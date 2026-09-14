@@ -32,6 +32,15 @@ body.page-main-BG {
     background-repeat: no-repeat;
 }
 
+body.page-admin-BG{
+   background-image: url('/static/Graphic/main_BG2_EX.jpg');
+   background-size: cover;        /* ภาพเต็มจอ ไม่บิดเบี้ยว */
+   background-position: center;   /* จุดกึ่งกลางภาพอยู่ตรงกลางจอเสมอ */
+   background-attachment: fixed;  /* ภาพไม่เลื่อนตามตอน scroll (ไม่บังคับ ลองดูได้) */
+   background-repeat: no-repeat;
+}
+
+
 /*@media (max-width: 600px) {
     body.page-main-BG {
         background-size: 600px auto;   ← "limit" ที่ตั้งไว้ 
