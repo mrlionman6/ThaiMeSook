@@ -54,6 +54,11 @@ body.page-admin-BG{
    text-align: center;
 }
 
+.login-box-left{
+   position: relative;
+   text-align: left;
+}
+
 body {
     font-family: sans-serif;
     /* ขยายตามความกว้างหน้าต่างจริง (width: 92%) แต่ยัง cap ไว้ที่ 900px บนจอกว้างมากๆ
