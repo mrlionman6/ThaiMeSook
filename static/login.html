@@ -8,18 +8,18 @@
 </head>
 <body class="page-admin-BG">
     <div class="login-box-center" >
-        <h1>🔐 เข้าสู่ระบบ Admin</h1>
+        <h1 class="login-box-center" >🔐 เข้าสู่ระบบ Admin</h1>
     
         <div id="errorMsg" style="color:red; display:none;">Username หรือ Password ไม่ถูกต้อง</div>
     
         <form action="/admin/login" method="post">
             <p>
                 <label>Username:</label><br>
-                <input type="text" name="username" required>
+                <input class="login-box-center" type="text" name="username" required>
             </p>
             <p>
                 <label>Password:</label><br>
-                <input type="password" name="password" required>
+                <input class="login-box-center" type="password" name="password" required>
             </p>
             <button type="submit">เข้าสู่ระบบ</button>
         </form>
