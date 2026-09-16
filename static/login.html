@@ -7,21 +7,30 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body class="page-admin-BG">
-    <div class="login-box-center" >
-        <h1 class="login-box-center" >🔐 เข้าสู่ระบบ Admin</h1>
-    
-        <div id="errorMsg" style="color:red; display:none;">Username หรือ Password ไม่ถูกต้อง</div>
-    
-        <form class="login-box-center" action="/admin/login" method="post">
-            <p>
-                <label class="login-box-left" >Username:</label><br>
-                <input  type="text" name="username" required>
-            </p>
-            <p >
-                <label class="login-box-left" >Password:</label><br>
-                <input  type="password" name="password" required>
-            </p>
-            <button type="submit">เข้าสู่ระบบ</button>
+    <div class="login-card">
+        <div class="login-card-icon">🔐</div>
+
+        <h1 class="login-card-title">เข้าสู่ระบบ</h1>
+        <p class="login-card-subtitle">สำหรับผู้ดูแลระบบ ThaiMeSook</p>
+
+        <div id="errorMsg" class="login-error" style="display:none;">
+            Username หรือ Password ไม่ถูกต้อง
+        </div>
+
+        <form action="/admin/login" method="post" class="login-form">
+            <div class="login-field">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+
+            <div class="login-field">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+
+            <div class="login-actions">
+                <button type="submit" class="login-submit-btn">เข้าสู่ระบบ</button>
+            </div>
         </form>
     </div>
 
