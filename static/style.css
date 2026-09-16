@@ -32,14 +32,19 @@ body.page-main-BG {
     background-repeat: no-repeat;
 }
 
-body.page-admin-BG{
-   background-image: url('/static/Graphic/main_BG2_EX.jpg');
-   background-size: cover;        /* ภาพเต็มจอ ไม่บิดเบี้ยว */
-   background-position: center;   /* จุดกึ่งกลางภาพอยู่ตรงกลางจอเสมอ */
-   background-attachment: fixed;  /* ภาพไม่เลื่อนตามตอน scroll (ไม่บังคับ ลองดูได้) */
-   background-repeat: no-repeat;
-}
+body.page-admin-BG {
+    background-image: url('/static/Graphic/main_BG2_EX.jpg');
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+    background-repeat: no-repeat;
 
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;   /* ← เพิ่ม: บังคับให้สูงเต็มจออย่างน้อย */
+    margin: 0;            /* ← เพิ่ม: ทับ margin:40px auto ของ body ทั่วไป */
+}
 
 
 /*@media (max-width: 600px) {
