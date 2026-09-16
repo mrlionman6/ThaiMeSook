@@ -1234,6 +1234,101 @@ button {
     line-height: 1.5;
 }
 
+/* =====================================================================
+   Admin Login: การ์ดกึ่งกลางจอ (สไตล์ Google Sign-in)
+   วิธีใช้:
+   1. หา .page-admin-BG ที่มีอยู่แล้วในไฟล์ style.css ของคุณ
+      เพิ่ม 3 บรรทัดนี้เข้าไปข้างใน { } เดิม (ห้ามลบของเดิมที่มีอยู่):
+        display: flex;
+        align-items: center;
+        justify-content: center;
+   2. เอาโค้ดด้านล่างทั้งหมดนี้ไปแปะต่อท้ายไฟล์ style.css
+   3. ลบ .login-box-center และ .login-box-left ออกจาก style.css ได้เลย
+      (เช็คแล้ว ไม่ถูกใช้ที่ไหนอีกนอกจาก login.html เวอร์ชันเก่า)
+   ===================================================================== */
+
+.login-card {
+    background: #fff;
+    border: 1px solid #dadce0;
+    border-radius: 12px;
+    padding: 40px 40px 32px;
+    width: 100%;
+    max-width: 400px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+    box-sizing: border-box;
+}
+
+.login-card-icon {
+    font-size: 28px;
+    margin-bottom: 16px;
+}
+
+.login-card-title {
+    font-size: 24px;
+    margin: 0 0 8px;
+    color: #202124;
+}
+
+.login-card-subtitle {
+    font-size: 14px;
+    color: #5f6368;
+    margin: 0 0 24px;
+}
+
+.login-error {
+    background: #fce8e6;
+    color: #c5221f;
+    font-size: 13px;
+    padding: 8px 12px;
+    border-radius: 6px;
+    margin-bottom: 16px;
+}
+
+.login-field {
+    margin-bottom: 20px;
+}
+
+.login-field label {
+    display: block;
+    font-size: 13px;
+    color: #5f6368;
+    margin-bottom: 6px;
+}
+
+.login-field input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 10px 12px;
+    border: 1px solid #dadce0;
+    border-radius: 6px;
+    font-size: 15px;
+}
+
+.login-field input:focus {
+    outline: none;
+    border-color: var(--color-primary);
+}
+
+.login-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 8px;
+}
+
+.login-submit-btn {
+    background: var(--color-primary);
+    color: #fff;
+    border: none;
+    border-radius: 20px;
+    padding: 10px 24px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.login-submit-btn:hover {
+    opacity: 0.9;
+}
 .snapshot-meta {
     color: #888;
     font-size: 12px;
