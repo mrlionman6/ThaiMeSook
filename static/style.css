@@ -43,7 +43,7 @@ body.page-admin-BG {
     align-items: center;
     justify-content: center;
     min-height: 100vh;   /* ← เพิ่ม: บังคับให้สูงเต็มจออย่างน้อย */
-    margin: 0;            /* ← เพิ่ม: ทับ margin:40px auto ของ body ทั่วไป */
+    margin: 0 auto;            /* ← เพิ่ม: ทับ margin:40px auto ของ body ทั่วไป */
 }
 
 
