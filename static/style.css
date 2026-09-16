@@ -38,12 +38,16 @@ body.page-admin-BG {
     background-position: center;
     background-attachment: fixed;
     background-repeat: no-repeat;
+    /* ไม่ต้องมี flex/min-height ตรงนี้แล้ว — คืนให้เหมือนเดิม */
+}
 
+/* ใช้เฉพาะหน้า login เท่านั้น แยกจาก dashboard */
+.login-page-layout {
     display: flex;
     align-items: center;
     justify-content: center;
-    min-height: 100vh;   /* ← เพิ่ม: บังคับให้สูงเต็มจออย่างน้อย */
-    margin: 0 auto;            /* ← เพิ่ม: ทับ margin:40px auto ของ body ทั่วไป */
+    min-height: 100vh;
+    margin: 0 auto;
 }
 
 
