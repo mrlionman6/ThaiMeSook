@@ -41,6 +41,11 @@ body.page-admin-BG {
     /* ไม่ต้องมี flex/min-height ตรงนี้แล้ว — คืนให้เหมือนเดิม */
 }
 
+.box-admin-padding {
+    background-color: white;
+    /* ไม่ต้องมี flex/min-height ตรงนี้แล้ว — คืนให้เหมือนเดิม */
+}
+
 /* ใช้เฉพาะหน้า login เท่านั้น แยกจาก dashboard */
 .login-page-layout {
     display: flex;
