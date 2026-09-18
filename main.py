@@ -600,7 +600,7 @@ def run_agentic_tool_loop(system_prompt: str, initial_messages: list) -> str:
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
+            max_tokens=2500,  # เดิม 1500 — เพิ่มเพราะคำตอบสาย investment advisor มักมี breakdown + อ้างอิงกฎหมายยาวขึ้น
             system=system_prompt,
             tools=AVAILABLE_TOOLS,
             messages=messages,
@@ -1007,7 +1007,7 @@ def rag_answer_stream(query, history=None, image_data=None):
     full_answer = ""
     with client.messages.stream(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1500,
+        max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
         system=ctx["system_prompt"],
         messages=ctx["messages"],
     ) as stream:
