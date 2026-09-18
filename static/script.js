@@ -66,7 +66,7 @@ function openInputExpandModal() {
         <textarea id="questionExpandTextarea" class="input-expand-textarea"
                   placeholder="พิมพ์คำถามเกี่ยวกับกฎหมายที่ท่านสงสัย">${escapeHtml(currentText)}</textarea>
         <div class="ask-controls">
-            <button type="button" onclick="document.getElementById('imageAttachInput').click()">แนบเอกสารทางกฎหมาย</button>
+            <button class="button_base_1" type="button" onclick="document.getElementById('imageAttachInput').click()">แนบเอกสารทางกฎหมาย</button>
             <button class="button_base_1" onclick="submitFromExpandModal()">ถาม</button>
         </div>
     `, "modal-card-wide");
