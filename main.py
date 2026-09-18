@@ -634,7 +634,7 @@ def run_agentic_tool_loop(system_prompt: str, initial_messages: list) -> str:
         messages.append({"role": "user", "content": tool_results})
 
     text_parts = [block.text for block in response.content if block.type == "text"]
-    return "".join(text_parts).strip()
+    return "\n\n".join(text_parts).strip()
 
 
 # ---------- ระยะ 3: AI Agent สำหรับจัดการ KB (เสนอ tag / ยุบรวม chunk) ----------
