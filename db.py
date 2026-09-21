@@ -125,6 +125,21 @@ class Log(Base):
     status = Column(String, nullable=False, default="pending")
 
 
+class DealScreeningBatch(Base):
+    """ผลการรัน Deal Screening 1 ครั้ง (1 ไฟล์ excel ที่อัปโหลด) — เก็บทั้ง summary + ผลราย
+    แถวเป็น JSON blob เดียว (แบบเดียวกับ KbSnapshot) เพราะจำนวนแถวต่อไฟล์ไม่ใหญ่มาก
+    และทำให้เช็ค expiry ตอนอ่านได้จุดเดียวไม่ต้อง join หลายตาราง"""
+    __tablename__ = "deal_screening_batches"
+
+    id = Column(Integer, primary_key=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+    filename = Column(String, nullable=False)
+    total_rows = Column(Integer, nullable=False)
+    success_count = Column(Integer, nullable=False)
+    failed_count = Column(Integer, nullable=False)
+    results = Column(JSON, nullable=False)  # list ของ {row_number, project_name, status, ...}
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -1161,4 +1176,78 @@ def reject_log(log_id: int) -> bool:
             return False
         row.status = "rejected"
         session.commit()
+        return True
+
+
+# ---------- Deal Screening Dashboard ----------
+DEAL_SCREENING_EXPIRY_DAYS = 5  # ผลที่เก็บไว้เกินนี้ถือว่าหมดอายุ — get_deal_screening_batch() คืน None ให้เหมือนไม่พบ id
+
+
+def create_deal_screening_batch(
+    filename: str, total_rows: int, success_count: int, failed_count: int, results: list
+) -> int:
+    with SessionLocal() as session:
+        row = DealScreeningBatch(
+            filename=filename,
+            total_rows=total_rows,
+            success_count=success_count,
+            failed_count=failed_count,
+            results=results,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.id
+
+
+def _is_deal_screening_expired(created_at: Optional[datetime.datetime]) -> bool:
+    if created_at is None:
+        return False
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=DEAL_SCREENING_EXPIRY_DAYS)
+    reference = created_at.replace(tzinfo=None) if created_at.tzinfo else created_at
+    return reference < cutoff
+
+
+def get_deal_screening_batch(batch_id: int) -> Optional[dict]:
+    """คืน None ทั้งกรณีไม่พบ id และกรณีหมดอายุ (เกิน DEAL_SCREENING_EXPIRY_DAYS วัน) — caller ต้องตอบ
+    'ไม่พบข้อมูล' แบบเดียวกันหมดโดยไม่แยกสาเหตุ (id ผิด/หมดอายุ/ถูกลบ ดูเหมือนกันหมดจากภายนอก)"""
+    with SessionLocal() as session:
+        row = session.get(DealScreeningBatch, batch_id)
+        if row is None or _is_deal_screening_expired(row.created_at):
+            return None
+        return {
+            "id": row.id,
+            "filename": row.filename,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "summary": {
+                "total_rows": row.total_rows,
+                "success": row.success_count,
+                "failed": row.failed_count,
+            },
+            "results": row.results,
+        }
+
+
+def get_deal_screening_history(limit: int = 20) -> list[dict]:
+    """คืนรายการ batch ล่าสุดที่ยังไม่หมดอายุ เรียงใหม่สุดก่อน — ใช้แสดง list ให้กดย้อนดูผลเก่าในหน้า admin"""
+    cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=DEAL_SCREENING_EXPIRY_DAYS)
+    with SessionLocal() as session:
+        rows = (
+            session.query(DealScreeningBatch)
+            .filter(DealScreeningBatch.created_at >= cutoff)
+            .order_by(DealScreeningBatch.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "total_rows": r.total_rows,
+                "success_count": r.success_count,
+                "failed_count": r.failed_count,
+            }
+            for r in rows
+        ]
         return True

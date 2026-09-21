@@ -59,6 +59,9 @@ from db import (
     add_chat_message,
     get_chat_messages,
     delete_chat_session,
+    create_deal_screening_batch,
+    get_deal_screening_batch,
+    get_deal_screening_history,
 )
 
 import os
@@ -70,6 +73,7 @@ import time
 import string
 import random
 import bcrypt
+import pandas as pd
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -504,6 +508,7 @@ def _estimate_investment_cost(inputs: dict) -> dict:
     items.append({
         "item": "ค่าธรรมเนียมจดทะเบียนบริษัท (DBD)",
         "estimated_cost_thb": DBD_REGISTRATION_FEE_ESTIMATE,
+        "severity": "info",  # ค่าใช้จ่ายปกติ ไม่ใช่คำเตือน
     })
 
     # 2. เช็คว่าต้องขอ Foreign Business License ไหม (หัวใจของ พ.ร.บ.ต่างด้าว)
@@ -515,18 +520,22 @@ def _estimate_investment_cost(inputs: dict) -> dict:
     )
     if requires_fbl:
         min_required = FBA_MIN_CAPITAL_LICENSED_BUSINESS
+        capital_insufficient = capital < min_required
         note = f"ธุรกิจประเภทนี้ต้องขอ Foreign Business License (FBL) ตาม พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว"
-        if capital < min_required:
+        if capital_insufficient:
             note += f" — ทุนจดทะเบียนที่ระบุ ({capital:,.0f} บาท) ต่ำกว่าเกณฑ์ขั้นต่ำที่แนะนำ ({min_required:,.0f} บาท)"
         items.append({
             "item": "Foreign Business License (FBL)",
             "estimated_cost_thb": "ค่าธรรมเนียมยื่นคำขอ ตามดุลยพินิจ DBD (ปกติหลักหมื่นบาท)",
             "note": note,
+            # blocker = ต้องขอ FBL และทุนไม่ถึงเกณฑ์ขั้นต่ำ, warning = ต้องขอ FBL แต่ทุนถึงเกณฑ์แล้ว
+            "severity": "blocker" if capital_insufficient else "warning",
         })
     elif foreign_pct > 49 and capital < FBA_MIN_CAPITAL_GENERAL:
         items.append({
             "item": "⚠️ ทุนจดทะเบียนอาจต่ำกว่าเกณฑ์ทั่วไปสำหรับธุรกิจต่างชาติ",
             "note": f"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว กำหนดทุนขั้นต่ำทั่วไปไว้ที่ {FBA_MIN_CAPITAL_GENERAL:,.0f} บาท",
+            "severity": "warning",
         })
 
     # 3. Work permit + วีซ่า (คูณตามจำนวนคน)
@@ -535,6 +544,7 @@ def _estimate_investment_cost(inputs: dict) -> dict:
         items.append({
             "item": f"Work Permit + วีซ่า Non-B ({num_permits} คน)",
             "estimated_cost_thb": per_person_fee * num_permits,
+            "severity": "info",
         })
 
     # 4. BOI — เป็นการ "ประหยัดภาษี" ไม่ใช่ค่าใช้จ่ายเพิ่ม แยก field ชัดเจนกันสับสนกับ cost
@@ -542,6 +552,7 @@ def _estimate_investment_cost(inputs: dict) -> dict:
         items.append({
             "item": "สิทธิประโยชน์ BOI",
             "estimated_savings": "อาจได้รับยกเว้นภาษีเงินได้นิติบุคคลสูงสุด 8 ปี ขึ้นกับประเภทกิจการที่ได้รับส่งเสริม",
+            "severity": "info",
         })
 
     total_known_cost = sum(
@@ -1892,6 +1903,174 @@ def admin_delete_user_endpoint(user_id: int, _: bool = Depends(require_login)):
     if not ok:
         raise HTTPException(status_code=404, detail="ไม่พบผู้ใช้นี้")
     return {"status": "deleted"}
+
+
+# ---------- Deal Screening Dashboard ----------
+DEAL_SCREENING_REQUIRED_COLUMNS = [
+    "ชื่อโครงการ",
+    "foreign_ownership_percent",
+    "registered_capital",
+    "business_category",
+    "num_foreign_work_permits",
+    "applying_for_boi",
+]
+
+
+def _normalize_boi_flag(value) -> bool:
+    """แปลงค่า applying_for_boi จาก excel (bool/เลข/ข้อความ TRUE-FALSE) ให้เป็น bool จริง
+    ต้องทำก่อนส่งเข้า execute_estimate_investment_cost() เสมอ เพราะ bool("FALSE") ใน Python
+    เป็น True (string ไม่ว่างเป็น truthy ทุกตัว) ถ้าไม่ normalize ก่อนจะเข้าใจผิดว่าทุกแถวขอ BOI"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "y", "ใช่"):
+        return True
+    if text in ("false", "0", "no", "n", "ไม่ใช่", ""):
+        return False
+    raise ValueError(f"ไม่รู้จักค่า applying_for_boi: {value!r} (ต้องเป็น TRUE หรือ FALSE)")
+
+
+def _derive_deal_screening_flag(items: list[dict]) -> str:
+    """อ่าน severity ที่ _estimate_investment_cost() ใส่มาในแต่ละ item โดยตรง (ไม่ string-match ข้อความ note)
+    แดง = มี blocker, เหลือง = มี warning แต่ไม่มี blocker, เขียว = มีแต่ info ล้วนๆ"""
+    severities = {i.get("severity") for i in items}
+    if "blocker" in severities:
+        return "red"
+    if "warning" in severities:
+        return "yellow"
+    return "green"
+
+
+def _process_deal_screening_row(row_number: int, row: dict) -> dict:
+    """ประมวลผล 1 แถวจาก excel — เรียก execute_estimate_investment_cost() ที่มีอยู่แล้วตรงๆ
+    ไม่เขียน logic คำนวณใหม่ คืน dict เดียวเสมอ (ok หรือ error) ไม่ raise ออกไปนอกฟังก์ชัน
+    กันไม่ให้ 1 แถวที่ข้อมูลผิดทำให้ทั้ง batch ล้ม"""
+    project_name_raw = row.get("ชื่อโครงการ")
+    project_name = (
+        str(project_name_raw).strip()
+        if project_name_raw is not None and not pd.isna(project_name_raw)
+        else ""
+    ) or f"แถวที่ {row_number}"
+
+    required_fields = [
+        "foreign_ownership_percent", "registered_capital",
+        "business_category", "num_foreign_work_permits", "applying_for_boi",
+    ]
+    missing = [f for f in required_fields if f not in row or pd.isna(row.get(f))]
+    if missing:
+        return {
+            "row_number": row_number, "project_name": project_name,
+            "status": "error", "error": f"ขาดข้อมูลคอลัมน์: {', '.join(missing)}",
+        }
+
+    try:
+        tool_input = {
+            "foreign_ownership_percent": row["foreign_ownership_percent"],
+            "registered_capital": row["registered_capital"],
+            "business_category": str(row["business_category"]).strip(),
+            "num_foreign_work_permits": row["num_foreign_work_permits"],
+            "applying_for_boi": _normalize_boi_flag(row["applying_for_boi"]),
+        }
+    except (TypeError, ValueError) as e:
+        return {"row_number": row_number, "project_name": project_name, "status": "error", "error": str(e)}
+
+    result = execute_estimate_investment_cost(tool_input)
+    if "error" in result:
+        return {"row_number": row_number, "project_name": project_name, "status": "error", "error": result["error"]}
+
+    return {
+        "row_number": row_number,
+        "project_name": project_name,
+        "status": "ok",
+        "flag": _derive_deal_screening_flag(result["items"]),
+        "total_cost_thb": result["total_one_time_cost_estimate_thb"],
+        "items": result["items"],
+    }
+
+
+@app.post("/admin/api/deal-screening/upload")
+async def upload_deal_screening(file: UploadFile = File(...), _: bool = Depends(require_login)):
+    """รับไฟล์ excel หลายโครงการพร้อมกัน วนคำนวณทีละแถวด้วย _estimate_investment_cost() เดิม
+    เก็บผลทั้ง batch ลง DB แล้วคืนกลับให้ frontend render ตาราง+กราฟทันที"""
+    raw = await file.read()
+    try:
+        df = pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+    except Exception:
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
+
+    missing_columns = [c for c in DEAL_SCREENING_REQUIRED_COLUMNS if c not in df.columns]
+    if missing_columns:
+        raise HTTPException(status_code=400, detail=f"ไฟล์ขาดคอลัมน์ที่จำเป็น: {', '.join(missing_columns)}")
+
+    rows = df.to_dict("records")
+    if not rows:
+        raise HTTPException(status_code=400, detail="ไฟล์ไม่มีข้อมูลแถวใดเลย")
+
+    results = [_process_deal_screening_row(idx + 2, row) for idx, row in enumerate(rows)]
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    failed_count = len(results) - success_count
+
+    batch_id = create_deal_screening_batch(
+        filename=file.filename or "upload.xlsx",
+        total_rows=len(results),
+        success_count=success_count,
+        failed_count=failed_count,
+        results=results,
+    )
+
+    return {
+        "batch_id": batch_id,
+        "summary": {"total_rows": len(results), "success": success_count, "failed": failed_count},
+        "results": results,
+    }
+
+
+@app.get("/admin/api/deal-screening/history")
+def list_deal_screening_history(_: bool = Depends(require_login)):
+    """คืนรายการ batch ล่าสุดที่ยังไม่หมดอายุ — ต้อง declare ก่อน route /{batch_id}
+    ไม่งั้น FastAPI จะพยายาม parse 'history' เป็น int ให้ route {batch_id} ก่อนแล้วพัง 422"""
+    return {"batches": get_deal_screening_history()}
+
+
+@app.get("/admin/api/deal-screening/{batch_id}")
+def get_deal_screening_batch_endpoint(batch_id: int, _: bool = Depends(require_login)):
+    batch = get_deal_screening_batch(batch_id)
+    if batch is None:
+        # ไม่แยกบอกสาเหตุ (id ผิด/หมดอายุ/ถูกลบ) ให้ตอบเหมือนกันหมดตามที่ตกลงไว้
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+    return batch
+
+
+@app.get("/admin/api/deal-screening/{batch_id}/export")
+def export_deal_screening_endpoint(batch_id: int, _: bool = Depends(require_login)):
+    batch = get_deal_screening_batch(batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+
+    flag_labels = {"green": "เขียว", "yellow": "เหลือง", "red": "แดง"}
+    rows = [
+        {
+            "แถวที่": r["row_number"],
+            "ชื่อโครงการ": r["project_name"],
+            "สถานะ": "สำเร็จ" if r["status"] == "ok" else "ผิดพลาด",
+            "Flag": flag_labels.get(r.get("flag"), "") if r["status"] == "ok" else "",
+            "total_cost_thb": r.get("total_cost_thb", ""),
+            "หมายเหตุ/ข้อผิดพลาด": r.get("error", ""),
+        }
+        for r in batch["results"]
+    ]
+    export_df = pd.DataFrame(rows)
+    buf = io.BytesIO()
+    export_df.to_excel(buf, index=False, engine="openpyxl")
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename=deal_screening_{batch_id}.xlsx"},
+    )
 
 
 # ---------- เสิร์ฟหน้าเว็บผู้ใช้ ----------

@@ -1359,3 +1359,38 @@ button {
     line-height: 1.6;
     color: var(--color-peach-text);
 }
+
+/* ---------- Admin: แท็บ Deal Screening ---------- */
+.deal-screening-actions {
+    margin: 12px 0;
+}
+
+.deal-screening-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.deal-screening-table th,
+.deal-screening-table td {
+    text-align: left;
+    padding: 8px 10px;
+    border-bottom: 1px solid #eee;
+}
+
+.deal-screening-row-green {
+    background: #eaf7ec;
+}
+
+.deal-screening-row-yellow {
+    background: #fdf6e3;
+}
+
+.deal-screening-row-red {
+    background: #fbe9e9;
+}
+
+.deal-screening-row-error {
+    background: #f2f2f2;
+    color: #888;
+}

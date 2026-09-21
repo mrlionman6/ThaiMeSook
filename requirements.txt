@@ -11,3 +11,5 @@ psycopg2-binary
 pgvector
 bcrypt
 Pillow
+pandas
+openpyxl

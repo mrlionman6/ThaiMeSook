@@ -27,6 +27,7 @@ function switchTab(tab) {
     document.getElementById("tabUsers").style.display = tab === "users" ? "block" : "none";
     document.getElementById("tabTags").style.display = tab === "tags" ? "block" : "none";
     document.getElementById("tabAgent").style.display = tab === "agent" ? "block" : "none";
+    document.getElementById("tabDealScreening").style.display = tab === "dealScreening" ? "block" : "none";
 
     document.getElementById("tabBtnPending").classList.toggle("tab-btn-active", tab === "pending");
     document.getElementById("tabBtnKb").classList.toggle("tab-btn-active", tab === "kb");
@@ -34,6 +35,7 @@ function switchTab(tab) {
     document.getElementById("tabBtnUsers").classList.toggle("tab-btn-active", tab === "users");
     document.getElementById("tabBtnTags").classList.toggle("tab-btn-active", tab === "tags");
     document.getElementById("tabBtnAgent").classList.toggle("tab-btn-active", tab === "agent");
+    document.getElementById("tabBtnDealScreening").classList.toggle("tab-btn-active", tab === "dealScreening");
 
     if (tab === "pending") {
         loadLogs(pendingPage);
@@ -53,6 +55,8 @@ function switchTab(tab) {
         updateScopePreview();
         loadAgentProposals();
         loadAgentJobList();
+    } else if (tab === "dealScreening") {
+        loadDealScreeningHistory();
     }
 }
 
@@ -1153,6 +1157,176 @@ async function loadAgentJobList() {
                     <span class="snapshot-meta">${escapeHtml(job.action_type)} · ${escapeHtml(job.mode)} · scope: ${escapeHtml(job.scope_summary || '-')} · ${statusLabel}</span>
                 </div>
                 ${rollbackBtn}
+            `;
+            container.appendChild(row);
+        });
+    } catch (error) {
+        container.innerHTML = "<p style='color:red;'>โหลดประวัติไม่สำเร็จ: " + escapeHtml(String(error)) + "</p>";
+    }
+}
+
+// ---------- แท็บ Deal Screening ----------
+let dealScreeningLatestBatchId = null;
+let dealScreeningChartInstance = null;
+
+async function uploadDealScreeningFile() {
+    const fileInput = document.getElementById("dealScreeningFileInput");
+    const statusEl = document.getElementById("dealScreeningUploadStatus");
+
+    if (!fileInput.files || fileInput.files.length === 0) {
+        statusEl.textContent = "เลือกไฟล์ Excel ก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    statusEl.textContent = "กำลังประมวลผล... (อาจใช้เวลาสักครู่ถ้ามีหลายแถว)";
+    statusEl.style.color = "#666";
+
+    try {
+        const res = await fetch("/admin/api/deal-screening/upload", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        fileInput.value = "";
+        statusEl.textContent = `✅ ประมวลผลสำเร็จ ${data.summary.total_rows} แถว`;
+        statusEl.style.color = "green";
+
+        renderDealScreeningResult(data.batch_id, data.summary, data.results);
+        loadDealScreeningHistory();
+    } catch (error) {
+        statusEl.textContent = "❌ ประมวลผลไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
+    }
+}
+
+async function loadDealScreeningBatch(batchId) {
+    const statusEl = document.getElementById("dealScreeningUploadStatus");
+    try {
+        const res = await fetch(`/admin/api/deal-screening/${batchId}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        renderDealScreeningResult(data.id, data.summary, data.results);
+        statusEl.textContent = "";
+    } catch (error) {
+        statusEl.textContent = "❌ " + error;
+        statusEl.style.color = "red";
+    }
+}
+
+function renderDealScreeningResult(batchId, summary, results) {
+    dealScreeningLatestBatchId = batchId;
+    document.getElementById("dealScreeningActions").style.display = "block";
+
+    document.getElementById("dealScreeningSummary").innerHTML = `
+        <p class="ts-note">
+            ทั้งหมด ${summary.total_rows} แถว — สำเร็จ ${summary.success} แถว, ผิดพลาด ${summary.failed} แถว
+        </p>
+    `;
+
+    const flagLabels = { green: "🟢 เขียว", yellow: "🟡 เหลือง", red: "🔴 แดง" };
+    const container = document.getElementById("dealScreeningResultsContainer");
+
+    if (results.length === 0) {
+        container.innerHTML = "<p>ไม่มีข้อมูลในไฟล์นี้</p>";
+    } else {
+        const rowsHtml = results.map(r => {
+            if (r.status === "error") {
+                return `
+                    <tr class="deal-screening-row-error">
+                        <td>${r.row_number}</td>
+                        <td>${escapeHtml(r.project_name)}</td>
+                        <td colspan="3">❌ ${escapeHtml(r.error)}</td>
+                    </tr>
+                `;
+            }
+            return `
+                <tr class="deal-screening-row-${r.flag}">
+                    <td>${r.row_number}</td>
+                    <td>${escapeHtml(r.project_name)}</td>
+                    <td>${flagLabels[r.flag] || escapeHtml(String(r.flag))}</td>
+                    <td>${Number(r.total_cost_thb).toLocaleString("th-TH")} บาท</td>
+                    <td>-</td>
+                </tr>
+            `;
+        }).join("");
+
+        container.innerHTML = `
+            <table class="deal-screening-table">
+                <thead>
+                    <tr><th>แถวที่</th><th>ชื่อโครงการ</th><th>Flag</th><th>ค่าใช้จ่ายรวม (THB)</th><th>หมายเหตุ</th></tr>
+                </thead>
+                <tbody>${rowsHtml}</tbody>
+            </table>
+        `;
+    }
+
+    renderDealScreeningChart(results);
+}
+
+function renderDealScreeningChart(results) {
+    const canvas = document.getElementById("dealScreeningChart");
+    const okResults = results.filter(r => r.status === "ok");
+
+    if (dealScreeningChartInstance) {
+        dealScreeningChartInstance.destroy();
+        dealScreeningChartInstance = null;
+    }
+    if (okResults.length === 0) return;
+
+    const flagColors = { green: "#3fa34d", yellow: "#e0b400", red: "#d9534f" };
+
+    dealScreeningChartInstance = new Chart(canvas, {
+        type: "bar",
+        data: {
+            labels: okResults.map(r => r.project_name),
+            datasets: [{
+                label: "ค่าใช้จ่ายเบื้องต้นโดยประมาณ (บาท)",
+                data: okResults.map(r => r.total_cost_thb),
+                backgroundColor: okResults.map(r => flagColors[r.flag] || "#999"),
+            }],
+        },
+        options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true } },
+        },
+    });
+}
+
+function downloadDealScreeningExcel() {
+    if (!dealScreeningLatestBatchId) return;
+    window.location.href = `/admin/api/deal-screening/${dealScreeningLatestBatchId}/export`;
+}
+
+async function loadDealScreeningHistory() {
+    const container = document.getElementById("dealScreeningHistoryList");
+    try {
+        const res = await fetch("/admin/api/deal-screening/history");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+
+        if (data.batches.length === 0) {
+            container.innerHTML = "<p>ยังไม่เคยอัปโหลดไฟล์เลย</p>";
+            return;
+        }
+
+        container.innerHTML = "";
+        data.batches.forEach(batch => {
+            const row = document.createElement("div");
+            row.className = "snapshot-row";
+            const dateStr = batch.created_at ? new Date(batch.created_at).toLocaleString("th-TH") : "-";
+            row.innerHTML = `
+                <div class="snapshot-info">
+                    <strong>#${batch.id}</strong> — ${escapeHtml(batch.filename)} — ${dateStr}<br>
+                    <span class="snapshot-meta">ทั้งหมด ${batch.total_rows} แถว · สำเร็จ ${batch.success_count} · ผิดพลาด ${batch.failed_count}</span>
+                </div>
+                <button onclick="loadDealScreeningBatch(${batch.id})">👁️ ดูผลลัพธ์</button>
             `;
             container.appendChild(row);
         });

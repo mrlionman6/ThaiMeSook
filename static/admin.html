@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Admin - จัดการ Knowledge Base</title>
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 </head>
 <body class="page-admin-BG">
     <div class="box-admin-padding">  
@@ -30,6 +31,9 @@
             </button>
             <button id="tabBtnAgent" class="tab-btn" onclick="switchTab('agent')">
                 🤖 AI Agent KB Management
+            </button>
+            <button id="tabBtnDealScreening" class="tab-btn" onclick="switchTab('dealScreening')">
+                🔍 Deal Screening
             </button>
         </div>
     
@@ -227,6 +231,43 @@
                     <div id="agentJobList">กำลังโหลด...</div>
                 </div>
             </details>
+        </div>
+
+        <div id="tabDealScreening" class="tab-panel" style="display:none;">
+
+            <div class="kb-toolbar">
+                <details class="kb-toolbar-section" open>
+                    <summary>📁 อัปโหลดไฟล์ Excel</summary>
+                    <div class="kb-toolbar-body">
+                        <p class="ts-note">
+                            คอลัมน์ที่ต้องมี: ชื่อโครงการ, foreign_ownership_percent, registered_capital,
+                            business_category (manufacturing_export/service_restricted/trading/boi_eligible_tech),
+                            num_foreign_work_permits, applying_for_boi (TRUE/FALSE)
+                        </p>
+                        <input type="file" id="dealScreeningFileInput" accept=".xlsx">
+                        <button onclick="uploadDealScreeningFile()">อัปโหลดและประเมิน</button>
+                        <span id="dealScreeningUploadStatus" class="kb-toolbar-status"></span>
+                    </div>
+                </details>
+                <details class="kb-toolbar-section">
+                    <summary>📜 ประวัติการอัปโหลด (5 วันล่าสุด)</summary>
+                    <div class="kb-toolbar-body">
+                        <div id="dealScreeningHistoryList">กำลังโหลด...</div>
+                    </div>
+                </details>
+            </div>
+
+            <div id="dealScreeningSummary"></div>
+
+            <div class="deal-screening-actions" id="dealScreeningActions" style="display:none;">
+                <button onclick="downloadDealScreeningExcel()">📥 ดาวน์โหลดเป็น Excel</button>
+            </div>
+
+            <div style="max-width: 700px; margin: 16px 0;">
+                <canvas id="dealScreeningChart" height="220"></canvas>
+            </div>
+
+            <div id="dealScreeningResultsContainer"></div>
         </div>
     </div>
     <script src="/static/admin.js"></script>
