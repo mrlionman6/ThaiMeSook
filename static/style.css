@@ -1394,3 +1394,15 @@ button {
     background: #f2f2f2;
     color: #888;
 }
+
+/* ---------- Admin: แท็บ Feasibility Summarizer ---------- */
+.feasibility-summary-box {
+    white-space: pre-wrap;
+    background: var(--color-cream);
+    border: 1px solid #f0e4a8;
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 16px;
+    font-size: 14px;
+    line-height: 1.7;
+}

@@ -28,6 +28,7 @@ function switchTab(tab) {
     document.getElementById("tabTags").style.display = tab === "tags" ? "block" : "none";
     document.getElementById("tabAgent").style.display = tab === "agent" ? "block" : "none";
     document.getElementById("tabDealScreening").style.display = tab === "dealScreening" ? "block" : "none";
+    document.getElementById("tabFeasibility").style.display = tab === "feasibility" ? "block" : "none";
 
     document.getElementById("tabBtnPending").classList.toggle("tab-btn-active", tab === "pending");
     document.getElementById("tabBtnKb").classList.toggle("tab-btn-active", tab === "kb");
@@ -36,6 +37,7 @@ function switchTab(tab) {
     document.getElementById("tabBtnTags").classList.toggle("tab-btn-active", tab === "tags");
     document.getElementById("tabBtnAgent").classList.toggle("tab-btn-active", tab === "agent");
     document.getElementById("tabBtnDealScreening").classList.toggle("tab-btn-active", tab === "dealScreening");
+    document.getElementById("tabBtnFeasibility").classList.toggle("tab-btn-active", tab === "feasibility");
 
     if (tab === "pending") {
         loadLogs(pendingPage);
@@ -1332,6 +1334,45 @@ async function loadDealScreeningHistory() {
         });
     } catch (error) {
         container.innerHTML = "<p style='color:red;'>โหลดประวัติไม่สำเร็จ: " + escapeHtml(String(error)) + "</p>";
+    }
+}
+
+// ---------- แท็บ Feasibility Summarizer ----------
+async function uploadFeasibilityFile() {
+    const fileInput = document.getElementById("feasibilityFileInput");
+    const statusEl = document.getElementById("feasibilityUploadStatus");
+    const summaryBox = document.getElementById("feasibilitySummaryBox");
+
+    if (!fileInput.files || fileInput.files.length === 0) {
+        statusEl.textContent = "เลือกไฟล์ Excel ก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+
+    statusEl.textContent = "กำลังอ่านไฟล์และสรุป... (อาจใช้เวลาสักครู่)";
+    statusEl.style.color = "#666";
+    summaryBox.hidden = true;
+
+    try {
+        const res = await fetch("/admin/api/feasibility-summarizer/upload", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        fileInput.value = "";
+        statusEl.textContent = "✅ สรุปเสร็จแล้ว";
+        statusEl.style.color = "green";
+
+        summaryBox.textContent = data.summary;
+        summaryBox.hidden = false;
+    } catch (error) {
+        statusEl.textContent = "❌ สรุปไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
     }
 }
 

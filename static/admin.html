@@ -35,6 +35,9 @@
             <button id="tabBtnDealScreening" class="tab-btn" onclick="switchTab('dealScreening')">
                 🔍 Deal Screening
             </button>
+            <button id="tabBtnFeasibility" class="tab-btn" onclick="switchTab('feasibility')">
+                🧾 Feasibility Summarizer
+            </button>
         </div>
     
         <div id="tabPending" class="tab-panel">
@@ -268,6 +271,22 @@
             </div>
 
             <div id="dealScreeningResultsContainer"></div>
+        </div>
+
+        <div id="tabFeasibility" class="tab-panel" style="display:none;">
+            <div class="kb-toolbar">
+                <details class="kb-toolbar-section" open>
+                    <summary>📁 อัปโหลดไฟล์ Feasibility Study (Excel)</summary>
+                    <div class="kb-toolbar-body">
+                        <p class="ts-note">รองรับ .xlsx และ .xls — อ่านทุกชีต ไม่บังคับโครงสร้างไฟล์ตายตัว</p>
+                        <input type="file" id="feasibilityFileInput" accept=".xlsx,.xls">
+                        <button onclick="uploadFeasibilityFile()">อัปโหลดและสรุป</button>
+                        <span id="feasibilityUploadStatus" class="kb-toolbar-status"></span>
+                    </div>
+                </details>
+            </div>
+
+            <div id="feasibilitySummaryBox" class="feasibility-summary-box" hidden></div>
         </div>
     </div>
     <script src="/static/admin.js"></script>

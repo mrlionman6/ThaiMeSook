@@ -2073,6 +2073,75 @@ def export_deal_screening_endpoint(batch_id: int, _: bool = Depends(require_logi
     )
 
 
+# ---------- Feasibility Summarizer ----------
+FEASIBILITY_MAX_CHARS = 15000  # จำกัดความยาวข้อความดิบที่ส่งเข้า Claude กันกิน token เกินจำเป็น
+FEASIBILITY_TRUNCATION_NOTICE = (
+    "⚠️ สรุปนี้อ้างอิงจากบางส่วนของไฟล์เท่านั้น (ตัดที่ 15,000 ตัวอักษรแรก) อาจไม่ครบทุกหมวด\n\n"
+)
+FEASIBILITY_SYSTEM_PROMPT = (
+    "คุณเป็นผู้ช่วยสรุปเอกสาร feasibility study ของโครงการ สรุปให้ครอบคลุม (ถ้ามีในเอกสาร): "
+    "ภาพรวมโครงการ, ตัวเลขการเงินสำคัญ (งบประมาณ ต้นทุน อัตราคิดลด อัตราภาษี), ไทม์ไลน์, "
+    "ความเสี่ยงและแผนจัดการ — ถ้าหมวดไหนไม่มีข้อมูลในเอกสาร ให้ข้ามไปเฉยๆ ห้ามเดา/สมมติ "
+    "ข้อมูลที่ไม่มีอยู่จริงเด็ดขาด ตอบเป็นภาษาไทย จัดหัวข้อให้อ่านง่าย"
+)
+
+
+def _extract_excel_text(raw: bytes) -> str:
+    """อ่านทุก cell ในทุกชีตของไฟล์ excel เป็นข้อความดิบ ไม่บังคับ schema/คอลัมน์ตายตัว
+    เพราะแต่ละไฟล์ feasibility study โครงสร้างไม่เหมือนกัน ลอง .xlsx (openpyxl) ก่อน
+    ถ้าอ่านไม่ได้ค่อยลอง .xls เก่า (xlrd) — ไม่ต้องให้ผู้ใช้เลือก engine เอง"""
+    sheets = None
+    for engine in ("openpyxl", "xlrd"):
+        try:
+            sheets = pd.read_excel(io.BytesIO(raw), sheet_name=None, header=None, engine=engine)
+            break
+        except Exception:
+            continue
+
+    if sheets is None:
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx หรือ .xls ที่ถูกต้อง")
+
+    parts = []
+    for sheet_name, df in sheets.items():
+        parts.append(f"=== {sheet_name} ===")
+        for _, row in df.iterrows():
+            cells = [str(v).strip() for v in row.tolist() if v is not None and not pd.isna(v) and str(v).strip()]
+            if cells:
+                parts.append(" | ".join(cells))
+
+    return "\n".join(parts)
+
+
+def summarize_feasibility_document(raw_text: str) -> str:
+    """เรียก Claude ตรงๆ ครั้งเดียว ไม่ผ่าน RAG/agentic tool loop — งานนี้แค่สรุปข้อความดิบที่ให้มา"""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=2000,
+        system=FEASIBILITY_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": raw_text}],
+    )
+    return response.content[0].text.strip()
+
+
+@app.post("/admin/api/feasibility-summarizer/upload")
+async def upload_feasibility_summary(file: UploadFile = File(...), _: bool = Depends(require_login)):
+    raw = await file.read()
+    raw_text = _extract_excel_text(raw)
+
+    if not raw_text.strip():
+        raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
+
+    truncated = len(raw_text) > FEASIBILITY_MAX_CHARS
+    if truncated:
+        raw_text = raw_text[:FEASIBILITY_MAX_CHARS]
+
+    summary = summarize_feasibility_document(raw_text)
+    if truncated:
+        summary = FEASIBILITY_TRUNCATION_NOTICE + summary
+
+    return {"summary": summary}
+
+
 # ---------- เสิร์ฟหน้าเว็บผู้ใช้ ----------
 @app.get("/")
 def read_root():
