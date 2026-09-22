@@ -62,6 +62,7 @@ from db import (
     create_deal_screening_batch,
     get_deal_screening_batch,
     get_deal_screening_history,
+    create_user_document,
 )
 
 import os
@@ -2073,6 +2074,87 @@ def export_deal_screening_endpoint(batch_id: int, _: bool = Depends(require_logi
     )
 
 
+# ---------- Deal Screening (user ทั่วไป — ผ่านปุ่ม "แนบเอกสาร" ในหน้าแชท) ----------
+# แยกจากแท็บ admin โดยสิ้นเชิง: คนละ auth (require_user ไม่ใช่ require_login), ไม่เก็บลง DB เลย
+# (ไม่มี history/retention/export) และคืนผลเป็นข้อความสรุปอ่านง่ายแทนตาราง+กราฟ
+# ไม่มีการเรียก Claude เลยในเส้นทางนี้ — ใช้ _process_deal_screening_row() เดิมตรงๆ (pandas + calculator ล้วนๆ)
+def _read_deal_screening_dataframe(raw: bytes, header_only: bool = False):
+    """อ่านไฟล์ excel สำหรับ Deal Screening — รองรับเฉพาะ .xlsx (engine=openpyxl) เหมือนฝั่ง admin เป๊ะ
+    ไม่มี xlrd fallback เพราะฝั่ง admin เองก็ไม่เคยรองรับ .xls มาก่อน
+    header_only=True จะอ่านแค่แถวหัวตาราง (nrows=0) ใช้สำหรับ classify เร็วๆ ไม่ต้องโหลดทั้งไฟล์"""
+    kwargs = {"engine": "openpyxl"}
+    if header_only:
+        kwargs["nrows"] = 0
+    return pd.read_excel(io.BytesIO(raw), **kwargs)
+
+
+def _matches_deal_screening_schema(columns) -> bool:
+    """superset check — มีคอลัมน์ที่จำเป็นครบทุกตัวก็พอ มีคอลัมน์อื่นเกินมาได้ไม่เป็นไร
+    เหมือนวิธีที่ /admin/api/deal-screening/upload ตรวจอยู่แล้ว (missing_columns pattern)"""
+    return all(c in columns for c in DEAL_SCREENING_REQUIRED_COLUMNS)
+
+
+@app.post("/api/attachment-kind")
+async def detect_attachment_kind(file: UploadFile = File(...), _: int = Depends(require_user)):
+    """classify ไฟล์ .xlsx/.xls ที่แนบมาว่าตรง schema Deal Screening หรือไม่ ก่อนหน้าบ้านจะเลือกว่า
+    จะส่งไฟล์จริงไป endpoint ไหนต่อ (/api/deal-screening/upload หรือ /api/user-documents/upload)
+    อ่านแค่แถวหัวตาราง ไม่โหลดทั้งไฟล์ กันเปลืองงานถ้าไฟล์ใหญ่"""
+    filename = (file.filename or "").lower()
+    if not filename.endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+
+    raw = await file.read()
+
+    if filename.endswith(".xls"):
+        # .xls เก่าอ่านด้วย openpyxl ไม่ได้อยู่แล้ว (ต้องใช้ xlrd) แต่ Deal Screening ไม่รองรับ .xls
+        # จึงตกไปที่ Feasibility Summarizer เสมอ ไม่ต้องเสียเวลาลองอ่านด้วยซ้ำ
+        return {"kind": "feasibility"}
+
+    try:
+        df = _read_deal_screening_dataframe(raw, header_only=True)
+    except Exception:
+        # อ่านด้วย openpyxl ไม่ได้ (ไฟล์เสีย/ไม่ใช่ .xlsx จริง) — ให้ตกไปที่ Feasibility Summarizer
+        # แล้วให้ _extract_excel_text() ที่ทน error มากกว่า (มี xlrd fallback) ไปเจอปัญหาเดิมอีกที
+        return {"kind": "feasibility"}
+
+    kind = "deal-screening-batch" if _matches_deal_screening_schema(df.columns) else "feasibility"
+    return {"kind": kind}
+
+
+@app.post("/api/deal-screening/upload")
+async def upload_deal_screening_for_user(file: UploadFile = File(...), _: int = Depends(require_user)):
+    """เหมือน /admin/api/deal-screening/upload ทุกจุดเรื่องการอ่านไฟล์/คำนวณ (reuse _process_deal_screening_row()
+    ตรงๆ ไม่เขียน logic คำนวณใหม่) ต่างกันแค่ auth และไม่เก็บผลลง DB — คืนข้อความสรุปแทนตาราง+กราฟ"""
+    raw = await file.read()
+    try:
+        df = _read_deal_screening_dataframe(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
+
+    missing_columns = [c for c in DEAL_SCREENING_REQUIRED_COLUMNS if c not in df.columns]
+    if missing_columns:
+        raise HTTPException(status_code=400, detail=f"ไฟล์ขาดคอลัมน์ที่จำเป็น: {', '.join(missing_columns)}")
+
+    rows = df.to_dict("records")
+    if not rows:
+        raise HTTPException(status_code=400, detail="ไฟล์ไม่มีข้อมูลแถวใดเลย")
+
+    results = [_process_deal_screening_row(idx + 2, row) for idx, row in enumerate(rows)]
+    success_count = sum(1 for r in results if r["status"] == "ok")
+    failed_count = len(results) - success_count
+
+    flag_emoji = {"green": "🟢", "yellow": "🟡", "red": "🔴"}
+    lines = [f"ผลการประเมิน {len(results)} โครงการ — สำเร็จ {success_count} โครงการ, ผิดพลาด {failed_count} โครงการ", ""]
+    for r in results:
+        if r["status"] == "ok":
+            emoji = flag_emoji.get(r["flag"], "")
+            lines.append(f"{emoji} {r['project_name']} — ค่าใช้จ่ายเบื้องต้นโดยประมาณ {r['total_cost_thb']:,.0f} บาท")
+        else:
+            lines.append(f"❌ แถวที่ {r['row_number']} ({r['project_name']}) — ข้อผิดพลาด: {r['error']}")
+
+    return {"summary_text": "\n".join(lines)}
+
+
 # ---------- Feasibility Summarizer ----------
 FEASIBILITY_MAX_CHARS = 15000  # จำกัดความยาวข้อความดิบที่ส่งเข้า Claude กันกิน token เกินจำเป็น
 FEASIBILITY_TRUNCATION_NOTICE = (
@@ -2142,6 +2224,71 @@ async def upload_feasibility_summary(file: UploadFile = File(...), _: bool = Dep
         summary = FEASIBILITY_TRUNCATION_NOTICE + summary
 
     return {"summary": summary}
+
+
+# ---------- User Document Upload (แนบไฟล์ excel ในหน้าแชทของ user ทั่วไป) ----------
+# แยกจาก Feasibility Summarizer (แท็บ admin) โดยสิ้นเชิง — คนละ auth, คนละที่เก็บข้อมูล
+# (user_documents ไม่ผ่านหน้ารอตรวจสอบ/AI Agent review queue ของ admin เลย), และคืนผลเป็น JSON
+# มี structured_fields เก็บไว้เบื้องหลังสำหรับ feature เปรียบเทียบใน phase ถัดไป
+USER_DOCUMENT_SYSTEM_PROMPT = (
+    "คุณเป็นผู้ช่วยสรุปเอกสาร feasibility study ของโครงการ ต้องตอบกลับมาเป็น JSON object เดียวเท่านั้น "
+    "ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
+    '{"summary_text": "...", "structured_fields": {"project_name": ..., "total_investment_thb": ..., '
+    '"total_revenue_monthly_thb": ..., "project_duration_text": ..., "discount_rate_percent": ..., '
+    '"tax_rate_percent": ..., "risks": ["..."]}}\n\n'
+    "กฎสำหรับ summary_text: สรุปให้ครอบคลุม (ถ้ามีในเอกสาร) ภาพรวมโครงการ, ตัวเลขการเงินสำคัญ "
+    "(งบประมาณ ต้นทุน อัตราคิดลด อัตราภาษี), ไทม์ไลน์, ความเสี่ยงและแผนจัดการ — ถ้าหมวดไหนไม่มีข้อมูลในเอกสาร "
+    "ให้ข้ามไปเฉยๆ ห้ามเดา/สมมติข้อมูลที่ไม่มีอยู่จริงเด็ดขาด ตอบเป็นภาษาไทย จัดหัวข้อให้อ่านง่าย "
+    "เป็นข้อความธรรมดา ห้ามใช้ Markdown syntax เช่น #, **, |, อีโมจิ ใช้การขึ้นบรรทัดใหม่และเว้นวรรคแทนการจัดรูปแบบ\n\n"
+    "กฎสำหรับ structured_fields: ฟิลด์ไหนไม่มีในเอกสารให้ใส่ null ห้ามเดา/สมมติค่าเด็ดขาด "
+    "โดยเฉพาะตัวเลขและวันที่ ต้องคัดลอกตามตัวอักษรต้นฉบับเป๊ะ (เช่น project_duration_text ต้องคัดลอกข้อความ "
+    "ต้นฉบับเป๊ะ ห้ามตีความหรือเติมหน่วยปีเอง) risks เป็น list ของข้อความสั้นๆ ถ้าไม่มีให้ใส่ [] ว่าง"
+)
+
+
+@app.post("/api/user-documents/upload")
+async def upload_user_document(file: UploadFile = File(...), user_id: int = Depends(require_user)):
+    filename = file.filename or ""
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+
+    raw = await file.read()
+    raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ
+
+    if not raw_text.strip():
+        raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
+
+    truncated = len(raw_text) > FEASIBILITY_MAX_CHARS
+    if truncated:
+        raw_text = raw_text[:FEASIBILITY_MAX_CHARS]
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4000,
+        system=USER_DOCUMENT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": raw_text}],
+    )
+    parsed = _parse_json_response(response.content[0].text, dict)
+    if parsed is None or "summary_text" not in parsed:
+        raise HTTPException(status_code=502, detail="สรุปเอกสารไม่สำเร็จ ลองใหม่อีกครั้ง")
+
+    summary_text = str(parsed.get("summary_text") or "").strip()
+    structured_fields = parsed.get("structured_fields")
+    if not isinstance(structured_fields, dict):
+        structured_fields = None  # กันกรณี Claude ตอบผิดรูปแบบ ไม่ให้พังทั้ง request แค่ไม่มี structured data
+
+    if truncated:
+        summary_text = FEASIBILITY_TRUNCATION_NOTICE + summary_text
+
+    create_user_document(
+        user_id=user_id,
+        filename=filename,
+        raw_text=raw_text,
+        summary_text=summary_text,
+        structured_fields=structured_fields,
+    )
+
+    return {"summary_text": summary_text}
 
 
 # ---------- เสิร์ฟหน้าเว็บผู้ใช้ ----------

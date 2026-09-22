@@ -164,6 +164,20 @@ class UserSecurityAnswer(Base):
     answer_hash = Column(String, nullable=False)  # เก็บ bcrypt hash ของคำตอบ (normalize แล้ว) ไม่เก็บ plain text
 
 
+class UserDocument(Base):
+    """เอกสาร excel ที่ user ทั่วไปอัปโหลดผ่านปุ่มแนบไฟล์ในหน้าแชท (Feasibility Document Upload)
+    แยกจาก knowledge_base/logs โดยสิ้นเชิง ไม่ผ่านหน้ารอตรวจสอบหรือ AI Agent review queue ของ admin เลย"""
+    __tablename__ = "user_documents"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    filename = Column(String, nullable=False)
+    uploaded_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+    raw_text = Column(Text, nullable=False)
+    summary_text = Column(Text, nullable=False)
+    structured_fields = Column(JSON, nullable=True)
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
@@ -976,6 +990,25 @@ def get_security_answers_for_user(user_id: int) -> list[dict]:
     with SessionLocal() as session:
         rows = session.query(UserSecurityAnswer).filter(UserSecurityAnswer.user_id == user_id).all()
         return [{"question_id": r.question_id, "answer_hash": r.answer_hash} for r in rows]
+
+
+# ---------- User Documents (Feasibility Document Upload ในหน้าแชท) ----------
+
+def create_user_document(
+    user_id: int, filename: str, raw_text: str, summary_text: str, structured_fields: Optional[dict]
+) -> int:
+    with SessionLocal() as session:
+        row = UserDocument(
+            user_id=user_id,
+            filename=filename,
+            raw_text=raw_text,
+            summary_text=summary_text,
+            structured_fields=structured_fields,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.id
 
 
 # ---------- Chat sessions & messages ----------

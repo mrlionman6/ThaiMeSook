@@ -45,11 +45,11 @@
         <img src="/static/Graphic/TITLE_4.png" alt="กำลังสงสัยกฎหมายอะไรอยู่?" class="page-title">
 
         <div class="ask-row">
-            <input type="text" id="questionInput" placeholder="พิมพ์คำถามเกี่ยวกับกฎหมายที่ท่านสงสัย"
+            <input type="text" id="questionInput" placeholder="เริ่มต้นตรวจสอบกันเลย"
                    oninput="handleQuestionInputChange()" onclick="handleQuestionInputClick()">
             <div class="ask-controls">
-                <button type="button" id="attachImageBtn" onclick="document.getElementById('imageAttachInput').click()" title="ต้องเข้าสู่ระบบก่อนใช้งาน">แนบเอกสารทางกฎหมาย</button>
-                <input type="file" id="imageAttachInput" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf" hidden onchange="handleImageSelected()">
+                <button type="button" id="attachImageBtn" onclick="document.getElementById('imageAttachInput').click()" title="ต้องเข้าสู่ระบบก่อนใช้งาน">แนบเอกสาร</button>
+                <input type="file" id="imageAttachInput" accept="image/jpeg,image/png,image/webp,image/gif,application/pdf,.xlsx,.xls" hidden onchange="handleImageSelected()">
                 <button id="askButton" class="askButton_1" onclick="askQuestion()">ถาม</button>
             </div>
         </div>
@@ -68,7 +68,7 @@
     </div>
     <div id="answerBox" class="answerBox_1"></div>
 
-    <p class="app-footnote">💡 เครื่องมือช่วยค้นหาความรู้กฎหมายเบื้องต้นเพื่อความสะดวกของท่าน สำหรับกรณีเฉพาะแนะนำปรึกษาทนายความหรือหน่วยงานราชการที่เกี่ยวข้องเพิ่มเติม</p>
+    <p class="app-footnote">💡 เครื่องมือช่วยค้นหาความรู้กฎหมายเบื้องต้นเพื่อความสะดวกของท่าน สำหรับกรณีเฉพาะแนะนำปรึกษาผู้เชี่ยวชาญเกี่ยวข้องเพิ่มเติม</p>
 
     <!-- Modal overlay — ใช้ร่วมกันทั้ง login/register/forgot-password/profile -->
     <div id="modalBackdrop" class="modal-backdrop" hidden>

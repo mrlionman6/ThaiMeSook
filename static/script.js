@@ -9,15 +9,49 @@ let forgotPasswordUsername = null;
 const ROLE_LABELS_JS = { 1: "ระดับ 1", 2: "ระดับ 2", 3: "ระดับ 3" };
 
 // =====================================================================
-// แนบภาพ (ต้อง login) — เลือกไฟล์แล้วโชว์ชื่อไฟล์เป็น chip เล็กๆ ใต้ช่องพิมพ์
+// แนบไฟล์ (ต้อง login) — เลือกไฟล์แล้วโชว์ชื่อไฟล์เป็น chip เล็กๆ ใต้ช่องพิมพ์
+// รองรับ 3 ประเภท: ภาพ (Claude Vision ผ่าน /ask เดิม), excel แบบ Deal Screening
+// (/api/deal-screening/upload) และ excel แบบเอกสารทั่วไป (/api/user-documents/upload)
 // =====================================================================
-function handleImageSelected() {
+const IMAGE_MIME_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
+
+// ผลตรวจ header ล่าสุดจาก handleImageSelected() — cache ไว้กันเรียก /api/attachment-kind ซ้ำตอนกด "ถาม"
+// ต้อง reset ทุกครั้งที่เปลี่ยน/ล้างไฟล์แนบ (ไม่ใช่แค่ตอนกดปุ่มล้าง) กันค้างผลของไฟล์เก่า
+let cachedAttachmentKind = null;
+
+function resetAttachmentKindCache() {
+    cachedAttachmentKind = null;
+}
+
+async function getAttachmentKind(file) {
+    if (IMAGE_MIME_TYPES.includes(file.type)) return "image";
+    const name = file.name.toLowerCase();
+    if (!name.endsWith(".xlsx") && !name.endsWith(".xls")) {
+        return "unsupported"; // เช่น PDF ที่ accept ยอมให้เลือกได้แต่ backend ยังไม่รองรับจริง (phase ถัดไป)
+    }
+
+    // .xlsx/.xls ต้องเช็ค header column ฝั่ง backend ก่อนว่าตรง schema Deal Screening ไหม
+    // (โปรเจกต์นี้ยังไม่มี library อ่าน excel ฝั่ง client เลย เช็คฝั่ง backend ง่ายกว่าเพิ่ม dependency ใหม่)
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+        const res = await fetch("/api/attachment-kind", { method: "POST", body: formData });
+        if (!res.ok) return "unsupported";
+        const data = await res.json();
+        return data.kind; // "deal-screening-batch" | "feasibility"
+    } catch (error) {
+        return "unsupported";
+    }
+}
+
+async function handleImageSelected() {
     const imageInput = document.getElementById("imageAttachInput");
     const file = imageInput.files[0];
+    resetAttachmentKindCache(); // เลือกไฟล์ใหม่ทับไฟล์เดิมต้องล้าง cache เก่าทิ้งทันที ไม่ใช่แค่ตอนกดปุ่มล้าง
     if (!file) return;
 
     if (!currentUser) {
-        showAlertDialog("กรุณาเข้าสู่ระบบก่อนใช้ฟีเจอร์แนบภาพ");
+        showAlertDialog("กรุณาเข้าสู่ระบบก่อนใช้ฟีเจอร์แนบไฟล์");
         imageInput.value = "";
         return;
     }
@@ -29,6 +63,18 @@ function handleImageSelected() {
         return;
     }
 
+    const kind = await getAttachmentKind(file);
+
+    // กันเคส user เปลี่ยนไฟล์ใหม่อีกรอบระหว่างรอผล classify ของไฟล์เก่า — ไม่ให้ตั้ง cache/โชว์ chip ผิดไฟล์
+    if (imageInput.files[0] !== file) return;
+
+    if (kind === "unsupported") {
+        showAlertDialog("ยังไม่รองรับไฟล์ประเภทนี้ (รองรับเฉพาะภาพ JPEG/PNG/WEBP/GIF และ Excel .xlsx/.xls)");
+        imageInput.value = "";
+        return;
+    }
+
+    cachedAttachmentKind = kind;
     document.getElementById("imageAttachName").textContent = "📎 " + file.name;
     document.getElementById("imageAttachPreview").hidden = false;
 }
@@ -36,6 +82,7 @@ function handleImageSelected() {
 function clearImageAttachment() {
     document.getElementById("imageAttachInput").value = "";
     document.getElementById("imageAttachPreview").hidden = true;
+    resetAttachmentKindCache();
 }
 
 // =====================================================================
@@ -64,9 +111,9 @@ function openInputExpandModal() {
     const currentText = document.getElementById("questionInput").value;
     openModal(`
         <textarea id="questionExpandTextarea" class="input-expand-textarea"
-                  placeholder="พิมพ์คำถามเกี่ยวกับกฎหมายที่ท่านสงสัย">${escapeHtml(currentText)}</textarea>
+                  placeholder="เริ่มต้นตรวจสอบกันเลย">${escapeHtml(currentText)}</textarea>
         <div class="ask-controls">
-            <button class="button_base_1" type="button" onclick="document.getElementById('imageAttachInput').click()">แนบเอกสารทางกฎหมาย</button>
+            <button class="button_base_1" type="button" onclick="document.getElementById('imageAttachInput').click()">แนบเอกสาร</button>
             <button class="button_base_1" onclick="submitFromExpandModal()">ถาม</button>
         </div>
     `, "modal-card-wide");
@@ -117,6 +164,21 @@ async function askQuestion() {
     const imageFile = imageInput.files[0] || null;
 
     if (!query && !imageFile) return;
+
+    // ไฟล์ excel (ทั้ง 2 แบบ) แยกไปคนละ endpoint/flow กับ /ask เดิม (ไม่ผ่าน RAG, ไม่มี query/chat_id)
+    // ข้อความที่พิมพ์ไว้ในช่อง (ถ้ามี) จะไม่ถูกใช้เลยตามที่ตกลงกันไว้
+    if (imageFile) {
+        const kind = cachedAttachmentKind || await getAttachmentKind(imageFile);
+        if (kind === "deal-screening-batch") {
+            await handleDealScreeningAttachmentSubmit(imageFile);
+            return;
+        }
+        if (kind === "feasibility") {
+            await handleExcelAttachmentSubmit(imageFile);
+            return;
+        }
+        // kind === "image" → ปล่อยผ่านไป flow /ask เดิมด้านล่าง (Claude Vision)
+    }
 
     // จำแชทที่กำลังถามไว้ ณ ตอนเริ่ม — เผื่อ user สลับไปแชทอื่นระหว่างรอคำตอบ
     // (currentChatId ตัวแปร global อาจเปลี่ยนไปแล้วตอนคำตอบมาถึง ถ้าสลับแชทระหว่างทาง)
@@ -172,6 +234,88 @@ async function askQuestion() {
         }
         // ถ้าสลับไปแชทอื่นแล้ว ไม่ต้องโชว์อะไร (จะเห็นตอนกลับมาเปิดแชทนั้นผ่าน loadChat ที่ fetch จาก server)
 
+    } catch (error) {
+        markChatPending(requestChatId, false);
+        updateLoadingIndicator();
+        if (currentChatId === requestChatId) {
+            appendChatMessage("assistant", "⚠️ เกิดข้อผิดพลาด: " + error);
+            scrollChatToBottom();
+        }
+    }
+}
+
+// ไฟล์ excel (feasibility document) — เรียก /api/user-documents/upload แยกจาก /ask เดิมทั้งหมด
+// ไม่มี chat_id ไม่บันทึกลงประวัติแชท (หายไปถ้ารีเฟรชหรือสลับแชท) — ตามที่ตกลงกันไว้
+async function handleExcelAttachmentSubmit(file) {
+    const requestChatId = currentChatId; // ยึด context แชทที่กำลังดูอยู่ตอนกดส่ง กันโชว์ผลผิดที่ถ้าสลับแชทระหว่างรอ
+
+    appendChatMessage("user", "📎 [แนบเอกสาร] " + file.name);
+    document.getElementById("questionInput").value = "";
+    clearImageAttachment();
+    scrollChatToBottom();
+
+    markChatPending(requestChatId, true);
+    updateLoadingIndicator();
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const response = await fetch("/api/user-documents/upload", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || ("HTTP " + response.status));
+
+        markChatPending(requestChatId, false);
+        updateLoadingIndicator();
+
+        if (currentChatId === requestChatId) {
+            appendChatMessage("assistant", data.summary_text);
+            scrollChatToBottom();
+        }
+    } catch (error) {
+        markChatPending(requestChatId, false);
+        updateLoadingIndicator();
+        if (currentChatId === requestChatId) {
+            appendChatMessage("assistant", "⚠️ เกิดข้อผิดพลาด: " + error);
+            scrollChatToBottom();
+        }
+    }
+}
+
+// ไฟล์ excel ที่ header ตรง schema Deal Screening — เรียก /api/deal-screening/upload แยกจาก /ask เดิมทั้งหมด
+// เหมือน handleExcelAttachmentSubmit() ทุกจุด (ไม่มี chat_id ไม่บันทึกลงประวัติแชท) ต่างกันแค่ endpoint ปลายทาง
+async function handleDealScreeningAttachmentSubmit(file) {
+    const requestChatId = currentChatId;
+
+    appendChatMessage("user", "📎 [แนบเอกสาร] " + file.name);
+    document.getElementById("questionInput").value = "";
+    clearImageAttachment();
+    scrollChatToBottom();
+
+    markChatPending(requestChatId, true);
+    updateLoadingIndicator();
+
+    const formData = new FormData();
+    formData.append("file", file);
+
+    try {
+        const response = await fetch("/api/deal-screening/upload", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.detail || ("HTTP " + response.status));
+
+        markChatPending(requestChatId, false);
+        updateLoadingIndicator();
+
+        if (currentChatId === requestChatId) {
+            appendChatMessage("assistant", data.summary_text);
+            scrollChatToBottom();
+        }
     } catch (error) {
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
