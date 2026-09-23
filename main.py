@@ -875,6 +875,7 @@ def describe_image_for_retrieval(image_data: dict, query: str) -> tuple[bool, st
     lines = result.split("\n", 1)
     is_relevant = "ไม่เกี่ยวข้อง" not in lines[0]
     detail = lines[1].strip() if len(lines) > 1 else lines[0]
+    kind = image_data.get("media_type", "unknown")
     print(f"[ImageGuard] kind={kind} relevant={is_relevant} detail={detail!r}")
     return is_relevant, detail
 
