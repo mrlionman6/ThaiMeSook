@@ -2296,6 +2296,7 @@ async def upload_user_document(file: UploadFile = File(...), user_id: int = Depe
 
     if truncated:
         summary_text = FEASIBILITY_TRUNCATION_NOTICE + summary_text
+    summary_text += FEASIBILITY_DISCLAIMER_NOTICE  # เหมือนฝั่ง admin — ข้อความเตือนตายตัว เขียนในโค้ดเสมอ
 
     create_user_document(
         user_id=user_id,
