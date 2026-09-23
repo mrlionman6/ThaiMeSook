@@ -121,6 +121,10 @@ REWRITER_HISTORY_MESSAGES = 6  # 3 คู่ล่าสุด ที่ส่�
 # ---------- ฟีเจอร์แนบภาพ (อ่านข้อความจากภาพด้วย Claude Vision) — จำกัดเฉพาะ user ที่ login ----------
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+IMAGE_ANSWER_DISCLAIMER = (
+    "\n\n⚠️ คำตอบนี้อ้างอิงจากการอ่านภาพที่แนบมา ตัวเลข/ชื่อเฉพาะอาจคลาดเคลื่อนได้ "
+    "ควรตรวจสอบกับเอกสารต้นฉบับก่อนนำไปใช้งานจริง"
+)
 
 # ---------- โหลดโมเดล ----------
 print("กำลังโหลดโมเดล...")
@@ -1182,6 +1186,9 @@ async def ask_question(
     query, image_data, history = await _parse_and_validate_ask_input(query, chat_id, image, user_id)
 
     answer, sources = rag_answer(query, history=history, image_data=image_data)
+    if image_data:
+        # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง — Vision อ่านภาพคลาดเคลื่อนได้มากกว่าอ่านไฟล์จริง
+        answer += IMAGE_ANSWER_DISCLAIMER
 
     if user_id:
         saved_query = _build_saved_query(query, image_data)
