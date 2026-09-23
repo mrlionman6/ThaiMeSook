@@ -244,9 +244,9 @@ async function askQuestion() {
     }
 }
 
-// ไฟล์ excel (feasibility document) — เรียก /api/user-documents/upload แยกจาก /ask เดิมทั้งหมด
-// ไม่มี chat_id ไม่บันทึกลงประวัติแชท (หายไปถ้ารีเฟรชหรือสลับแชท) — ตามที่ตกลงกันไว้
-async function handleExcelAttachmentSubmit(file) {
+// ส่งผลอัปโหลดเอกสาร (Feasibility หรือ Deal Screening) ไปเซฟลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
+// ใช้ร่วมกันทั้ง 2 flow — sync currentChatId + sidebar ให้ตรงกันถ้า backend สร้างแชทใหม่ให้ (chat_id เดิมเป็น null)
+async function submitAttachmentUpload(endpoint, file) {
     const requestChatId = currentChatId; // ยึด context แชทที่กำลังดูอยู่ตอนกดส่ง กันโชว์ผลผิดที่ถ้าสลับแชทระหว่างรอ
 
     appendChatMessage("user", "📎 [แนบเอกสาร] " + file.name);
@@ -259,9 +259,10 @@ async function handleExcelAttachmentSubmit(file) {
 
     const formData = new FormData();
     formData.append("file", file);
+    if (requestChatId) formData.append("chat_id", requestChatId);
 
     try {
-        const response = await fetch("/api/user-documents/upload", {
+        const response = await fetch(endpoint, {
             method: "POST",
             body: formData,
         });
@@ -271,7 +272,17 @@ async function handleExcelAttachmentSubmit(file) {
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
 
-        if (currentChatId === requestChatId) {
+        // เช็คไว้ก่อน sync currentChatId เหมือน askQuestion() — กันเช็คซ้ำทีหลังผิดพลาดตอนเป็นแชทใหม่ (null -> id จริง)
+        const stillSameChat = (currentChatId === requestChatId);
+
+        if (data.chat_id) {
+            if (stillSameChat) {
+                currentChatId = data.chat_id; // แชทใหม่เพิ่งได้ id จริงตอนนี้ sync ให้ตรงก่อนโชว์ผล
+            }
+            loadChatHistory(); // อัปเดต sidebar เสมอ แม้ทำงานอยู่เบื้องหลัง (ไม่ได้ดูแชทนี้ตอนนี้)
+        }
+
+        if (stillSameChat) {
             appendChatMessage("assistant", data.summary_text);
             scrollChatToBottom();
         }
@@ -285,45 +296,14 @@ async function handleExcelAttachmentSubmit(file) {
     }
 }
 
+// ไฟล์ excel (feasibility document) — เรียก /api/user-documents/upload แยกจาก /ask เดิมทั้งหมด
+async function handleExcelAttachmentSubmit(file) {
+    await submitAttachmentUpload("/api/user-documents/upload", file);
+}
+
 // ไฟล์ excel ที่ header ตรง schema Deal Screening — เรียก /api/deal-screening/upload แยกจาก /ask เดิมทั้งหมด
-// เหมือน handleExcelAttachmentSubmit() ทุกจุด (ไม่มี chat_id ไม่บันทึกลงประวัติแชท) ต่างกันแค่ endpoint ปลายทาง
 async function handleDealScreeningAttachmentSubmit(file) {
-    const requestChatId = currentChatId;
-
-    appendChatMessage("user", "📎 [แนบเอกสาร] " + file.name);
-    document.getElementById("questionInput").value = "";
-    clearImageAttachment();
-    scrollChatToBottom();
-
-    markChatPending(requestChatId, true);
-    updateLoadingIndicator();
-
-    const formData = new FormData();
-    formData.append("file", file);
-
-    try {
-        const response = await fetch("/api/deal-screening/upload", {
-            method: "POST",
-            body: formData,
-        });
-        const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || ("HTTP " + response.status));
-
-        markChatPending(requestChatId, false);
-        updateLoadingIndicator();
-
-        if (currentChatId === requestChatId) {
-            appendChatMessage("assistant", data.summary_text);
-            scrollChatToBottom();
-        }
-    } catch (error) {
-        markChatPending(requestChatId, false);
-        updateLoadingIndicator();
-        if (currentChatId === requestChatId) {
-            appendChatMessage("assistant", "⚠️ เกิดข้อผิดพลาด: " + error);
-            scrollChatToBottom();
-        }
-    }
+    await submitAttachmentUpload("/api/deal-screening/upload", file);
 }
 
 // "Fake streaming" — คำตอบมาครบเต็มแล้วจาก backend (ผ่าน LanguageGuard retry มาแล้ว)

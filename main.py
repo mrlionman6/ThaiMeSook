@@ -2105,6 +2105,27 @@ def _matches_deal_screening_schema(columns) -> bool:
     return all(c in columns for c in DEAL_SCREENING_REQUIRED_COLUMNS)
 
 
+def _validate_chat_ownership(chat_id: Optional[int], user_id: int):
+    """เช็คว่าแชทนี้เป็นของ user คนนี้จริงก่อนจะเอาไปต่อข้อความใหม่ — กัน user คนอื่นยัดข้อความ
+    เข้าไปในแชทของคนอื่น (IDOR) เหมือนที่ /ask เช็คอยู่แล้วผ่าน _parse_and_validate_ask_input()"""
+    if chat_id is not None and get_chat_session(chat_id, user_id) is None:
+        raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
+
+
+def _save_attachment_result_to_chat(user_id: int, chat_id: Optional[int], filename: str, summary_text: str) -> int:
+    """บันทึกผลอัปโหลดเอกสาร (Deal Screening หรือ Feasibility) ลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
+    ใช้ร่วมกันทั้ง /api/deal-screening/upload และ /api/user-documents/upload
+    สร้างแชทใหม่ให้ถ้ายังไม่มี chat_id (ตั้งชื่อจากชื่อไฟล์ เหมือน /ask ตั้งชื่อจากคำถามแรก) คืนค่า chat_id สุดท้ายที่ใช้"""
+    if chat_id is None:
+        title = (f"📎 [แนบเอกสาร] {filename}")[:50] or "แชทใหม่"
+        chat_id = create_chat_session(user_id, title=title)
+
+    add_chat_message(chat_id, "user", f"📎 [แนบเอกสาร] {filename}")
+    add_chat_message(chat_id, "assistant", summary_text)
+    touch_chat_session(chat_id)
+    return chat_id
+
+
 @app.post("/api/attachment-kind")
 async def detect_attachment_kind(file: UploadFile = File(...), _: int = Depends(require_user)):
     """classify ไฟล์ .xlsx/.xls ที่แนบมาว่าตรง schema Deal Screening หรือไม่ ก่อนหน้าบ้านจะเลือกว่า
@@ -2133,9 +2154,15 @@ async def detect_attachment_kind(file: UploadFile = File(...), _: int = Depends(
 
 
 @app.post("/api/deal-screening/upload")
-async def upload_deal_screening_for_user(file: UploadFile = File(...), _: int = Depends(require_user)):
+async def upload_deal_screening_for_user(
+    file: UploadFile = File(...),
+    chat_id: Optional[int] = Form(None),
+    user_id: int = Depends(require_user),
+):
     """เหมือน /admin/api/deal-screening/upload ทุกจุดเรื่องการอ่านไฟล์/คำนวณ (reuse _process_deal_screening_row()
-    ตรงๆ ไม่เขียน logic คำนวณใหม่) ต่างกันแค่ auth และไม่เก็บผลลง DB — คืนข้อความสรุปแทนตาราง+กราฟ"""
+    ตรงๆ ไม่เขียน logic คำนวณใหม่) ต่างกันแค่ auth และไม่เก็บผลลง DB — คืนข้อความสรุปแทนตาราง+กราฟ
+    แต่บันทึกลงประวัติแชทปกติเหมือน /ask ทุกอย่าง (ต่างจาก /admin/api/deal-screening/upload ที่ไม่มีแชทเกี่ยวข้องเลย)"""
+    _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
     try:
         df = _read_deal_screening_dataframe(raw)
@@ -2163,7 +2190,9 @@ async def upload_deal_screening_for_user(file: UploadFile = File(...), _: int = 
         else:
             lines.append(f"❌ แถวที่ {r['row_number']} ({r['project_name']}) — ข้อผิดพลาด: {r['error']}")
 
-    return {"summary_text": "\n".join(lines)}
+    summary_text = "\n".join(lines)
+    final_chat_id = _save_attachment_result_to_chat(user_id, chat_id, file.filename or "upload.xlsx", summary_text)
+    return {"summary_text": summary_text, "chat_id": final_chat_id}
 
 
 # ---------- Feasibility Summarizer ----------
@@ -2264,11 +2293,16 @@ USER_DOCUMENT_SYSTEM_PROMPT = (
 
 
 @app.post("/api/user-documents/upload")
-async def upload_user_document(file: UploadFile = File(...), user_id: int = Depends(require_user)):
+async def upload_user_document(
+    file: UploadFile = File(...),
+    chat_id: Optional[int] = Form(None),
+    user_id: int = Depends(require_user),
+):
     filename = file.filename or ""
     if not filename.lower().endswith((".xlsx", ".xls")):
         raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
 
+    _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
     raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ
 
@@ -2305,8 +2339,9 @@ async def upload_user_document(file: UploadFile = File(...), user_id: int = Depe
         summary_text=summary_text,
         structured_fields=structured_fields,
     )
+    final_chat_id = _save_attachment_result_to_chat(user_id, chat_id, filename, summary_text)
 
-    return {"summary_text": summary_text}
+    return {"summary_text": summary_text, "chat_id": final_chat_id}
 
 
 # ---------- เสิร์ฟหน้าเว็บผู้ใช้ ----------
