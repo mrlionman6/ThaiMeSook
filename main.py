@@ -2369,6 +2369,78 @@ USER_DOCUMENT_SYSTEM_PROMPT = (
     "ต้นฉบับเป๊ะ ห้ามตีความหรือเติมหน่วยปีเอง) risks เป็น list ของข้อความสั้นๆ ถ้าไม่มีให้ใส่ [] ว่าง"
 )
 
+# ---------- Map-Reduce สำหรับเอกสารยาวเกิน FEASIBILITY_MAX_CHARS (เหมือน Feasibility Summarizer
+# แต่ Reduce ต้องคืน JSON ไม่ใช่ข้อความธรรมดา) — recycle FEASIBILITY_MAP_SYSTEM_PROMPT/_split_raw_text_by_sheet() เดิม
+USER_DOCUMENT_REDUCE_SYSTEM_PROMPT = (
+    USER_DOCUMENT_SYSTEM_PROMPT + "\n\n"
+    "ข้อมูลด้านล่างเป็นข้อสรุปย่อยจากแต่ละชีตของเอกสารเดียวกัน รวมเป็น JSON เดียวตาม schema ที่กำหนดไว้ข้างต้น ไม่ซ้ำซ้อน"
+)
+
+
+def _parse_user_document_response(response) -> dict:
+    """parse ผล Claude ที่ควรเป็น JSON {summary_text, structured_fields} — ใช้ร่วมกันทั้ง
+    summarize_user_document() (เรียกครั้งเดียว) และ Reduce step ของ summarize_user_document_map_reduce()"""
+    parsed = _parse_json_response(response.content[0].text, dict)
+    if parsed is None or "summary_text" not in parsed:
+        raise HTTPException(status_code=502, detail="สรุปเอกสารไม่สำเร็จ ลองใหม่อีกครั้ง")
+
+    summary_text = str(parsed.get("summary_text") or "").strip()
+    structured_fields = parsed.get("structured_fields")
+    if not isinstance(structured_fields, dict):
+        structured_fields = None  # กันกรณี Claude ตอบผิดรูปแบบ ไม่ให้พังทั้ง request แค่ไม่มี structured data
+
+    return {"summary_text": summary_text, "structured_fields": structured_fields}
+
+
+def summarize_user_document(raw_text: str) -> dict:
+    """เรียก Claude ตรงๆ ครั้งเดียว ไม่ผ่าน RAG/agentic tool loop เหมือน summarize_feasibility_document()
+    แต่ parse ผลเป็น JSON {summary_text, structured_fields} แทนข้อความธรรมดา"""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4000,
+        system=USER_DOCUMENT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": raw_text}],
+    )
+    return _parse_user_document_response(response)
+
+
+def summarize_user_document_map_reduce(raw_text: str) -> dict:
+    """เหมือน summarize_feasibility_document_map_reduce() ทุกจุด (Map ด้วย FEASIBILITY_MAP_SYSTEM_PROMPT เดิม,
+    recycle _split_raw_text_by_sheet() เดิม, fallback เดียวกันทั้ง >10 ชีตและทุกชีตว่างเปล่า)
+    ต่างกันแค่ Reduce ต้องคืน JSON แทนข้อความธรรมดา — เรียกทีละคำขอตามลำดับ (ไม่ parallelize)"""
+    sheets = _split_raw_text_by_sheet(raw_text)
+
+    if len(sheets) > FEASIBILITY_MAX_SHEETS_FOR_MAP_REDUCE:
+        # ชีตเยอะผิดปกติ — fallback กลับไปตัด 15,000 ตัวอักษรแรกแบบเดิมทั้งไฟล์ กัน cost บาน
+        result = summarize_user_document(raw_text[:FEASIBILITY_MAX_CHARS])
+        result["summary_text"] = FEASIBILITY_TRUNCATION_NOTICE + result["summary_text"]
+        return result
+
+    sheet_summaries = []
+    for sheet_name, content in sheets:
+        if not content.strip():
+            continue  # ชีตว่างเปล่า ข้ามไปไม่เสีย API call
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            system=FEASIBILITY_MAP_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+        sheet_summaries.append(f"=== {sheet_name} ===\n{response.content[0].text.strip()}")
+
+    if not sheet_summaries:
+        # ทุกชีตว่างเปล่าหมด (edge case) — ไม่มีอะไรให้ Reduce ต่อ ใช้ทางเดิมกับข้อความที่ตัดแล้ว
+        return summarize_user_document(raw_text[:FEASIBILITY_MAX_CHARS])
+
+    combined = "\n\n".join(sheet_summaries)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4000,
+        system=USER_DOCUMENT_REDUCE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": combined}],
+    )
+    return _parse_user_document_response(response)
+
 
 @app.post("/api/user-documents/upload")
 async def upload_user_document(
@@ -2387,28 +2459,13 @@ async def upload_user_document(
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
 
-    truncated = len(raw_text) > FEASIBILITY_MAX_CHARS
-    if truncated:
-        raw_text = raw_text[:FEASIBILITY_MAX_CHARS]
+    if len(raw_text) <= FEASIBILITY_MAX_CHARS:
+        result = summarize_user_document(raw_text)
+    else:
+        result = summarize_user_document_map_reduce(raw_text)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=4000,
-        system=USER_DOCUMENT_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": raw_text}],
-    )
-    parsed = _parse_json_response(response.content[0].text, dict)
-    if parsed is None or "summary_text" not in parsed:
-        raise HTTPException(status_code=502, detail="สรุปเอกสารไม่สำเร็จ ลองใหม่อีกครั้ง")
-
-    summary_text = str(parsed.get("summary_text") or "").strip()
-    structured_fields = parsed.get("structured_fields")
-    if not isinstance(structured_fields, dict):
-        structured_fields = None  # กันกรณี Claude ตอบผิดรูปแบบ ไม่ให้พังทั้ง request แค่ไม่มี structured data
-
-    if truncated:
-        summary_text = FEASIBILITY_TRUNCATION_NOTICE + summary_text
-    summary_text += FEASIBILITY_DISCLAIMER_NOTICE  # เหมือนฝั่ง admin — ข้อความเตือนตายตัว เขียนในโค้ดเสมอ
+    summary_text = result["summary_text"] + FEASIBILITY_DISCLAIMER_NOTICE  # เหมือนฝั่ง admin — เขียนในโค้ดเสมอ
+    structured_fields = result["structured_fields"]
 
     create_user_document(
         user_id=user_id,
