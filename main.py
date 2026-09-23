@@ -2214,6 +2214,50 @@ FEASIBILITY_SYSTEM_PROMPT = (
     "ห้ามเติมปีที่ไม่ได้เขียนไว้ ห้ามตีความหรือคำนวณวันที่เอง แม้จะดูเหมือนเข้าใจบริบทได้ก็ตาม"
 )
 
+# ---------- Map-Reduce สำหรับเอกสารยาวเกิน FEASIBILITY_MAX_CHARS (แทนการตัดทิ้งเนื้อหา) ----------
+FEASIBILITY_SHEET_HEADER_PATTERN = re.compile(r"^=== (.+) ===$")
+
+FEASIBILITY_MAP_SYSTEM_PROMPT = (
+    "ดึงข้อเท็จจริงสำคัญ (ตัวเลข วันที่ ชื่อ เงื่อนไข) จากเอกสารส่วนนี้ (1 ชีต) เฉพาะที่ปรากฏจริง "
+    "ห้ามเดา/สมมติ ห้ามใช้ Markdown ไม่ต้องจัดครบ 4 หมวด (จะรวมกับชีตอื่นภายหลัง)"
+)
+
+FEASIBILITY_REDUCE_SYSTEM_PROMPT = (
+    FEASIBILITY_SYSTEM_PROMPT + "\n\n"
+    "ข้อมูลด้านล่างเป็นข้อสรุปย่อยจากแต่ละชีตของเอกสารเดียวกัน รวมเป็นสรุปเดียวที่สมบูรณ์ ไม่ซ้ำซ้อน"
+)
+
+FEASIBILITY_MAX_SHEETS_FOR_MAP_REDUCE = 10  # เกินนี้ fallback กลับไปตัดทิ้งแบบเดิมทั้งไฟล์ กัน cost บาน
+
+
+def _split_raw_text_by_sheet(raw_text: str) -> list[tuple[str, str]]:
+    """แบ่งข้อความดิบจาก _extract_excel_text() กลับเป็นรายชีต ตาม marker '=== ชื่อชีต ===' เดิม
+    คืนเป็น list ของ (ชื่อชีต, เนื้อหาชีต) — ถ้าชีตไหนเนื้อหาเดี่ยวๆ ยาวเกิน FEASIBILITY_MAX_CHARS
+    จะตัด + ปะ FEASIBILITY_TRUNCATION_NOTICE เฉพาะชีตนั้น (ของเดิมที่มีอยู่แล้ว)"""
+    sheets: list[tuple[str, str]] = []
+    current_name = None
+    current_lines: list[str] = []
+
+    def flush():
+        if current_name is None:
+            return
+        content = "\n".join(current_lines)
+        if len(content) > FEASIBILITY_MAX_CHARS:
+            content = content[:FEASIBILITY_MAX_CHARS] + "\n\n" + FEASIBILITY_TRUNCATION_NOTICE.strip()
+        sheets.append((current_name, content))
+
+    for line in raw_text.split("\n"):
+        match = FEASIBILITY_SHEET_HEADER_PATTERN.match(line)
+        if match:
+            flush()
+            current_name = match.group(1)
+            current_lines = []
+        else:
+            current_lines.append(line)
+    flush()
+
+    return sheets
+
 
 def _extract_excel_text(raw: bytes) -> str:
     """อ่านทุก cell ในทุกชีตของไฟล์ excel เป็นข้อความดิบ ไม่บังคับ schema/คอลัมน์ตายตัว
@@ -2252,6 +2296,42 @@ def summarize_feasibility_document(raw_text: str) -> str:
     return response.content[0].text.strip()
 
 
+def summarize_feasibility_document_map_reduce(raw_text: str) -> str:
+    """ใช้แทน summarize_feasibility_document() ตอนเอกสารยาวเกิน FEASIBILITY_MAX_CHARS
+    (ไม่ตัดทิ้งเนื้อหาแบบเดิม) — Map: สรุปย่อยทีละชีตแยกกัน, Reduce: รวมสรุปย่อยทุกชีตเป็นสรุปเดียว
+    ที่ครบ 4 หมวดเหมือน summarize_feasibility_document() ปกติ เรียกทีละคำขอตามลำดับ (ไม่ parallelize)"""
+    sheets = _split_raw_text_by_sheet(raw_text)
+
+    if len(sheets) > FEASIBILITY_MAX_SHEETS_FOR_MAP_REDUCE:
+        # ชีตเยอะผิดปกติ — fallback กลับไปตัด 15,000 ตัวอักษรแรกแบบเดิมทั้งไฟล์ กัน cost บาน
+        return FEASIBILITY_TRUNCATION_NOTICE + summarize_feasibility_document(raw_text[:FEASIBILITY_MAX_CHARS])
+
+    sheet_summaries = []
+    for sheet_name, content in sheets:
+        if not content.strip():
+            continue  # ชีตว่างเปล่า ข้ามไปไม่เสีย API call
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            system=FEASIBILITY_MAP_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": content}],
+        )
+        sheet_summaries.append(f"=== {sheet_name} ===\n{response.content[0].text.strip()}")
+
+    if not sheet_summaries:
+        # ทุกชีตว่างเปล่าหมด (edge case) — ไม่มีอะไรให้ Reduce ต่อ ใช้ทางเดิมกับข้อความที่ตัดแล้ว
+        return summarize_feasibility_document(raw_text[:FEASIBILITY_MAX_CHARS])
+
+    combined = "\n\n".join(sheet_summaries)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=4000,
+        system=FEASIBILITY_REDUCE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": combined}],
+    )
+    return response.content[0].text.strip()
+
+
 @app.post("/admin/api/feasibility-summarizer/upload")
 async def upload_feasibility_summary(file: UploadFile = File(...), _: bool = Depends(require_login)):
     raw = await file.read()
@@ -2260,13 +2340,11 @@ async def upload_feasibility_summary(file: UploadFile = File(...), _: bool = Dep
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
 
-    truncated = len(raw_text) > FEASIBILITY_MAX_CHARS
-    if truncated:
-        raw_text = raw_text[:FEASIBILITY_MAX_CHARS]
+    if len(raw_text) <= FEASIBILITY_MAX_CHARS:
+        summary = summarize_feasibility_document(raw_text)
+    else:
+        summary = summarize_feasibility_document_map_reduce(raw_text)
 
-    summary = summarize_feasibility_document(raw_text)
-    if truncated:
-        summary = FEASIBILITY_TRUNCATION_NOTICE + summary
     summary += FEASIBILITY_DISCLAIMER_NOTICE  # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง
 
     return {"summary": summary}
