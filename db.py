@@ -32,7 +32,8 @@ import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func
+    create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func,
+    LargeBinary,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
@@ -176,6 +177,21 @@ class UserDocument(Base):
     raw_text = Column(Text, nullable=False)
     summary_text = Column(Text, nullable=False)
     structured_fields = Column(JSON, nullable=True)
+
+
+class EditableDocument(Base):
+    """ไฟล์ excel ที่ user อัปโหลดผ่านฟีเจอร์ 'แก้ไฟล์ Excel' — เก็บไฟล์ต้นฉบับ (original_bytes)
+    แยกจาก label_map (ตำแหน่ง+ค่าปัจจุบันของแต่ละ label) ไว้คนละส่วน การแก้ระหว่างคุยกันหลายรอบ
+    จะแก้แค่ label_map เท่านั้น ไม่แตะ original_bytes เลย จนกว่าจะยืนยัน (confirm) จริง"""
+    __tablename__ = "editable_documents"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    filename = Column(String, nullable=False)
+    original_bytes = Column(LargeBinary, nullable=False)
+    label_map = Column(JSON, nullable=False)  # {label: {sheet, row, col, current_value, number_format}}
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime(timezone=True), nullable=False)  # เขียนตอน insert = created_at + EDITABLE_DOCUMENT_EXPIRY_DAYS
 
 
 class ChatSession(Base):
@@ -1009,6 +1025,56 @@ def create_user_document(
         session.commit()
         session.refresh(row)
         return row.id
+
+
+# ---------- Excel Editor (แนบไฟล์ excel มาแก้ผ่านการคุย แล้วดาวน์โหลดกลับ) ----------
+EDITABLE_DOCUMENT_EXPIRY_DAYS = 5  # เขียนเป็นค่า expires_at ตอน insert เลย (ต่างจาก Deal Screening ที่คำนวณตอน query)
+
+
+def create_editable_document(user_id: int, filename: str, original_bytes: bytes, label_map: dict) -> int:
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        row = EditableDocument(
+            user_id=user_id,
+            filename=filename,
+            original_bytes=original_bytes,
+            label_map=label_map,
+            created_at=now,
+            expires_at=now + datetime.timedelta(days=EDITABLE_DOCUMENT_EXPIRY_DAYS),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.id
+
+
+def get_editable_document(document_id: int, user_id: int) -> Optional[dict]:
+    """คืน None ทั้งกรณีไม่พบ id, ไม่ใช่เจ้าของ, และหมดอายุ — ดูเหมือนกันหมดจากภายนอก
+    (เหมือน get_chat_session()/get_deal_screening_batch() — ownership+expiry รวมอยู่จุดเดียว)"""
+    with SessionLocal() as session:
+        row = session.get(EditableDocument, document_id)
+        if row is None or row.user_id != user_id:
+            return None
+        if row.expires_at is not None and row.expires_at < datetime.datetime.utcnow():
+            return None
+        return {
+            "id": row.id,
+            "filename": row.filename,
+            "original_bytes": row.original_bytes,
+            "label_map": row.label_map,
+        }
+
+
+def update_editable_document_label_map(document_id: int, label_map: dict) -> bool:
+    """อัปเดตแค่ label_map (current_value ที่แก้ระหว่างคุย) — ไม่แตะ original_bytes เลย
+    caller ต้องเช็ค ownership ผ่าน get_editable_document() มาก่อนแล้วเสมอ"""
+    with SessionLocal() as session:
+        row = session.get(EditableDocument, document_id)
+        if row is None:
+            return False
+        row.label_map = label_map
+        session.commit()
+        return True
 
 
 # ---------- Chat sessions & messages ----------

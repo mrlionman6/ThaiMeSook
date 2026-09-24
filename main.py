@@ -63,6 +63,9 @@ from db import (
     get_deal_screening_batch,
     get_deal_screening_history,
     create_user_document,
+    create_editable_document,
+    get_editable_document,
+    update_editable_document_label_map,
 )
 
 import os
@@ -75,6 +78,7 @@ import string
 import random
 import bcrypt
 import pandas as pd
+import openpyxl
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -1100,6 +1104,9 @@ class LoginRequest(BaseModel):
 
 class ChatCreateRequest(BaseModel):
     title: Optional[str] = None
+
+class ExcelEditorInstruction(BaseModel):
+    instruction: str
 
 class ForgotPasswordQuestionsRequest(BaseModel):
     username: str
@@ -2477,6 +2484,200 @@ async def upload_user_document(
     final_chat_id = _save_attachment_result_to_chat(user_id, chat_id, filename, summary_text)
 
     return {"summary_text": summary_text, "chat_id": final_chat_id}
+
+
+# ---------- Excel Editor (อัปโหลด excel, คุยสั่งแก้หลายรอบ, ยืนยันแล้วดาวน์โหลด) ----------
+# แยกจาก Feasibility Summarizer/Deal Screening/User Documents โดยสิ้นเชิง — คนละ mode คนละ flow
+# ใช้ openpyxl ตรงๆ (ไม่ใช่ pandas) เพราะต้องรู้พิกัด (sheet, row, col) จริงของแต่ละเซลล์
+# เพื่อเขียนค่ากลับตำแหน่งเดิมเป๊ะตอน confirm โดยคงโครงสร้าง/formatting เดิมทั้งไฟล์ไว้
+EXCEL_EDITOR_SYSTEM_PROMPT = (
+    "คุณเป็นผู้ช่วยแก้ไฟล์ Excel ผู้ใช้จะพิมพ์คำสั่งบอกว่าอยากแก้ค่าไหนในไฟล์เป็นอะไร "
+    "ด้านล่างคือรายการ label ทั้งหมดที่แก้ได้ในไฟล์นี้ พร้อมค่าปัจจุบันและรูปแบบเซลล์ (number_format)\n\n"
+    "หน้าที่ของคุณ: จับคู่คำสั่งของผู้ใช้กับ label ที่ตรงที่สุดเพียง 1 label เท่านั้น "
+    "(ถ้าคำสั่งขอแก้หลาย label พร้อมกัน ให้เลือกจับคู่แค่ label แรกที่ชัดเจนที่สุด "
+    "แล้วอธิบายในเหตุผลว่าต้องแยกสั่งทีละรายการ) ถ้าไม่พบ label ที่ตรงกับคำสั่งเลย หรือไม่มั่นใจว่าจับคู่ถูกจุด "
+    "ห้ามเดาเด็ดขาด ให้ตอบ matched เป็น false พร้อมอธิบายเหตุผลว่าทำไมไม่พบ\n\n"
+    "ถ้า label ที่จับคู่ได้มี number_format ที่มีสัญลักษณ์ % อยู่ ให้ตอบ new_value เป็นตัวเลขเปอร์เซ็นต์ธรรมดา "
+    "(เช่นถ้าผู้ใช้ต้องการ 10% ให้ตอบ \"10\") ห้ามหารด้วย 100 เองหรือแปลงเป็นทศนิยมเอง ระบบจะแปลงให้เอง\n\n"
+    "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
+    '{"matched": true/false, "label": "...หรือ null ถ้า matched เป็น false", '
+    '"new_value": "...หรือ null ถ้า matched เป็น false", "reason": "คำอธิบายสั้นๆ"}'
+)
+
+
+def _extract_excel_labels(raw: bytes) -> dict:
+    """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ)
+    ไล่ทุกแถวทุกชีต ถ้าแถวมีเซลล์ไม่ว่างพอดี 2 เซลล์ ให้เซลล์แรก=label เซลล์หลัง=value+พิกัด
+    label ที่ซ้ำกัน: ซ้ำต่างชีต เติม '(ชื่อชีต)' ต่อท้าย, ซ้ำในชีตเดียวกัน เติม '(แถว N)' ต่อท้าย"""
+    wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+
+    sheets_seen_by_label: dict[str, set] = {}
+    label_map = {}
+
+    for sheet_name in wb.sheetnames:
+        ws = wb[sheet_name]
+        for row in ws.iter_rows():
+            non_empty = [c for c in row if c.value is not None and str(c.value).strip() != ""]
+            if len(non_empty) != 2:
+                continue
+            label_cell, value_cell = non_empty
+            label_text = str(label_cell.value).strip()
+
+            sheets_seen = sheets_seen_by_label.setdefault(label_text, set())
+            if not sheets_seen:
+                key = label_text
+            elif sheet_name in sheets_seen:
+                key = f"{label_text} (แถว {value_cell.row})"
+            else:
+                key = f"{label_text} ({sheet_name})"
+            sheets_seen.add(sheet_name)
+
+            label_map[key] = {
+                "sheet": sheet_name,
+                "row": value_cell.row,
+                "col": value_cell.column,
+                "current_value": value_cell.value,
+                "number_format": value_cell.number_format,
+            }
+
+    return label_map
+
+
+def _coerce_value_for_cell(current_value, number_format: Optional[str]):
+    """แปลงค่าก่อนเขียนกลับเซลล์จริงตอน confirm — คืน (ok, value, error_message)
+    ถ้าเซลล์เป็น %-format: ตัด '%' ออกแล้วหารด้วย 100 เสมอ ไม่ว่า Claude จะตอบมามีเครื่องหมาย % หรือไม่
+    (แปลงไม่ได้ = error ชัดเจน ไม่เขียนค่าผิดขนาดแบบเงียบๆ)
+    ถ้าไม่ใช่ %-format: ลองแปลงเป็นตัวเลขถ้าทำได้ ไม่ได้ก็เขียนเป็น string ตามเดิม (ไม่ใช่ error เพราะบาง label เป็นข้อความ)"""
+    is_percent = bool(number_format) and "%" in number_format
+
+    if is_percent:
+        text = str(current_value).strip().rstrip("%").strip()
+        try:
+            return True, float(text) / 100, None
+        except ValueError:
+            return False, None, f"ไม่สามารถแปลงค่า {current_value!r} ให้เป็นตัวเลขเปอร์เซ็นต์ได้"
+
+    if isinstance(current_value, (int, float)):
+        return True, current_value, None
+
+    text = str(current_value).strip()
+    try:
+        return True, (float(text) if "." in text else int(text)), None
+    except ValueError:
+        return True, current_value, None  # ไม่ใช่ตัวเลข เขียนเป็น string ตรงๆ (ไม่ error)
+
+
+@app.post("/api/excel-editor/upload")
+async def upload_excel_editor_document(file: UploadFile = File(...), user_id: int = Depends(require_user)):
+    filename = file.filename or "upload.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        # openpyxl เขียนไฟล์กลับได้เฉพาะ .xlsx เท่านั้น (.xls ต้องใช้ library คนละตัวที่เขียนไม่ได้) จึงไม่รองรับ .xls รอบนี้
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx เท่านั้น")
+
+    raw = await file.read()
+    try:
+        label_map = _extract_excel_labels(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
+
+    if not label_map:
+        raise HTTPException(
+            status_code=400,
+            detail="ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้",
+        )
+
+    document_id = create_editable_document(
+        user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map,
+    )
+
+    return {
+        "document_id": document_id,
+        "labels": [
+            {"label": label, "current_value": info["current_value"]}
+            for label, info in label_map.items()
+        ],
+    }
+
+
+@app.post("/api/excel-editor/{document_id}/edit")
+def edit_excel_editor_document(
+    document_id: int, body: ExcelEditorInstruction, user_id: int = Depends(require_user)
+):
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+
+    label_map = doc["label_map"]
+    prompt = (
+        f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
+        f"คำสั่งจากผู้ใช้: {body.instruction}"
+    )
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=500,
+        system=EXCEL_EDITOR_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parsed = _parse_json_response(response.content[0].text, dict)
+    if parsed is None or "matched" not in parsed:
+        raise HTTPException(status_code=502, detail="ประมวลผลคำสั่งไม่สำเร็จ ลองใหม่อีกครั้ง")
+
+    if not parsed.get("matched"):
+        return {"matched": False, "message": str(parsed.get("reason") or "ไม่พบ label ที่ตรงกับคำสั่งนี้")}
+
+    label = parsed.get("label")
+    if label not in label_map:
+        # กันกรณี Claude หลอนชื่อ label ที่ไม่มีอยู่จริง ไม่ให้ไปสร้าง key ใหม่ปนใน label_map
+        return {
+            "matched": False,
+            "message": f"ระบบจับคู่กับ '{label}' แต่ไม่พบ label นี้จริงในไฟล์ กรุณาลองสั่งใหม่ให้ชัดเจนขึ้น",
+        }
+
+    new_value = parsed.get("new_value")
+    old_value = label_map[label]["current_value"]
+    label_map[label]["current_value"] = new_value
+    update_editable_document_label_map(document_id, label_map)
+
+    return {
+        "matched": True,
+        "label": label,
+        "old_value": old_value,
+        "new_value": new_value,
+        "message": str(parsed.get("reason") or f"แก้ '{label}' จาก {old_value} เป็น {new_value}"),
+    }
+
+
+@app.post("/api/excel-editor/{document_id}/confirm")
+def confirm_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+
+    # ตรวจสอบให้ผ่านทุก label ก่อน ค่อยเริ่มเขียนไฟล์จริง — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
+    resolved = {}
+    for label, info in doc["label_map"].items():
+        ok, value, error = _coerce_value_for_cell(info["current_value"], info.get("number_format"))
+        if not ok:
+            raise HTTPException(
+                status_code=422,
+                detail=f"'{label}': {error} — กรุณาแก้ไขค่านี้ก่อนยืนยันอีกครั้ง",
+            )
+        resolved[label] = value
+
+    wb = openpyxl.load_workbook(io.BytesIO(doc["original_bytes"]))  # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว
+    for label, info in doc["label_map"].items():
+        ws = wb[info["sheet"]]
+        ws.cell(row=info["row"], column=info["col"], value=resolved[label])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={doc['filename']}"},
+    )
 
 
 # ---------- เสิร์ฟหน้าเว็บผู้ใช้ ----------
