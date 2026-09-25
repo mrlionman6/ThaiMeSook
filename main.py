@@ -2628,6 +2628,19 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     return intent if intent in ("edit", "finalize", "unrelated") else "unrelated"
 
 
+_LABEL_TRAILING_PUNCTUATION = ":：;；,，."
+
+
+def _normalize_label(s: str) -> str:
+    """ตัด whitespace และเครื่องหมายวรรคตอนท้ายสุด (เช่น ':', '：') ออกก่อนเทียบ label — กันเคส Claude
+    ตอบชื่อ label กลับมาไม่ตรงตัวอักษรเป๊ะ (เช่น ตัด ':' ท้ายออกไปเอง) ตัดแค่ตัวสุดท้ายตัวเดียวเท่านั้น
+    ไม่ตัดซ้ำหลายตัว กันกัดกร่อนวงเล็บ/เปอร์เซ็นต์ที่เป็นส่วนหนึ่งของชื่อจริง เช่น '(Tax %)'"""
+    result = s.strip()
+    if result and result[-1] in _LABEL_TRAILING_PUNCTUATION:
+        result = result[:-1].strip()
+    return result
+
+
 def _match_and_apply_excel_edit(document_id: int, label_map: dict, instruction: str) -> dict:
     """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
     คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
@@ -2651,11 +2664,18 @@ def _match_and_apply_excel_edit(document_id: int, label_map: dict, instruction: 
 
     label = parsed.get("label")
     if label not in label_map:
-        # กันกรณี Claude หลอนชื่อ label ที่ไม่มีอยู่จริง ไม่ให้ไปสร้าง key ใหม่ปนใน label_map
-        return {
-            "matched": False,
-            "message": f"ระบบจับคู่กับ '{label}' แต่ไม่พบ label นี้จริงในไฟล์ กรุณาลองสั่งใหม่ให้ชัดเจนขึ้น",
-        }
+        # exact match ไม่เจอ — ลองเทียบแบบ normalize (ตัด whitespace/เครื่องหมายวรรคตอนท้ายสุด) ก่อนปฏิเสธ
+        # กันเคส Claude ตอบชื่อ label ไม่ตรงตัวอักษรเป๊ะ (เช่น ตัด ':' ท้ายออกไปเอง) ทั้งที่จับคู่ถูกตัวจริงๆ
+        normalized_target = _normalize_label(label) if label else ""
+        candidates = [key for key in label_map if _normalize_label(key) == normalized_target]
+        if len(candidates) == 1:
+            label = candidates[0]  # ใช้ key จริงจาก label_map เสมอ ไม่ใช่ข้อความที่ Claude ตอบมา
+        else:
+            # เจอมากกว่า 1 ตัวชนกัน (กำกวม) หรือไม่เจอเลย -> ปฏิเสธเหมือนเดิม ไม่เดาแก้ผิดจุด
+            return {
+                "matched": False,
+                "message": f"ระบบจับคู่กับ '{label}' แต่ไม่พบ label นี้จริงในไฟล์ กรุณาลองสั่งใหม่ให้ชัดเจนขึ้น",
+            }
 
     new_value = parsed.get("new_value")
     old_value = label_map[label]["current_value"]
