@@ -1055,8 +1055,12 @@ def get_editable_document(document_id: int, user_id: int) -> Optional[dict]:
         row = session.get(EditableDocument, document_id)
         if row is None or row.user_id != user_id:
             return None
-        if row.expires_at is not None and row.expires_at < datetime.datetime.utcnow():
-            return None
+        if row.expires_at is not None:
+            # normalize offset-aware -> offset-naive ก่อนเทียบ เหมือน _is_deal_screening_expired() เป๊ะ
+            # (datetime.utcnow() เป็น naive แต่ column เป็น DateTime(timezone=True) — เทียบตรงๆ ไม่ได้ TypeError)
+            expires_at = row.expires_at.replace(tzinfo=None) if row.expires_at.tzinfo else row.expires_at
+            if expires_at < datetime.datetime.utcnow():
+                return None
         return {
             "id": row.id,
             "filename": row.filename,
