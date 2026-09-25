@@ -343,7 +343,7 @@ button {
     border-bottom: 2px solid #eee;
 }
 
-.flat-text-simple {
+.flat-text-simple a{
    color: black;
    text-decoration: none;
 }
