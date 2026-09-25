@@ -270,6 +270,12 @@ def init_db():
         ))
         conn.commit()
 
+    # ตาราง editable_documents ถูกสร้างไปแล้วตั้งแต่ก่อนเพิ่ม column chat_id เข้าโมเดล (deploy รอบแรกของ
+    # Excel Editor) — create_all ไม่ alter ตารางเดิมที่มีอยู่แล้ว ต้อง ALTER TABLE เพิ่มเอง
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE editable_documents ADD COLUMN IF NOT EXISTS chat_id INTEGER"))
+        conn.commit()
+
 
 # ---------- Knowledge base ----------
 
