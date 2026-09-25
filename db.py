@@ -1092,12 +1092,17 @@ def get_editable_document_by_chat(chat_id: int, user_id: int) -> Optional[dict]:
     ถือว่าตัวใหม่สุดคือตัวที่กำลังแก้อยู่ ไม่ทำ logic ซับซ้อนกว่านี้) คืน None ถ้าไม่มี/หมดอายุแล้ว
     ใช้เช็คตอน /ask ว่าแชทนี้อยู่ระหว่างแก้ไฟล์ excel อยู่หรือไม่ ก่อน route ข้อความถัดไป"""
     with SessionLocal() as session:
-        row = (
+        rows = (
             session.query(EditableDocument)
             .filter(EditableDocument.chat_id == chat_id, EditableDocument.user_id == user_id)
             .order_by(EditableDocument.created_at.desc())
-            .first()
+            .all()
         )
+        if len(rows) > 1:
+            # ไม่ควรเกิดในการใช้งานปกติ (1 แชท = 1 เอกสารที่กำลังแก้) — log ไว้เผื่อสืบสาเหตุถ้าเกิด lost update
+            # อีก เพราะ policy "เอาตัวล่าสุด" แปลว่าการแก้ที่เคยทำกับ row เก่าจะมองไม่เห็นอีกเลยตั้งแต่จุดนี้
+            print(f"[EditableDocument] เตือน: chat_id={chat_id} มี {len(rows)} rows ผูกอยู่ (ควรมีแค่ 1) ids={[r.id for r in rows]}")
+        row = rows[0] if rows else None
         if row is None or _is_editable_document_expired(row.expires_at):
             return None
         return _editable_document_to_dict(row)

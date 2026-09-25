@@ -1198,7 +1198,7 @@ async def ask_question(
             intent = _classify_excel_editor_intent(editable_doc["label_map"], query)
 
             if intent == "edit":
-                result = _match_and_apply_excel_edit(editable_doc["id"], editable_doc["label_map"], query)
+                result = _match_and_apply_excel_edit(editable_doc["id"], user_id, query)
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", result["message"])
                 touch_chat_session(chat_id)
@@ -2644,10 +2644,18 @@ def _normalize_label(s: str) -> str:
     return result
 
 
-def _match_and_apply_excel_edit(document_id: int, label_map: dict, instruction: str) -> dict:
+def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
     """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
     คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
-    ซึ่งทั้งคู่ต้องได้ข้อความคำตอบกลับไปแสดงในแชทเสมอ ไม่ใช่ error response)"""
+    ซึ่งทั้งคู่ต้องได้ข้อความคำตอบกลับไปแสดงในแชทเสมอ ไม่ใช่ error response)
+
+    รับแค่ document_id + user_id แล้ว fetch label_map สดใหม่จาก DB เองเสมอ (ไม่รับ label_map จาก caller
+    ตรงๆ) กัน caller ถือ label_map เก่าค้างไว้แล้วเขียนทับการแก้ก่อนหน้าที่คนอื่น/รอบอื่นเพิ่งบันทึกไป (lost update)"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว กรุณาอัปโหลดไฟล์ใหม่อีกครั้ง"}
+    label_map = doc["label_map"]
+
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
         f"คำสั่งจากผู้ใช้: {instruction}"
@@ -2727,7 +2735,7 @@ async def upload_excel_editor_document(
         user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map, chat_id=final_chat_id,
     )
 
-    result = _match_and_apply_excel_edit(document_id, label_map, instruction)
+    result = _match_and_apply_excel_edit(document_id, user_id, instruction)
 
     user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}"
     _save_attachment_result_to_chat(final_chat_id, user_message, result["message"])
