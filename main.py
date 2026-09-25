@@ -2575,10 +2575,16 @@ def _extract_excel_labels(raw: bytes) -> dict:
 
 
 def _coerce_value_for_cell(current_value, number_format: Optional[str]):
-    """แปลงค่าก่อนเขียนกลับเซลล์จริงตอน confirm — คืน (ok, value, error_message)
-    ถ้าเซลล์เป็น %-format: ตัด '%' ออกแล้วหารด้วย 100 เสมอ ไม่ว่า Claude จะตอบมามีเครื่องหมาย % หรือไม่
-    (แปลงไม่ได้ = error ชัดเจน ไม่เขียนค่าผิดขนาดแบบเงียบๆ)
-    ถ้าไม่ใช่ %-format: ลองแปลงเป็นตัวเลขถ้าทำได้ ไม่ได้ก็เขียนเป็น string ตามเดิม (ไม่ใช่ error เพราะบาง label เป็นข้อความ)"""
+    """แปลงค่าก่อนเขียนกลับเซลล์จริงตอน download — คืน (ok, value, error_message)
+    ถ้า current_value เป็น int/float อยู่แล้ว แปลว่าเป็นค่าดั้งเดิมจาก openpyxl ตรงๆ (label นี้ยังไม่เคยถูกแก้)
+    ซึ่ง scale ถูกต้องอยู่แล้วเสมอไม่ว่าจะเป็นเซลล์ % หรือไม่ (เช่น 0.0807 สำหรับเซลล์ 8.07%) — ใช้ตรงๆ ห้ามแปลงซ้ำ
+    เด็ดขาด (บั๊กเดิม: หารด้วย 100 ซ้ำอีกรอบทำให้ label ที่ยังไม่ถูกแก้เพี้ยนขนาดไปเลย เช่น 0.0807 -> 0.000807)
+    ถ้าเป็น string (แปลว่าผ่านการแก้จาก Claude มาแล้ว เป็นตัวเลขเปอร์เซ็นต์ธรรมดาตามที่ prompt สั่ง เช่น "10")
+    และเซลล์เป็น %-format: ตัด '%' ออกแล้วหารด้วย 100 เสมอ (แปลงไม่ได้ = error ชัดเจน ไม่เขียนค่าผิดขนาดแบบเงียบๆ)
+    ถ้าไม่ใช่ %-format: ลองแปลง string เป็นตัวเลขถ้าทำได้ ไม่ได้ก็เขียนเป็น string ตามเดิม (ไม่ใช่ error เพราะบาง label เป็นข้อความ)"""
+    if isinstance(current_value, (int, float)):
+        return True, current_value, None
+
     is_percent = bool(number_format) and "%" in number_format
 
     if is_percent:
@@ -2587,9 +2593,6 @@ def _coerce_value_for_cell(current_value, number_format: Optional[str]):
             return True, float(text) / 100, None
         except ValueError:
             return False, None, f"ไม่สามารถแปลงค่า {current_value!r} ให้เป็นตัวเลขเปอร์เซ็นต์ได้"
-
-    if isinstance(current_value, (int, float)):
-        return True, current_value, None
 
     text = str(current_value).strip()
     try:
@@ -2760,10 +2763,16 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     wb.save(buf)
     buf.seek(0)
 
+    # ต่อท้าย "_thaimesook" ก่อนนามสกุลเฉพาะชื่อไฟล์ที่ใช้ดาวน์โหลด (Content-Disposition) เท่านั้น
+    # กันเบราว์เซอร์บันทึกทับไฟล์ต้นฉบับชื่อเดียวกันในโฟลเดอร์ดาวน์โหลดของผู้ใช้โดยไม่ตั้งใจ
+    # ไม่กระทบ doc["filename"] ที่เก็บใน DB เลย — ใช้ os.path.splitext() กันเดาผิดถ้าชื่อไฟล์มีจุดหลายจุด (เช่น "report.v2.xlsx")
+    name_root, name_ext = os.path.splitext(doc["filename"])
+    download_filename = f"{name_root}_thaimesook{name_ext}"
+
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={doc['filename']}"},
+        headers={"Content-Disposition": f"attachment; filename={download_filename}"},
     )
 
 
