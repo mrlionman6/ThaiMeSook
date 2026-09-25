@@ -811,7 +811,8 @@ button {
 }
 
 .modal-card {
-    background-image: url("/static/Graphic/main_BG2.jpg");
+    /* background-image: url("/static/Graphic/main_BG2.jpg") */
+    background-color: white;
     background-size: cover;
     background-position: center;
     background-replace: no replace;
