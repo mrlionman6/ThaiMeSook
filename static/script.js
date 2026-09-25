@@ -165,16 +165,22 @@ async function askQuestion() {
 
     if (!query && !imageFile) return;
 
-    // ไฟล์ excel (ทั้ง 2 แบบ) แยกไปคนละ endpoint/flow กับ /ask เดิม (ไม่ผ่าน RAG, ไม่มี query/chat_id)
-    // ข้อความที่พิมพ์ไว้ในช่อง (ถ้ามี) จะไม่ถูกใช้เลยตามที่ตกลงกันไว้
+    // ไฟล์ excel แยกไปคนละ endpoint/flow กับ /ask เดิม (ไม่ผ่าน RAG ตอนอัปโหลดครั้งแรก)
     if (imageFile) {
         const kind = cachedAttachmentKind || await getAttachmentKind(imageFile);
         if (kind === "deal-screening-batch") {
+            // Deal Screening ไม่ใช้ query เลยตามที่ตกลงกันไว้ (คำสั่งพิมพ์มาด้วยจะไม่ถูกใช้)
             await handleDealScreeningAttachmentSubmit(imageFile);
             return;
         }
         if (kind === "feasibility") {
-            await handleExcelAttachmentSubmit(imageFile);
+            if (query) {
+                // แนบไฟล์ + พิมพ์คำสั่งมาด้วยพร้อมกัน -> เข้า Excel Editor (อัปโหลด + แก้ครั้งแรกทันที)
+                await handleExcelEditorFirstEdit(imageFile, query);
+            } else {
+                // ไม่มีคำสั่งมาด้วย -> ทางเดิมทุกอย่าง (Feasibility Summarizer)
+                await handleExcelAttachmentSubmit(imageFile);
+            }
             return;
         }
         // kind === "image" → ปล่อยผ่านไป flow /ask เดิมด้านล่าง (Claude Vision)
@@ -244,12 +250,16 @@ async function askQuestion() {
     }
 }
 
-// ส่งผลอัปโหลดเอกสาร (Feasibility หรือ Deal Screening) ไปเซฟลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
-// ใช้ร่วมกันทั้ง 2 flow — sync currentChatId + sidebar ให้ตรงกันถ้า backend สร้างแชทใหม่ให้ (chat_id เดิมเป็น null)
-async function submitAttachmentUpload(endpoint, file) {
+// ส่งผลอัปโหลดเอกสาร (Feasibility, Deal Screening หรือ Excel Editor) ไปเซฟลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
+// ใช้ร่วมกันทั้ง 3 flow — sync currentChatId + sidebar ให้ตรงกันถ้า backend สร้างแชทใหม่ให้ (chat_id เดิมเป็น null)
+// instruction: ถ้ามี (เฉพาะ Excel Editor) จะแนบไปกับ FormData ด้วย และโชว์ต่อท้ายชื่อไฟล์ในข้อความฝั่ง user
+async function submitAttachmentUpload(endpoint, file, instruction = null) {
     const requestChatId = currentChatId; // ยึด context แชทที่กำลังดูอยู่ตอนกดส่ง กันโชว์ผลผิดที่ถ้าสลับแชทระหว่างรอ
 
-    appendChatMessage("user", "📎 [แนบเอกสาร] " + file.name);
+    const userMessage = instruction
+        ? `📎 [แนบเอกสาร] ${file.name} — ${instruction}`
+        : "📎 [แนบเอกสาร] " + file.name;
+    appendChatMessage("user", userMessage);
     document.getElementById("questionInput").value = "";
     clearImageAttachment();
     scrollChatToBottom();
@@ -260,6 +270,7 @@ async function submitAttachmentUpload(endpoint, file) {
     const formData = new FormData();
     formData.append("file", file);
     if (requestChatId) formData.append("chat_id", requestChatId);
+    if (instruction) formData.append("instruction", instruction);
 
     try {
         const response = await fetch(endpoint, {
@@ -304,6 +315,12 @@ async function handleExcelAttachmentSubmit(file) {
 // ไฟล์ excel ที่ header ตรง schema Deal Screening — เรียก /api/deal-screening/upload แยกจาก /ask เดิมทั้งหมด
 async function handleDealScreeningAttachmentSubmit(file) {
     await submitAttachmentUpload("/api/deal-screening/upload", file);
+}
+
+// แนบไฟล์ excel (ไม่ตรง schema Deal Screening) พร้อมพิมพ์คำสั่งมาด้วยพร้อมกัน — เข้า Excel Editor
+// อัปโหลด + แก้ครั้งแรกทันทีในคำขอเดียว จากนั้นคุยแก้ต่อ/ขอไฟล์ ทำผ่าน /ask ปกติ (ดู _classify_excel_editor_intent ฝั่ง backend)
+async function handleExcelEditorFirstEdit(file, instruction) {
+    await submitAttachmentUpload("/api/excel-editor/upload", file, instruction);
 }
 
 // "Fake streaming" — คำตอบมาครบเต็มแล้วจาก backend (ผ่าน LanguageGuard retry มาแล้ว)
@@ -1054,170 +1071,6 @@ function startNewChat() {
     updateLoadingIndicator(); // เผื่อมีคำถามใหม่ (ที่ยังไม่มี id) ค้างรออยู่ตอนกด "แชทใหม่" ซ้อนอีกที
     loadChatHistory();
     closeSidebar();
-}
-
-// =====================================================================
-// Excel Editor — อัปโหลด excel, คุยสั่งแก้หลายรอบ, ยืนยันแล้วดาวน์โหลด
-// แยกจากปุ่ม "แนบเอกสาร" โดยสิ้นเชิง — คนละ mode คนละ flow ไม่ปนกับ Feasibility/Deal Screening
-// =====================================================================
-let excelEditorDocumentId = null;
-let excelEditorLabels = {}; // label -> current_value (cache ฝั่ง client แค่ไว้แสดงผล ไม่ใช่ source of truth)
-
-function openExcelEditorModal() {
-    if (!currentUser) {
-        showAlertDialog("กรุณาเข้าสู่ระบบก่อนใช้ฟีเจอร์แก้ไฟล์ Excel");
-        return;
-    }
-    excelEditorDocumentId = null;
-    excelEditorLabels = {};
-
-    openModal(`
-        <h2>🛠️ แก้ไฟล์ Excel</h2>
-        <div id="excelEditorUploadSection">
-            <p class="modal-hint-note">อัปโหลดไฟล์ .xlsx ที่มีแถวรูปแบบ "หัวข้อ | ค่า" (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว)</p>
-            <input type="file" id="excelEditorFileInput" accept=".xlsx">
-            <button class="button_base_1" onclick="uploadExcelEditorFile()">อัปโหลด</button>
-            <span id="excelEditorUploadStatus" class="modal-status"></span>
-        </div>
-
-        <div id="excelEditorWorkArea" hidden>
-            <p class="modal-section-label">รายการที่แก้ได้</p>
-            <div id="excelEditorLabelList" class="excel-editor-label-list"></div>
-
-            <p class="modal-section-label">พิมพ์คำสั่งแก้ไข (เช่น "แก้อัตราคิดลดเป็น 10%")</p>
-            <div class="tag-range-row">
-                <input type="text" id="excelEditorCommandInput" placeholder="พิมพ์คำสั่งแก้ไข">
-                <button class="button_base_1" onclick="sendExcelEditorCommand()">ส่ง</button>
-            </div>
-            <div id="excelEditorCommandLog" class="excel-editor-log"></div>
-
-            <div class="modal-buttons">
-                <button class="button_base_1" onclick="confirmExcelEditorChanges()">✅ ยืนยันและดาวน์โหลด</button>
-                <button class="button_base_1" type="button" onclick="closeModal()">ปิด</button>
-            </div>
-            <span id="excelEditorConfirmStatus" class="modal-status"></span>
-        </div>
-    `, "modal-card-wide");
-}
-
-async function uploadExcelEditorFile() {
-    const fileInput = document.getElementById("excelEditorFileInput");
-    const statusEl = document.getElementById("excelEditorUploadStatus");
-
-    if (!fileInput.files || fileInput.files.length === 0) {
-        statusEl.textContent = "เลือกไฟล์ .xlsx ก่อน";
-        statusEl.style.color = "red";
-        return;
-    }
-
-    const formData = new FormData();
-    formData.append("file", fileInput.files[0]);
-
-    statusEl.textContent = "กำลังอ่านไฟล์...";
-    statusEl.style.color = "#666";
-
-    try {
-        const res = await fetch("/api/excel-editor/upload", { method: "POST", body: formData });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
-
-        excelEditorDocumentId = data.document_id;
-        excelEditorLabels = {};
-        data.labels.forEach(item => { excelEditorLabels[item.label] = item.current_value; });
-
-        statusEl.textContent = `✅ พบ ${data.labels.length} รายการที่แก้ได้`;
-        statusEl.style.color = "green";
-        document.getElementById("excelEditorWorkArea").hidden = false;
-        document.getElementById("excelEditorCommandLog").innerHTML = "";
-        renderExcelEditorLabelList();
-    } catch (error) {
-        statusEl.textContent = "";
-        showAlertDialog("อ่านไฟล์ไม่สำเร็จ: " + error);
-    }
-}
-
-function renderExcelEditorLabelList() {
-    const container = document.getElementById("excelEditorLabelList");
-    const entries = Object.entries(excelEditorLabels);
-    if (entries.length === 0) {
-        container.innerHTML = "<p>ไม่มีรายการ</p>";
-        return;
-    }
-    container.innerHTML = entries.map(([label, value]) =>
-        `<div class="excel-editor-label-row"><strong>${escapeHtml(label)}</strong>: ${escapeHtml(String(value))}</div>`
-    ).join("");
-}
-
-async function sendExcelEditorCommand() {
-    const input = document.getElementById("excelEditorCommandInput");
-    const instruction = input.value.trim();
-    if (!instruction || !excelEditorDocumentId) return;
-
-    const logEl = document.getElementById("excelEditorCommandLog");
-    input.value = "";
-
-    const entry = document.createElement("div");
-    entry.className = "excel-editor-log-entry";
-    entry.textContent = "⏳ " + instruction;
-    logEl.appendChild(entry);
-    logEl.scrollTop = logEl.scrollHeight;
-
-    try {
-        const res = await fetch(`/api/excel-editor/${excelEditorDocumentId}/edit`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ instruction }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
-
-        if (data.matched) {
-            excelEditorLabels[data.label] = data.new_value;
-            renderExcelEditorLabelList();
-            entry.textContent = "✅ " + data.message;
-        } else {
-            entry.textContent = "⚠️ " + data.message;
-        }
-    } catch (error) {
-        entry.textContent = "❌ เกิดข้อผิดพลาด: " + error;
-    }
-    logEl.scrollTop = logEl.scrollHeight;
-}
-
-async function confirmExcelEditorChanges() {
-    const statusEl = document.getElementById("excelEditorConfirmStatus");
-    if (!excelEditorDocumentId) return;
-
-    statusEl.textContent = "กำลังสร้างไฟล์...";
-    statusEl.style.color = "#666";
-
-    try {
-        const res = await fetch(`/api/excel-editor/${excelEditorDocumentId}/confirm`, { method: "POST" });
-        if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.detail || ("HTTP " + res.status));
-        }
-
-        const disposition = res.headers.get("Content-Disposition") || "";
-        const match = disposition.match(/filename="?([^"]+)"?/);
-        const downloadName = match ? match[1] : "edited.xlsx";
-
-        const blob = await res.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = downloadName;
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        URL.revokeObjectURL(url);
-
-        statusEl.textContent = "✅ ดาวน์โหลดแล้ว";
-        statusEl.style.color = "green";
-    } catch (error) {
-        statusEl.textContent = "";
-        showAlertDialog("ยืนยันไม่สำเร็จ: " + error);
-    }
 }
 
 // =====================================================================

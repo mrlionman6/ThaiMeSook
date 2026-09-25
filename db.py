@@ -187,6 +187,7 @@ class EditableDocument(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=True, index=True)
     filename = Column(String, nullable=False)
     original_bytes = Column(LargeBinary, nullable=False)
     label_map = Column(JSON, nullable=False)  # {label: {sheet, row, col, current_value, number_format}}
@@ -1031,11 +1032,14 @@ def create_user_document(
 EDITABLE_DOCUMENT_EXPIRY_DAYS = 5  # เขียนเป็นค่า expires_at ตอน insert เลย (ต่างจาก Deal Screening ที่คำนวณตอน query)
 
 
-def create_editable_document(user_id: int, filename: str, original_bytes: bytes, label_map: dict) -> int:
+def create_editable_document(
+    user_id: int, filename: str, original_bytes: bytes, label_map: dict, chat_id: Optional[int] = None
+) -> int:
     now = datetime.datetime.utcnow()
     with SessionLocal() as session:
         row = EditableDocument(
             user_id=user_id,
+            chat_id=chat_id,
             filename=filename,
             original_bytes=original_bytes,
             label_map=label_map,
@@ -1048,25 +1052,49 @@ def create_editable_document(user_id: int, filename: str, original_bytes: bytes,
         return row.id
 
 
+def _is_editable_document_expired(expires_at: Optional[datetime.datetime]) -> bool:
+    """normalize offset-aware -> offset-naive ก่อนเทียบ เหมือน _is_deal_screening_expired() เป๊ะ
+    (datetime.utcnow() เป็น naive แต่ column เป็น DateTime(timezone=True) — เทียบตรงๆ ไม่ได้ TypeError)
+    ใช้ร่วมกันทั้ง get_editable_document() และ get_editable_document_by_chat()"""
+    if expires_at is None:
+        return False
+    reference = expires_at.replace(tzinfo=None) if expires_at.tzinfo else expires_at
+    return reference < datetime.datetime.utcnow()
+
+
+def _editable_document_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "filename": row.filename,
+        "original_bytes": row.original_bytes,
+        "label_map": row.label_map,
+    }
+
+
 def get_editable_document(document_id: int, user_id: int) -> Optional[dict]:
     """คืน None ทั้งกรณีไม่พบ id, ไม่ใช่เจ้าของ, และหมดอายุ — ดูเหมือนกันหมดจากภายนอก
     (เหมือน get_chat_session()/get_deal_screening_batch() — ownership+expiry รวมอยู่จุดเดียว)"""
     with SessionLocal() as session:
         row = session.get(EditableDocument, document_id)
-        if row is None or row.user_id != user_id:
+        if row is None or row.user_id != user_id or _is_editable_document_expired(row.expires_at):
             return None
-        if row.expires_at is not None:
-            # normalize offset-aware -> offset-naive ก่อนเทียบ เหมือน _is_deal_screening_expired() เป๊ะ
-            # (datetime.utcnow() เป็น naive แต่ column เป็น DateTime(timezone=True) — เทียบตรงๆ ไม่ได้ TypeError)
-            expires_at = row.expires_at.replace(tzinfo=None) if row.expires_at.tzinfo else row.expires_at
-            if expires_at < datetime.datetime.utcnow():
-                return None
-        return {
-            "id": row.id,
-            "filename": row.filename,
-            "original_bytes": row.original_bytes,
-            "label_map": row.label_map,
-        }
+        return _editable_document_to_dict(row)
+
+
+def get_editable_document_by_chat(chat_id: int, user_id: int) -> Optional[dict]:
+    """คืน EditableDocument ล่าสุดที่ผูกกับแชทนี้ (ORDER BY created_at DESC — ถ้าแชทเดียวมีหลายเอกสาร
+    ถือว่าตัวใหม่สุดคือตัวที่กำลังแก้อยู่ ไม่ทำ logic ซับซ้อนกว่านี้) คืน None ถ้าไม่มี/หมดอายุแล้ว
+    ใช้เช็คตอน /ask ว่าแชทนี้อยู่ระหว่างแก้ไฟล์ excel อยู่หรือไม่ ก่อน route ข้อความถัดไป"""
+    with SessionLocal() as session:
+        row = (
+            session.query(EditableDocument)
+            .filter(EditableDocument.chat_id == chat_id, EditableDocument.user_id == user_id)
+            .order_by(EditableDocument.created_at.desc())
+            .first()
+        )
+        if row is None or _is_editable_document_expired(row.expires_at):
+            return None
+        return _editable_document_to_dict(row)
 
 
 def update_editable_document_label_map(document_id: int, label_map: dict) -> bool:

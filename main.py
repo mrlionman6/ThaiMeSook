@@ -65,6 +65,7 @@ from db import (
     create_user_document,
     create_editable_document,
     get_editable_document,
+    get_editable_document_by_chat,
     update_editable_document_label_map,
 )
 
@@ -1105,9 +1106,6 @@ class LoginRequest(BaseModel):
 class ChatCreateRequest(BaseModel):
     title: Optional[str] = None
 
-class ExcelEditorInstruction(BaseModel):
-    instruction: str
-
 class ForgotPasswordQuestionsRequest(BaseModel):
     username: str
 
@@ -1190,6 +1188,32 @@ async def ask_question(
     image: Optional[UploadFile] = File(None),
 ):
     user_id = get_active_user_id(request)
+
+    # ถ้าแชทนี้มี EditableDocument (Excel Editor) ที่ยังไม่หมดอายุผูกอยู่ และข้อความนี้ไม่มีไฟล์แนบมาด้วย
+    # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
+    # (unrelated) ซึ่งจะปล่อยผ่านไป flow RAG ปกติด้านล่างทันที ไม่บล็อกการสนทนาปกติ
+    if user_id and chat_id and query.strip() and image is None:
+        editable_doc = get_editable_document_by_chat(chat_id, user_id)
+        if editable_doc is not None:
+            intent = _classify_excel_editor_intent(editable_doc["label_map"], query)
+
+            if intent == "edit":
+                result = _match_and_apply_excel_edit(editable_doc["id"], editable_doc["label_map"], query)
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", result["message"])
+                touch_chat_session(chat_id)
+                return {"answer": result["message"], "sources": [], "chat_id": chat_id}
+
+            if intent == "finalize":
+                download_url = f"/api/excel-editor/{editable_doc['id']}/download"
+                answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
+
     query, image_data, history = await _parse_and_validate_ask_input(query, chat_id, image, user_id)
 
     answer, sources = rag_answer(query, history=history, image_data=image_data)
@@ -2119,18 +2143,22 @@ def _validate_chat_ownership(chat_id: Optional[int], user_id: int):
         raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
 
 
-def _save_attachment_result_to_chat(user_id: int, chat_id: Optional[int], filename: str, summary_text: str) -> int:
-    """บันทึกผลอัปโหลดเอกสาร (Deal Screening หรือ Feasibility) ลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
-    ใช้ร่วมกันทั้ง /api/deal-screening/upload และ /api/user-documents/upload
-    สร้างแชทใหม่ให้ถ้ายังไม่มี chat_id (ตั้งชื่อจากชื่อไฟล์ เหมือน /ask ตั้งชื่อจากคำถามแรก) คืนค่า chat_id สุดท้ายที่ใช้"""
-    if chat_id is None:
-        title = (f"📎 [แนบเอกสาร] {filename}")[:50] or "แชทใหม่"
-        chat_id = create_chat_session(user_id, title=title)
+def _resolve_chat_id(user_id: int, chat_id: Optional[int], title_source: str) -> int:
+    """คืน chat_id เดิมถ้ามีอยู่แล้ว หรือสร้างแชทใหม่ให้ (ตั้งชื่อจาก title_source ตัดที่ 50 ตัวอักษร
+    เหมือนที่ /ask ตั้งชื่อจากคำถามแรก) — แยกออกมาจาก _save_attachment_result_to_chat() เพราะบางเคส
+    (เช่น Excel Editor) ต้องรู้ chat_id ที่แน่นอนก่อน จะได้เอาไปผูกกับข้อมูลอื่นก่อนค่อยบันทึกข้อความจริง"""
+    if chat_id is not None:
+        return chat_id
+    title = title_source[:50] or "แชทใหม่"
+    return create_chat_session(user_id, title=title)
 
-    add_chat_message(chat_id, "user", f"📎 [แนบเอกสาร] {filename}")
-    add_chat_message(chat_id, "assistant", summary_text)
+
+def _save_attachment_result_to_chat(chat_id: int, user_message: str, assistant_message: str) -> None:
+    """บันทึกคู่ข้อความ user+assistant ลงแชทที่ resolve เป็น id จริงแล้ว (เรียก _resolve_chat_id() มาก่อนเสมอ)
+    ใช้ร่วมกันทั้ง Deal Screening, Feasibility Summarizer (User Documents) และ Excel Editor"""
+    add_chat_message(chat_id, "user", user_message)
+    add_chat_message(chat_id, "assistant", assistant_message)
     touch_chat_session(chat_id)
-    return chat_id
 
 
 @app.post("/api/attachment-kind")
@@ -2198,7 +2226,9 @@ async def upload_deal_screening_for_user(
             lines.append(f"❌ แถวที่ {r['row_number']} ({r['project_name']}) — ข้อผิดพลาด: {r['error']}")
 
     summary_text = "\n".join(lines)
-    final_chat_id = _save_attachment_result_to_chat(user_id, chat_id, file.filename or "upload.xlsx", summary_text)
+    filename = file.filename or "upload.xlsx"
+    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename}")
+    _save_attachment_result_to_chat(final_chat_id, f"📎 [แนบเอกสาร] {filename}", summary_text)
     return {"summary_text": summary_text, "chat_id": final_chat_id}
 
 
@@ -2481,7 +2511,8 @@ async def upload_user_document(
         summary_text=summary_text,
         structured_fields=structured_fields,
     )
-    final_chat_id = _save_attachment_result_to_chat(user_id, chat_id, filename, summary_text)
+    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename}")
+    _save_attachment_result_to_chat(final_chat_id, f"📎 [แนบเอกสาร] {filename}", summary_text)
 
     return {"summary_text": summary_text, "chat_id": final_chat_id}
 
@@ -2567,50 +2598,43 @@ def _coerce_value_for_cell(current_value, number_format: Optional[str]):
         return True, current_value, None  # ไม่ใช่ตัวเลข เขียนเป็น string ตรงๆ (ไม่ error)
 
 
-@app.post("/api/excel-editor/upload")
-async def upload_excel_editor_document(file: UploadFile = File(...), user_id: int = Depends(require_user)):
-    filename = file.filename or "upload.xlsx"
-    if not filename.lower().endswith(".xlsx"):
-        # openpyxl เขียนไฟล์กลับได้เฉพาะ .xlsx เท่านั้น (.xls ต้องใช้ library คนละตัวที่เขียนไม่ได้) จึงไม่รองรับ .xls รอบนี้
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx เท่านั้น")
-
-    raw = await file.read()
-    try:
-        label_map = _extract_excel_labels(raw)
-    except Exception:
-        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
-
-    if not label_map:
-        raise HTTPException(
-            status_code=400,
-            detail="ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้",
-        )
-
-    document_id = create_editable_document(
-        user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map,
-    )
-
-    return {
-        "document_id": document_id,
-        "labels": [
-            {"label": label, "current_value": info["current_value"]}
-            for label, info in label_map.items()
-        ],
-    }
+EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
+    "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในบทสนทนานี้เกี่ยวข้องกับการแก้ไฟล์ Excel ที่กำลังทำอยู่หรือไม่ "
+    "ผู้ใช้กำลังแก้ไฟล์ excel อยู่ โดยมี label ที่แก้ได้ในไฟล์นี้ (JSON) ให้ดูประกอบการตัดสินใจ\n\n"
+    "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
+    '{"intent": "edit" หรือ "finalize" หรือ "unrelated"}\n\n'
+    "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
+    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับการแก้ไฟล์นี้เลย"
+)
 
 
-@app.post("/api/excel-editor/{document_id}/edit")
-def edit_excel_editor_document(
-    document_id: int, body: ExcelEditorInstruction, user_id: int = Depends(require_user)
-):
-    doc = get_editable_document(document_id, user_id)
-    if doc is None:
-        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
-
-    label_map = doc["label_map"]
+def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
+    """ตัดสินใจว่าข้อความล่าสุด (ไม่มีไฟล์แนบ) ในแชทที่มี EditableDocument ผูกอยู่ เกี่ยวกับการแก้ไฟล์
+    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'finalize' | 'unrelated' เสมอ — parse ไม่ได้ถือว่า 'unrelated'
+    (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้ตั้งใจ)"""
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
-        f"คำสั่งจากผู้ใช้: {body.instruction}"
+        f"ข้อความล่าสุดของผู้ใช้: {query}"
+    )
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        system=EXCEL_EDITOR_INTENT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parsed = _parse_json_response(response.content[0].text, dict)
+    intent = (parsed or {}).get("intent")
+    return intent if intent in ("edit", "finalize", "unrelated") else "unrelated"
+
+
+def _match_and_apply_excel_edit(document_id: int, label_map: dict, instruction: str) -> dict:
+    """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
+    คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
+    ซึ่งทั้งคู่ต้องได้ข้อความคำตอบกลับไปแสดงในแชทเสมอ ไม่ใช่ error response)"""
+    prompt = (
+        f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
+        f"คำสั่งจากผู้ใช้: {instruction}"
     )
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -2620,7 +2644,7 @@ def edit_excel_editor_document(
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     if parsed is None or "matched" not in parsed:
-        raise HTTPException(status_code=502, detail="ประมวลผลคำสั่งไม่สำเร็จ ลองใหม่อีกครั้ง")
+        return {"matched": False, "message": "ประมวลผลคำสั่งไม่สำเร็จ ลองใหม่อีกครั้ง"}
 
     if not parsed.get("matched"):
         return {"matched": False, "message": str(parsed.get("reason") or "ไม่พบ label ที่ตรงกับคำสั่งนี้")}
@@ -2647,8 +2671,51 @@ def edit_excel_editor_document(
     }
 
 
-@app.post("/api/excel-editor/{document_id}/confirm")
-def confirm_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
+@app.post("/api/excel-editor/upload")
+async def upload_excel_editor_document(
+    file: UploadFile = File(...),
+    instruction: str = Form(...),
+    chat_id: Optional[int] = Form(None),
+    user_id: int = Depends(require_user),
+):
+    """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx
+    ที่ไม่ตรง schema Deal Screening พร้อมพิมพ์คำสั่งมาด้วยในครั้งเดียว: อัปโหลด + แก้ครั้งแรกทันที
+    (ถ้าไม่มีคำสั่งมาด้วย ฝั่ง frontend จะเรียก /api/user-documents/upload แทน ไม่มาที่นี่)"""
+    filename = file.filename or "upload.xlsx"
+    if not filename.lower().endswith(".xlsx"):
+        # openpyxl เขียนไฟล์กลับได้เฉพาะ .xlsx เท่านั้น (.xls ต้องใช้ library คนละตัวที่เขียนไม่ได้) จึงไม่รองรับ .xls รอบนี้
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx เท่านั้น")
+
+    _validate_chat_ownership(chat_id, user_id)
+    raw = await file.read()
+    try:
+        label_map = _extract_excel_labels(raw)
+    except Exception:
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
+
+    if not label_map:
+        raise HTTPException(
+            status_code=400,
+            detail="ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้",
+        )
+
+    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename} — {instruction}")
+    document_id = create_editable_document(
+        user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map, chat_id=final_chat_id,
+    )
+
+    result = _match_and_apply_excel_edit(document_id, label_map, instruction)
+
+    user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}"
+    _save_attachment_result_to_chat(final_chat_id, user_message, result["message"])
+
+    return {"summary_text": result["message"], "chat_id": final_chat_id}
+
+
+@app.get("/api/excel-editor/{document_id}/download")
+def download_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
+    """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้)
+    ไม่มี side effect ใดๆ กับ DB จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
@@ -2660,7 +2727,7 @@ def confirm_excel_editor_document(document_id: int, user_id: int = Depends(requi
         if not ok:
             raise HTTPException(
                 status_code=422,
-                detail=f"'{label}': {error} — กรุณาแก้ไขค่านี้ก่อนยืนยันอีกครั้ง",
+                detail=f"'{label}': {error} — กรุณาแก้ไขค่านี้ก่อนดาวน์โหลดอีกครั้ง",
             )
         resolved[label] = value
 
