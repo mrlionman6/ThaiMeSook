@@ -556,7 +556,7 @@ function openLoginModal() {
                 <button type="submit" class="button_base_1">เข้าสู่ระบบ</button>
                 <button type="button" class="button_base_1" onclick="closeModal()">ยกเลิก</button>
             </div>
-            <p class="modal-link flat-text-simple"><a href="#" onclick="openForgotPasswordModal(); return false;">ลืมรหัสผ่าน?</a></p>
+            <p class="modal-link"><a href="#" class="flat-text-simple" onclick="openForgotPasswordModal(); return false;">ลืมรหัสผ่าน?</a></p>
         </form>
     `);
 
