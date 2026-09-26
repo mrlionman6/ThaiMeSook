@@ -1230,12 +1230,6 @@ async def ask_question(
 
         elif len(active_docs) >= 2:
             route = _route_multi_file_instruction(active_docs, query)
-            # TODO: log ชั่วคราว ดีบัก action="unrelated" ที่น่าสงสัยว่าตัดสินใจผิดตอน user สั่ง compare
-            # ชัดเจน — ลบทิ้งหลังเก็บหลักฐานจาก Railway logs พอแล้ว
-            print(
-                f"[MultiFileRoute] chat_id={chat_id} action={route.get('action')!r} "
-                f"document_id={route.get('document_id')!r} message={route.get('message')!r} query={query!r}"
-            )
             action = route.get("action")
 
             if action == "edit":
@@ -1261,14 +1255,6 @@ async def ask_question(
                 return {"answer": answer, "sources": [], "chat_id": chat_id}
 
             if action == "compare":
-                # TODO: log ชั่วคราว ดีบักต่อจาก [MultiFileRoute] — action='compare' ยืนยันถูกต้องแล้วจาก
-                # Railway log จริง สงสัยว่าปัญหาอยู่ที่จำนวนไฟล์ active จริงไม่ใช่ 2 หรืออยู่ใน
-                # _compare_editable_documents() เอง — ลบทิ้งหลังเก็บหลักฐานพอแล้ว
-                print(
-                    f"[CompareDebug] chat_id={chat_id} active_docs_count={len(active_docs)} "
-                    f"filenames={[doc['filename'] for doc in active_docs]!r} "
-                    f"doc_ids={[doc['id'] for doc in active_docs]!r}"
-                )
                 if len(active_docs) == 2:
                     answer = _compare_editable_documents(active_docs[0], active_docs[1])
                 else:
@@ -2873,13 +2859,6 @@ def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
         compare_b = value_b.strip() if isinstance(value_b, str) else value_b
         diffs.append({"label": label, "value_a": value_a, "value_b": value_b, "changed": compare_a != compare_b})
 
-    # TODO: log ชั่วคราว ดีบักต่อจาก [MultiFileRoute]/[CompareDebug] — เช็คว่า deterministic diff
-    # คำนวณถูกไหมก่อนส่งให้ Claude เขียนอธิบาย ลบทิ้งหลังเก็บหลักฐานพอแล้ว
-    print(
-        f"[CompareDiff] common_keys_count={len(common_keys)} "
-        f"diffs={json.dumps(diffs, ensure_ascii=False, default=str)}"
-    )
-
     prompt = (
         f"ไฟล์ A: {doc_a['filename']}\nไฟล์ B: {doc_b['filename']}\n\n"
         f"ผลต่างที่คำนวณไว้แล้ว (JSON, ห้ามคำนวณหรือแก้ไขตัวเลขเอง ใช้ตามนี้เป๊ะ):\n"
@@ -2893,11 +2872,7 @@ def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
         max_tokens=1500,
         messages=[{"role": "user", "content": prompt}],
     )
-    raw_answer = response.content[0].text.strip()
-    # TODO: log ชั่วคราว ดีบักต่อจาก [MultiFileRoute]/[CompareDebug]/[CompareDiff] — เช็คว่าคำตอบดิบจาก
-    # Claude ตรงกับ diffs ที่ส่งเข้าไปจริงไหม ลบทิ้งหลังเก็บหลักฐานพอแล้ว
-    print(f"[CompareRawAnswer] {raw_answer!r}")
-    return raw_answer
+    return response.content[0].text.strip()
 
 
 EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT = (
