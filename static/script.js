@@ -174,11 +174,14 @@ async function askQuestion() {
             return;
         }
         if (kind === "feasibility") {
-            if (query) {
-                // แนบไฟล์ + พิมพ์คำสั่งมาด้วยพร้อมกัน -> เข้า Excel Editor (อัปโหลด + แก้ครั้งแรกทันที)
+            // Excel Editor รองรับเฉพาะ .xlsx เท่านั้น (.xls เขียนไฟล์กลับไม่ได้) — ถ้าเป็น .xls
+            // ให้ตกไปที่ Feasibility Summarizer เสมอ เหมือนไม่มีข้อความพ่วงมา ไม่ว่าจะพิมพ์อะไรมาด้วยก็ตาม
+            const isXlsx = imageFile.name.toLowerCase().endsWith(".xlsx");
+            if (query && isXlsx) {
+                // แนบไฟล์ .xlsx + พิมพ์คำสั่งมาด้วยพร้อมกัน -> เข้า Excel Editor (อัปโหลด + แก้ครั้งแรกทันที)
                 await handleExcelEditorFirstEdit(imageFile, query);
             } else {
-                // ไม่มีคำสั่งมาด้วย -> ทางเดิมทุกอย่าง (Feasibility Summarizer)
+                // ไม่มีคำสั่งมาด้วย หรือเป็น .xls -> ทางเดิมทุกอย่าง (Feasibility Summarizer)
                 await handleExcelAttachmentSubmit(imageFile);
             }
             return;
