@@ -2631,6 +2631,36 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     return intent if intent in ("edit", "finalize", "unrelated") else "unrelated"
 
 
+EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT = (
+    "คุณกำลังช่วยตัดสินใจว่าข้อความที่ผู้ใช้พิมพ์มาพร้อมกับไฟล์ Excel ที่เพิ่งแนบ ต้องการอะไรกันแน่\n\n"
+    "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
+    '{"intent": "edit" หรือ "summarize" หรือ "unclear"}\n\n'
+    "- edit: ข้อความระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน เช่น \"แก้อัตราคิดลดเป็น 10%\", \"เปลี่ยนงบประมาณเป็น 5 ล้าน\"\n"
+    "- summarize: ข้อความไม่ได้ระบุค่าที่จะเปลี่ยนเลย เป็นการขอให้อธิบาย/สรุปเนื้อหาแทน "
+    "เช่น \"สรุปให้หน่อย\", \"อธิบายให้ฟังหน่อย\", \"มีอะไรในไฟล์นี้บ้าง\"\n"
+    "- unclear: ข้อความคลุมเครือ ตีความไม่ออกจริงๆ ว่าต้องการแก้ไขหรือสรุป"
+)
+
+
+def _classify_excel_editor_upload_intent(label_map: dict, instruction: str) -> str:
+    """ตัดสินใจว่าข้อความที่พิมพ์มาพร้อมไฟล์ตอนอัปโหลดครั้งแรก ต้องการแก้ไฟล์ ('edit') หรือแค่ขอสรุปเนื้อหา
+    ('summarize') หรือคลุมเครือตีความไม่ออก ('unclear') คืนค่าใดค่าหนึ่งเสมอ — parse ไม่ได้ถือว่า 'unclear'
+    (fail-safe ให้ถามกลับชัดเจน ดีกว่าเดาแล้วพยายามแก้ไฟล์ผิดจุดแบบเงียบๆ)"""
+    prompt = (
+        f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
+        f"ข้อความที่ผู้ใช้พิมพ์มาพร้อมไฟล์: {instruction}"
+    )
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        system=EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parsed = _parse_json_response(response.content[0].text, dict)
+    intent = (parsed or {}).get("intent")
+    return intent if intent in ("edit", "summarize", "unclear") else "unclear"
+
+
 _LABEL_TRAILING_PUNCTUATION = ":：;；,，."
 
 
@@ -2731,16 +2761,38 @@ async def upload_excel_editor_document(
         )
 
     final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename} — {instruction}")
+    # สร้าง EditableDocument ผูกกับแชทนี้เสมอไม่ว่า intent จะเป็นอะไร (parse label_map ทำไปแล้วอยู่แล้ว
+    # ไม่เสียอะไรเพิ่ม) เผื่อ user อยากแก้ทีหลังในแชทเดียวกันโดยไม่ต้องแนบไฟล์ซ้ำ (ผ่าน /ask branch เดิม)
     document_id = create_editable_document(
         user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map, chat_id=final_chat_id,
     )
 
-    result = _match_and_apply_excel_edit(document_id, user_id, instruction)
+    intent = _classify_excel_editor_upload_intent(label_map, instruction)
+
+    if intent == "edit":
+        result = _match_and_apply_excel_edit(document_id, user_id, instruction)
+        response_text = result["message"]
+    elif intent == "summarize":
+        raw_text = _extract_excel_text(raw)
+        if raw_text.strip():
+            summary_result = (
+                summarize_user_document(raw_text)
+                if len(raw_text) <= FEASIBILITY_MAX_CHARS
+                else summarize_user_document_map_reduce(raw_text)
+            )
+            response_text = summary_result["summary_text"] + FEASIBILITY_DISCLAIMER_NOTICE
+        else:
+            response_text = "ไม่พบข้อความใดๆ ในไฟล์นี้ให้สรุปครับ"
+    else:  # "unclear"
+        response_text = (
+            "แนบไฟล์เรียบร้อยแล้วครับ ต้องการให้สรุปเนื้อหา หรือแก้ค่าบางอย่างในไฟล์ครับ? "
+            "บอกได้เลยในข้อความถัดไป"
+        )
 
     user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}"
-    _save_attachment_result_to_chat(final_chat_id, user_message, result["message"])
+    _save_attachment_result_to_chat(final_chat_id, user_message, response_text)
 
-    return {"summary_text": result["message"], "chat_id": final_chat_id}
+    return {"summary_text": response_text, "chat_id": final_chat_id}
 
 
 @app.get("/api/excel-editor/{document_id}/download")
