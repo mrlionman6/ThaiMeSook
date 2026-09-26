@@ -2855,7 +2855,9 @@ def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
         _, info_b = normalized_b[norm_key]
         value_a = info_a["current_value"]
         value_b = info_b["current_value"]
-        diffs.append({"label": label, "value_a": value_a, "value_b": value_b, "changed": value_a != value_b})
+        compare_a = value_a.strip() if isinstance(value_a, str) else value_a
+        compare_b = value_b.strip() if isinstance(value_b, str) else value_b
+        diffs.append({"label": label, "value_a": value_a, "value_b": value_b, "changed": compare_a != compare_b})
 
     prompt = (
         f"ไฟล์ A: {doc_a['filename']}\nไฟล์ B: {doc_b['filename']}\n\n"
