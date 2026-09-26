@@ -1230,6 +1230,12 @@ async def ask_question(
 
         elif len(active_docs) >= 2:
             route = _route_multi_file_instruction(active_docs, query)
+            # TODO: log ชั่วคราว ดีบัก action="unrelated" ที่น่าสงสัยว่าตัดสินใจผิดตอน user สั่ง compare
+            # ชัดเจน — ลบทิ้งหลังเก็บหลักฐานจาก Railway logs พอแล้ว
+            print(
+                f"[MultiFileRoute] chat_id={chat_id} action={route.get('action')!r} "
+                f"document_id={route.get('document_id')!r} message={route.get('message')!r} query={query!r}"
+            )
             action = route.get("action")
 
             if action == "edit":
