@@ -2643,40 +2643,93 @@ def _convert_xls_to_xlsx_bytes(raw: bytes) -> bytes:
     return buf.getvalue()
 
 
+EXCEL_LABEL_SECTION_HEADING_LOOKBACK = 10  # ระยะสูงสุด (แถว) ที่จะมองย้อนหาหัวข้อหมวดก่อนหน้า
+
+
 def _extract_excel_labels(raw: bytes) -> dict:
     """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ)
     ไล่ทุกแถวทุกชีต ถ้าแถวมีเซลล์ไม่ว่างพอดี 2 เซลล์ ให้เซลล์แรก=label เซลล์หลัง=value+พิกัด
-    label ที่ซ้ำกัน: ซ้ำต่างชีต เติม '(ชื่อชีต)' ต่อท้าย, ซ้ำในชีตเดียวกัน เติม '(แถว N)' ต่อท้าย"""
+
+    label ที่ซ้ำกัน:
+    - ซ้ำต่างชีต: เติม '(ชื่อชีต)' ต่อท้าย (ไม่เปลี่ยนจากเดิม)
+    - ซ้ำในชีตเดียวกัน: ทำแบบ two-pass ต่อชีต — pass แรกเก็บทุก occurrence ของทุก label ในชีตนั้น
+      พร้อม 'หัวข้อหมวด' ที่ใกล้ที่สุดก่อนหน้า (แถวที่มีเซลล์ไม่ว่างแค่ 1 เซลล์ ภายในระยะไม่เกิน
+      EXCEL_LABEL_SECTION_HEADING_LOOKBACK แถว) pass สองเช็คว่า label ไหนมีมากกว่า 1 occurrence
+      ในชีตนั้นบ้าง ถ้ามี ให้ tag ทุก occurrence ของ label นั้นด้วยหัวข้อหมวด (รวมตัวที่จะเป็น
+      'ตัวแรก' ด้วย ไม่ปล่อยเปล่าเหมือน scheme เดิม) เช่น 'จำนวน (คน): [▶ 3. พนักงาน Outsource]'
+      ถ้าหาหัวข้อหมวดไม่เจอในระยะที่กำหนด fallback เป็นเลขแถวแบบเดิม '(แถว N)' — label ที่ไม่ซ้ำ
+      เลยในชีตนั้นยังคงได้ key เดิมแบบไม่มี suffix เหมือนเดิมทุกประการ"""
     wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
 
-    sheets_seen_by_label: dict[str, set] = {}
     label_map = {}
+    label_seen_in_sheets: dict[str, list[str]] = {}  # label -> ชื่อชีตที่เจอมาแล้ว (เรียงตามลำดับ) ใช้ตัดสิน cross-sheet tag
 
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
+
+        # ---- pass 1: เก็บทุก occurrence ของทุก label ในชีตนี้ พร้อมหัวข้อหมวดที่ใกล้ที่สุดก่อนหน้า ----
+        occurrences_in_sheet = []  # [{"label":, "row":, "col":, "value":, "format":, "heading":}]
+        last_section_heading = None  # (row_number, text) — reset ทุกชีต
+
         for row in ws.iter_rows():
             non_empty = [c for c in row if c.value is not None and str(c.value).strip() != ""]
+
+            if len(non_empty) == 1:
+                # แถวหัวข้อหมวด (เช่น "▶ 3. พนักงาน Outsource") — จำไว้เป็นบริบทให้ label ที่ตามมา
+                heading_cell = non_empty[0]
+                last_section_heading = (heading_cell.row, str(heading_cell.value).strip())
+                continue
+
             if len(non_empty) != 2:
                 continue
+
             label_cell, value_cell = non_empty
             label_text = str(label_cell.value).strip()
 
-            sheets_seen = sheets_seen_by_label.setdefault(label_text, set())
-            if not sheets_seen:
-                key = label_text
-            elif sheet_name in sheets_seen:
-                key = f"{label_text} (แถว {value_cell.row})"
-            else:
-                key = f"{label_text} ({sheet_name})"
-            sheets_seen.add(sheet_name)
+            heading_text = None
+            if last_section_heading is not None:
+                heading_row, heading_value = last_section_heading
+                if value_cell.row - heading_row <= EXCEL_LABEL_SECTION_HEADING_LOOKBACK:
+                    heading_text = heading_value
 
-            label_map[key] = {
-                "sheet": sheet_name,
+            occurrences_in_sheet.append({
+                "label": label_text,
                 "row": value_cell.row,
                 "col": value_cell.column,
-                "current_value": value_cell.value,
-                "number_format": value_cell.number_format,
-            }
+                "value": value_cell.value,
+                "format": value_cell.number_format,
+                "heading": heading_text,
+            })
+
+        # ---- pass 2: ตัดสินใจ key สุดท้ายของทุก occurrence ในชีตนี้ ----
+        occurrences_by_label: dict[str, list[dict]] = {}
+        for occ in occurrences_in_sheet:
+            occurrences_by_label.setdefault(occ["label"], []).append(occ)
+
+        for label_text, occs in occurrences_by_label.items():
+            duplicated_within_sheet = len(occs) > 1
+            is_new_label_overall = label_text not in label_seen_in_sheets
+
+            for occ in occs:
+                if duplicated_within_sheet:
+                    if occ["heading"]:
+                        key = f"{label_text} [{occ['heading']}]"
+                    else:
+                        key = f"{label_text} (แถว {occ['row']})"
+                elif is_new_label_overall:
+                    key = label_text
+                else:
+                    key = f"{label_text} ({sheet_name})"
+
+                label_map[key] = {
+                    "sheet": sheet_name,
+                    "row": occ["row"],
+                    "col": occ["col"],
+                    "current_value": occ["value"],
+                    "number_format": occ["format"],
+                }
+
+            label_seen_in_sheets.setdefault(label_text, []).append(sheet_name)
 
     return label_map
 
