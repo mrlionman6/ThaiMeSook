@@ -175,13 +175,9 @@ async function askQuestion() {
         }
         if (kind === "feasibility") {
             // Excel Editor รองรับทั้ง .xlsx และ .xls แล้ว (.xls แปลงเป็น .xlsx อัตโนมัติฝั่ง backend)
-            if (query) {
-                // แนบไฟล์ + พิมพ์คำสั่งมาด้วยพร้อมกัน -> เข้า Excel Editor (อัปโหลด + แก้ครั้งแรกทันที)
-                await handleExcelEditorFirstEdit(imageFile, query);
-            } else {
-                // ไม่มีคำสั่งมาด้วย -> ทางเดิมทุกอย่าง (Feasibility Summarizer)
-                await handleExcelAttachmentSubmit(imageFile);
-            }
+            // ทุกกรณี (มี/ไม่มีคำสั่งมาด้วย) เข้าทางเดียวกันเสมอ -> อัปโหลดสร้าง EditableDocument เสมอ
+            // ไม่มีคำสั่งมาด้วย: backend จะสรุปเนื้อหาให้แบบ deterministic (ไม่เรียก Claude มา classify)
+            await handleExcelEditorFirstEdit(imageFile, query || null);
             return;
         }
         // kind === "image" → ปล่อยผ่านไป flow /ask เดิมด้านล่าง (Claude Vision)

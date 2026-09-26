@@ -2979,13 +2979,14 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
 @app.post("/api/excel-editor/upload")
 async def upload_excel_editor_document(
     file: UploadFile = File(...),
-    instruction: str = Form(...),
+    instruction: Optional[str] = Form(None),
     chat_id: Optional[int] = Form(None),
     user_id: int = Depends(require_user),
 ):
     """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx/.xls
-    ที่ไม่ตรง schema Deal Screening พร้อมพิมพ์คำสั่งมาด้วยในครั้งเดียว: อัปโหลด + แก้ครั้งแรกทันที
-    (ถ้าไม่มีคำสั่งมาด้วย ฝั่ง frontend จะเรียก /api/user-documents/upload แทน ไม่มาที่นี่)
+    ที่ไม่ตรง schema Deal Screening เสมอ ไม่ว่าจะพิมพ์คำสั่งมาด้วยหรือไม่ก็ตาม (frontend เรียก endpoint นี้
+    ทางเดียวเท่านั้นสำหรับไฟล์ประเภทนี้) — ถ้าไม่มีคำสั่งมาด้วย ถือว่าเป็นการขอสรุปเนื้อหาไปเลยแบบ deterministic
+    ไม่ต้องเสีย API call เรียก Claude ไปตีความว่า intent คืออะไร เพราะไม่มีข้อความให้ตีความอยู่แล้ว
     .xls จะถูกแปลงเป็น .xlsx อัตโนมัติเบื้องหลังก่อน (ดู _convert_xls_to_xlsx_bytes()) — ตั้งแต่บรรทัดที่แปลง
     แล้วเป็นต้นไป โค้ดด้านล่างทั้งหมดทำงานกับ .xlsx เสมอ ไม่ต้องรู้เลยว่าไฟล์ต้นฉบับเป็น .xls หรือ .xlsx"""
     filename = file.filename or "upload.xlsx"
@@ -3013,14 +3014,16 @@ async def upload_excel_editor_document(
             detail="ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้",
         )
 
-    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename} — {instruction}")
+    user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}" if instruction else f"📎 [แนบเอกสาร] {filename}"
+    final_chat_id = _resolve_chat_id(user_id, chat_id, user_message)
     # สร้าง EditableDocument ผูกกับแชทนี้เสมอไม่ว่า intent จะเป็นอะไร (parse label_map ทำไปแล้วอยู่แล้ว
     # ไม่เสียอะไรเพิ่ม) เผื่อ user อยากแก้ทีหลังในแชทเดียวกันโดยไม่ต้องแนบไฟล์ซ้ำ (ผ่าน /ask branch เดิม)
     document_id = create_editable_document(
         user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map, chat_id=final_chat_id,
     )
 
-    intent = _classify_excel_editor_upload_intent(label_map, instruction)
+    # ไม่มีคำสั่งมาด้วย -> ไม่มีอะไรให้ตีความ ถือเป็นการขอสรุปตรงๆ เลย ไม่ต้องเรียก Claude มา classify
+    intent = _classify_excel_editor_upload_intent(label_map, instruction) if instruction else "summarize"
 
     if intent == "edit":
         result = _match_and_apply_excel_edit(document_id, user_id, instruction)
@@ -3042,7 +3045,6 @@ async def upload_excel_editor_document(
             "บอกได้เลยในข้อความถัดไป"
         )
 
-    user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}"
     _save_attachment_result_to_chat(final_chat_id, user_message, response_text)
 
     return {"summary_text": response_text, "chat_id": final_chat_id}
