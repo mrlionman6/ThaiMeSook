@@ -81,6 +81,7 @@ import random
 import bcrypt
 import pandas as pd
 import openpyxl
+import xlrd
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -2596,6 +2597,52 @@ EXCEL_EDITOR_SYSTEM_PROMPT = (
 )
 
 
+def _convert_xls_to_xlsx_bytes(raw: bytes) -> bytes:
+    """แปลง .xls (BIFF เก่า) เป็น .xlsx ด้วย xlrd (อ่าน) + openpyxl (เขียน) ตรงๆ ไม่พึ่ง LibreOffice/
+    external binary เลย (ไม่แน่ใจว่า Railway มีติดตั้งไว้ ปลอดภัยกว่าไม่ต้องพึ่ง) คัดลอกทั้งค่าและ
+    number_format ของทุกเซลล์ให้ตรงที่สุด — ถ้าดึง format ของเซลล์ไหนไม่ได้ ปล่อยเป็น General ไป ไม่ error
+    ทั้งไฟล์ สูตรใน .xls จะกลายเป็นค่านิ่งถาวรหลังแปลง (ยอมรับได้ — Excel Editor ไม่เคยรักษาสูตรของ .xls
+    อยู่แล้วตั้งแต่แรก ไม่ใช่ regression)"""
+    book = xlrd.open_workbook(file_contents=raw, formatting_info=True)
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # ลบชีตเปล่า default ทิ้งก่อน จะสร้างชีตจริงเองทั้งหมด
+
+    for sheet_index in range(book.nsheets):
+        xls_sheet = book.sheet_by_index(sheet_index)
+        ws = wb.create_sheet(title=(xls_sheet.name or f"Sheet{sheet_index + 1}")[:31])  # openpyxl จำกัดชื่อชีตไม่เกิน 31 ตัวอักษร
+
+        for row_idx in range(xls_sheet.nrows):
+            for col_idx in range(xls_sheet.ncols):
+                cell_type = xls_sheet.cell_type(row_idx, col_idx)
+                if cell_type in (xlrd.XL_CELL_EMPTY, xlrd.XL_CELL_BLANK, xlrd.XL_CELL_ERROR):
+                    continue  # ไม่มีค่าที่มีความหมายให้ก็อปมา (BLANK มี format แต่ไม่มีค่า, ERROR ก็อปมาไม่มีประโยชน์)
+
+                raw_value = xls_sheet.cell_value(row_idx, col_idx)
+                try:
+                    if cell_type == xlrd.XL_CELL_DATE:
+                        value = xlrd.xldate_as_datetime(raw_value, book.datemode)
+                    elif cell_type == xlrd.XL_CELL_BOOLEAN:
+                        value = bool(raw_value)
+                    else:
+                        value = raw_value
+                except Exception:
+                    continue  # แปลงค่าไม่ได้ ข้ามเซลล์นี้ไปเลย ไม่ error ทั้งไฟล์
+
+                target_cell = ws.cell(row=row_idx + 1, column=col_idx + 1, value=value)  # xlrd 0-indexed, openpyxl 1-indexed
+
+                try:
+                    xf = book.xf_list[xls_sheet.cell_xf_index(row_idx, col_idx)]
+                    format_str = book.format_map[xf.format_key].format_str
+                    if format_str:
+                        target_cell.number_format = format_str
+                except Exception:
+                    pass  # ดึง format ไม่ได้ ปล่อยเป็น General (ค่า default ของ openpyxl อยู่แล้ว) ไม่ error ทั้งไฟล์
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 def _extract_excel_labels(raw: bytes) -> dict:
     """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ)
     ไล่ทุกแถวทุกชีต ถ้าแถวมีเซลล์ไม่ว่างพอดี 2 เซลล์ ให้เซลล์แรก=label เซลล์หลัง=value+พิกัด
@@ -2881,20 +2928,29 @@ async def upload_excel_editor_document(
     chat_id: Optional[int] = Form(None),
     user_id: int = Depends(require_user),
 ):
-    """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx
+    """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx/.xls
     ที่ไม่ตรง schema Deal Screening พร้อมพิมพ์คำสั่งมาด้วยในครั้งเดียว: อัปโหลด + แก้ครั้งแรกทันที
-    (ถ้าไม่มีคำสั่งมาด้วย ฝั่ง frontend จะเรียก /api/user-documents/upload แทน ไม่มาที่นี่)"""
+    (ถ้าไม่มีคำสั่งมาด้วย ฝั่ง frontend จะเรียก /api/user-documents/upload แทน ไม่มาที่นี่)
+    .xls จะถูกแปลงเป็น .xlsx อัตโนมัติเบื้องหลังก่อน (ดู _convert_xls_to_xlsx_bytes()) — ตั้งแต่บรรทัดที่แปลง
+    แล้วเป็นต้นไป โค้ดด้านล่างทั้งหมดทำงานกับ .xlsx เสมอ ไม่ต้องรู้เลยว่าไฟล์ต้นฉบับเป็น .xls หรือ .xlsx"""
     filename = file.filename or "upload.xlsx"
-    if not filename.lower().endswith(".xlsx"):
-        # openpyxl เขียนไฟล์กลับได้เฉพาะ .xlsx เท่านั้น (.xls ต้องใช้ library คนละตัวที่เขียนไม่ได้) จึงไม่รองรับ .xls รอบนี้
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx เท่านั้น")
+    if not filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
 
     _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
+
+    if filename.lower().endswith(".xls"):
+        try:
+            raw = _convert_xls_to_xlsx_bytes(raw)
+        except Exception:
+            raise HTTPException(status_code=400, detail="แปลงไฟล์ .xls ไม่สำเร็จ — ตรวจสอบว่าเป็นไฟล์ .xls ที่ถูกต้อง")
+        filename = filename[: -len(".xls")] + ".xlsx"  # ให้นามสกุลตรงกับเนื้อหาจริงหลังแปลง
+
     try:
         label_map = _extract_excel_labels(raw)
     except Exception:
-        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xlsx ที่ถูกต้อง")
+        raise HTTPException(status_code=400, detail="อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ที่ถูกต้อง")
 
     if not label_map:
         raise HTTPException(
