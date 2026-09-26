@@ -1108,6 +1108,24 @@ def get_editable_document_by_chat(chat_id: int, user_id: int) -> Optional[dict]:
         return _editable_document_to_dict(row)
 
 
+def list_active_editable_documents_by_chat(chat_id: int, user_id: int) -> list[dict]:
+    """คืนทุก EditableDocument ที่ยังไม่หมดอายุผูกกับแชทนี้ (ไม่ใช่แค่ตัวล่าสุดแบบ
+    get_editable_document_by_chat() เดิม — ฟังก์ชันนั้นยังเก็บไว้ไม่ลบ) เรียงใหม่สุดก่อน
+    ใช้รองรับหลายไฟล์ในแชทเดียวกัน (แก้/เปรียบเทียบหลายไฟล์พร้อมกัน)"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(EditableDocument)
+            .filter(EditableDocument.chat_id == chat_id, EditableDocument.user_id == user_id)
+            .order_by(EditableDocument.created_at.desc())
+            .all()
+        )
+        return [
+            _editable_document_to_dict(row)
+            for row in rows
+            if not _is_editable_document_expired(row.expires_at)
+        ]
+
+
 def update_editable_document_label_map(document_id: int, label_map: dict) -> bool:
     """อัปเดตแค่ label_map (current_value ที่แก้ระหว่างคุย) — ไม่แตะ original_bytes เลย
     caller ต้องเช็ค ownership ผ่าน get_editable_document() มาก่อนแล้วเสมอ"""

@@ -66,6 +66,7 @@ from db import (
     create_editable_document,
     get_editable_document,
     get_editable_document_by_chat,
+    list_active_editable_documents_by_chat,
     update_editable_document_label_map,
 )
 
@@ -1190,11 +1191,13 @@ async def ask_question(
     user_id = get_active_user_id(request)
 
     # ถ้าแชทนี้มี EditableDocument (Excel Editor) ที่ยังไม่หมดอายุผูกอยู่ และข้อความนี้ไม่มีไฟล์แนบมาด้วย
-    # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
+    # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize/compare) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
     # (unrelated) ซึ่งจะปล่อยผ่านไป flow RAG ปกติด้านล่างทันที ไม่บล็อกการสนทนาปกติ
     if user_id and chat_id and query.strip() and image is None:
-        editable_doc = get_editable_document_by_chat(chat_id, user_id)
-        if editable_doc is not None:
+        active_docs = list_active_editable_documents_by_chat(chat_id, user_id)
+
+        if len(active_docs) == 1:
+            editable_doc = active_docs[0]
             intent = _classify_excel_editor_intent(editable_doc["label_map"], query)
 
             if intent == "edit":
@@ -1212,7 +1215,64 @@ async def ask_question(
                 touch_chat_session(chat_id)
                 return {"answer": answer, "sources": [], "chat_id": chat_id}
 
+            if intent == "compare":
+                answer = (
+                    f"ตอนนี้มีแค่ไฟล์เดียวในแชทนี้ (ชื่อ {editable_doc['filename']}) "
+                    "กรุณาแนบอีกไฟล์ที่ต้องการเปรียบเทียบด้วยครับ"
+                )
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
             # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
+
+        elif len(active_docs) >= 2:
+            route = _route_multi_file_instruction(active_docs, query)
+            action = route.get("action")
+
+            if action == "edit":
+                valid_ids = {doc["id"] for doc in active_docs}
+                target_id = route.get("document_id")
+                if target_id in valid_ids:
+                    result = _match_and_apply_excel_edit(target_id, user_id, query)
+                    answer = result["message"]
+                else:
+                    answer = "ระบบระบุไฟล์ที่จะแก้ไม่ได้ชัดเจน กรุณาระบุชื่อไฟล์ในคำสั่งให้ชัดเจนขึ้นครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if action == "finalize":
+                # หลายไฟล์พร้อมกัน ไม่เดาว่าต้องการไฟล์ไหน — ให้ pattern เดียวกับ compare ตอน 3+ ไฟล์
+                names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
+                answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการดาวน์โหลดไฟล์ไหนครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if action == "compare":
+                if len(active_docs) == 2:
+                    answer = _compare_editable_documents(active_docs[0], active_docs[1])
+                else:
+                    names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
+                    answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการเปรียบเทียบไฟล์ไหนกับไฟล์ไหนครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if action == "clarify":
+                answer = route.get("message") or "กรุณาระบุให้ชัดเจนว่าต้องการแก้ไฟล์ไหน หรือให้เปรียบเทียบไฟล์ครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # action == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
+            # (สำคัญ: กันบทสนทนาปกติถูกขังอยู่ในโหมด Excel Editor ตลอดไปเมื่อมี 2+ ไฟล์ active)
 
     query, image_data, history = await _parse_and_validate_ask_input(query, chat_id, image, user_id)
 
@@ -2605,17 +2665,18 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในบทสนทนานี้เกี่ยวข้องกับการแก้ไฟล์ Excel ที่กำลังทำอยู่หรือไม่ "
     "ผู้ใช้กำลังแก้ไฟล์ excel อยู่ โดยมี label ที่แก้ได้ในไฟล์นี้ (JSON) ให้ดูประกอบการตัดสินใจ\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
-    '{"intent": "edit" หรือ "finalize" หรือ "unrelated"}\n\n'
+    '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "unrelated"}\n\n'
     "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
+    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่น\n"
     "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับการแก้ไฟล์นี้เลย"
 )
 
 
 def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     """ตัดสินใจว่าข้อความล่าสุด (ไม่มีไฟล์แนบ) ในแชทที่มี EditableDocument ผูกอยู่ เกี่ยวกับการแก้ไฟล์
-    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'finalize' | 'unrelated' เสมอ — parse ไม่ได้ถือว่า 'unrelated'
-    (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้ตั้งใจ)"""
+    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'finalize' | 'compare' | 'unrelated' เสมอ — parse ไม่ได้ถือว่า
+    'unrelated' (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้ตั้งใจ)"""
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
         f"ข้อความล่าสุดของผู้ใช้: {query}"
@@ -2628,7 +2689,88 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     intent = (parsed or {}).get("intent")
-    return intent if intent in ("edit", "finalize", "unrelated") else "unrelated"
+    return intent if intent in ("edit", "finalize", "compare", "unrelated") else "unrelated"
+
+
+EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
+    "คุณกำลังช่วยตัดสินใจว่าคำสั่งของผู้ใช้ในบทสนทนานี้ต้องการทำอะไร โดยมีไฟล์ Excel ที่กำลังแก้อยู่พร้อมกัน "
+    "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON)\n\n"
+    "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
+    '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "clarify" หรือ "unrelated", '
+    '"document_id": <เลข document_id ของไฟล์ที่จะแก้ ถ้า action เป็น edit ไม่งั้นใส่ null>, '
+    '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
+    "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน และสามารถระบุได้ว่าเป็นไฟล์ไหนไฟล์เดียว "
+    "(จาก label ที่ตรงกับแค่ไฟล์เดียว หรือเอ่ยชื่อไฟล์ตรงๆ) — ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
+    "ถ้า label ที่พูดถึงมีอยู่ในมากกว่า 1 ไฟล์พร้อมกันและไม่ได้เอ่ยชื่อไฟล์ ห้ามเดาว่าเป็นไฟล์ไหนเด็ดขาด ให้ตอบ clarify แทน\n"
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
+    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์กัน\n"
+    "- clarify: คำสั่งคลุมเครือ ตีความไม่ออกว่าต้องการแก้ไฟล์ไหนหรือต้องการทำอะไรกันแน่ "
+    "ให้ตั้งคำถามกลับสั้นๆ ใน message เพื่อขอความชัดเจนจากผู้ใช้\n"
+    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับไฟล์ทั้งหมดนี้เลย"
+)
+
+
+def _route_multi_file_instruction(documents: list[dict], instruction: str) -> dict:
+    """เรียก Claude ครั้งเดียวตัดสินใจว่าคำสั่งล่าสุด (มีไฟล์ excel active พร้อมกันหลายไฟล์) ต้องการทำอะไร
+    คืน dict {"action":, "document_id":, "message":} เสมอ ไม่ raise เลย — parse ไม่ได้ถือว่า action='clarify'
+    (fail-safe แบบเดียวกับ pattern เดิมทุกจุดในไฟล์นี้ — ไม่เดาแล้วแก้ผิดไฟล์)"""
+    files_context = [
+        {"document_id": doc["id"], "filename": doc["filename"], "label_map": doc["label_map"]}
+        for doc in documents
+    ]
+    prompt = (
+        f"ไฟล์ทั้งหมดที่กำลังแก้อยู่ (JSON):\n{json.dumps(files_context, ensure_ascii=False)}\n\n"
+        f"คำสั่งจากผู้ใช้: {instruction}"
+    )
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=300,
+        system=EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    parsed = _parse_json_response(response.content[0].text, dict)
+    if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "clarify", "unrelated"):
+        return {"action": "clarify", "document_id": None, "message": None}
+    return {
+        "action": parsed.get("action"),
+        "document_id": parsed.get("document_id"),
+        "message": parsed.get("message"),
+    }
+
+
+def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
+    """หา label ที่ normalize แล้วตรงกันทั้ง 2 ไฟล์ด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย)
+    สร้าง diff list ตัวเลข/ค่าที่คำนวณเสร็จแล้ว แล้วให้ Claude แค่ 'เขียนอธิบายเป็นภาษาธรรมชาติ'
+    ห้าม Claude คำนวณหรือแก้ไขตัวเลขเอง — ใช้ตามที่ diff list ให้มาเป๊ะ"""
+    normalized_a = {_normalize_label(label): (label, info) for label, info in doc_a["label_map"].items()}
+    normalized_b = {_normalize_label(label): (label, info) for label, info in doc_b["label_map"].items()}
+    common_keys = set(normalized_a) & set(normalized_b)
+
+    if not common_keys:
+        return f"ไม่พบ label ที่ตรงกันระหว่าง '{doc_a['filename']}' กับ '{doc_b['filename']}' เลย ไม่สามารถเปรียบเทียบได้"
+
+    diffs = []
+    for norm_key in sorted(common_keys):
+        label, info_a = normalized_a[norm_key]
+        _, info_b = normalized_b[norm_key]
+        value_a = info_a["current_value"]
+        value_b = info_b["current_value"]
+        diffs.append({"label": label, "value_a": value_a, "value_b": value_b, "changed": value_a != value_b})
+
+    prompt = (
+        f"ไฟล์ A: {doc_a['filename']}\nไฟล์ B: {doc_b['filename']}\n\n"
+        f"ผลต่างที่คำนวณไว้แล้ว (JSON, ห้ามคำนวณหรือแก้ไขตัวเลขเอง ใช้ตามนี้เป๊ะ):\n"
+        f"{json.dumps(diffs, ensure_ascii=False)}\n\n"
+        "หน้าที่ของคุณ: เขียนอธิบายผลต่างข้างต้นเป็นภาษาไทยที่อ่านง่าย เน้นเฉพาะรายการที่ changed=true เป็นหลัก "
+        "สรุปรายการที่ไม่เปลี่ยนแปลง (changed=false) สั้นๆ รวมกันไม่ต้องแจกแจงทีละรายการ "
+        "ตอบเป็นข้อความธรรมดา ห้ามใช้ Markdown syntax เช่น #, **, |, อีโมจิ"
+    )
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
 
 
 EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT = (
