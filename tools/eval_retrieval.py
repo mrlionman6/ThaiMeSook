@@ -1,38 +1,41 @@
 """
-tools/eval_retrieval.py
+tools/eval_retrieval.py (v2 — strict-recall round)
 
 Offline retrieval-quality evaluation for ThaiMeSook's hybrid search pipeline.
 Reimplements the pipeline from main.py from scratch (does NOT import main.py or
 db.py, does NOT connect to any database) against a static knowledge_base_export.json
-export, to compare 4 candidate embedding/reranking strategies (A-D) without touching
+export, to compare candidate reranking strategies (A/C/F/D/E) without touching
 production data or requiring a live DB.
 
 Usage:
     python tools/eval_retrieval.py <path-to-knowledge_base_export.json>
 
 Terminal output is English/ASCII only (numbers, PASS/FAIL, variant labels) per
-project convention (this shell mangles Thai text). Full detail (including Thai
-question/chunk text is never printed) is written to eval_out/eval_results.txt.
+project convention (this shell mangles Thai text). Full detail is written to
+eval_out/eval_results_v2.txt.
+
+Round 2 change from v1: strict metric. A question only "hits" (hit_strict) when
+EVERY chunk in its necessary set is present in the variant's final set — not just
+any one of them (that looser criterion is kept alongside as hit_lenient, for
+comparison). All variants in this round use NO e5 prefix on embeddings (matches
+current production behavior exactly — v1's B variant with e5 prefixes is dropped).
 
 Pipeline reproduced from main.py (read for reference only, not imported):
-  - BM25Okapi over word_tokenize(doc, engine="newmm") from pythainlp — identical
-    for all 4 variants (BM25 is lexical, unrelated to e5 embedding prefixes).
+  - BM25Okapi over word_tokenize(doc, engine="newmm") from pythainlp.
   - SentenceTransformer('intfloat/multilingual-e5-large') cosine similarity,
-    computed with plain numpy (query vs every chunk vector).
+    computed with plain numpy (query vs every chunk vector), no e5 prefix.
   - hybrid: final = 0.5*minmax(vector_scores) + 0.5*minmax(bm25_scores), top 5.
-  - CrossEncoder('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1') reranks the hybrid
-    top-5 using RAW (unprefixed) query/chunk text — the cross-encoder has no e5
-    prefix convention, so all 4 variants rerank identically.
+  - CrossEncoder('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1') for reranking,
+    using RAW (unprefixed) query/chunk text.
 
-Variants:
-  A = current behavior: no e5 prefix on chunk/query embeddings. hybrid top5 -> rerank -> top3.
-  B = "passage: "+chunk / "query: "+query embeddings. hybrid top5 -> rerank -> top3.
-  C = same embeddings as B, rerank all 5, keep all 5 (no truncation to top3).
-  D = same embeddings as B, no reranker at all — final = hybrid top3 directly.
-
-Each result line has one "scores" field, defined as the score of the ranking
-method that produced the "final" list: CrossEncoder rerank score for A/B/C,
-hybrid combined score for D (D has no rerank step).
+Variants (all share the identical hybrid top-5, since none use e5 prefixes):
+  A = hybrid top5 -> rerank -> top3 (current production behavior).
+  C = hybrid top5 -> rerank -> keep all 5 (sorted by rerank score).
+  F = hybrid top5, kept in original hybrid order, reranker never reorders/truncates.
+  D = hybrid top3 directly, no reranker call at all.
+  E = hybrid top5 -> rerank with CrossEncoder('BAAI/bge-reranker-v2-m3') -> top3.
+      Optional: if this model fails to load/download, E is skipped entirely and
+      is NOT treated as a stop condition (only A/C/F/D are mandatory).
 """
 
 import sys
@@ -44,6 +47,8 @@ from rank_bm25 import BM25Okapi
 from pythainlp.tokenize import word_tokenize
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
+# (question_number, question_text, necessary_chunk_numbers)
+# q12 is an unrelated control question (necessary=[]) excluded from recall.
 QUESTIONS = [
     (1, "ต่างชาติถือหุ้นในบริษัทไทยที่ทำธุรกิจบริการได้ไม่เกินกี่เปอร์เซ็นต์", [1, 4]),
     (2, "ต่างชาติทำนาหรือทำสวนได้ไหม", [2]),
@@ -57,7 +62,13 @@ QUESTIONS = [
     (10, "BOI กับ FBA ต่างกันอย่างไร", [16]),
     (11, "ยื่นขอ BOI ต้องเตรียมเอกสารอะไรบ้าง", [15]),
     (12, "กล้อง CCTV ยี่ห้อไหนนิยม", []),
+    (13, "ธุรกิจในบัญชีหนึ่ง บัญชีสอง บัญชีสามต่างกันอย่างไร", [2, 3, 4]),
+    (14, "ไม่ได้ BOI แล้วอยากทำธุรกิจบริการในบัญชีสาม ต้องทำอย่างไร", [4, 6]),
+    (15, "บริษัทไทยที่ต่างชาติถือหุ้น 60% นับเป็นคนต่างด้าวไหม ต้องขอ FBL ไหม", [1, 4]),
+    (16, "ธุรกิจนายหน้าต่างชาติทำได้ไหม", [4]),
 ]
+
+CONTROL_QUESTION_NUM = 12
 
 
 def minmax_normalize(scores):
@@ -77,12 +88,12 @@ def cosine_sim(query_vec, doc_vecs):
 
 def main():
     if len(sys.argv) < 2:
-        print("STOP_POINT_B: no knowledge_base_export.json path given as argv[1]")
+        print("STOP: no knowledge_base_export.json path given as argv[1]")
         sys.exit(1)
 
     kb_path = sys.argv[1]
     if not os.path.exists(kb_path):
-        print("STOP_POINT_B: file not found")
+        print("STOP: file not found")
         sys.exit(1)
 
     with open(kb_path, encoding="utf-8") as f:
@@ -96,108 +107,85 @@ def main():
         embed_model = SentenceTransformer("intfloat/multilingual-e5-large")
         reranker = CrossEncoder("cross-encoder/mmarco-mMiniLMv2-L12-H384-v1")
     except Exception:
-        print("STOP_POINT_C: model load failed")
+        print("STOP: mandatory model load failed")
         sys.exit(1)
+
+    bge_reranker = None
+    try:
+        bge_reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+        print("variant_E=available")
+    except Exception:
+        print("variant_E=skipped")
 
     os.makedirs("eval_out", exist_ok=True)
 
-    # BM25 index is identical across all 4 variants (lexical, no e5 prefix concept)
     tokenized_kb = [word_tokenize(doc, engine="newmm") for doc in chunks]
     bm25 = BM25Okapi(tokenized_kb)
+    emb_chunks = embed_model.encode(chunks)  # no e5 prefix — matches production
 
-    # Precompute chunk embeddings once per prefix scheme
-    emb_no_prefix = embed_model.encode(chunks)
-    emb_passage_prefix = embed_model.encode(["passage: " + c for c in chunks])
-
+    variant_names = ["A", "C", "F", "D"] + (["E"] if bge_reranker is not None else [])
     out_lines = []
-    recall_hits = {v: 0 for v in "ABCD"}
-    q1_hit = {v: 0 for v in "ABCD"}
+    recall_strict = {v: 0 for v in variant_names}
+    hit_strict_by_q = {v: {} for v in variant_names}
 
-    for q_num, q_text, correct_chunks in QUESTIONS:
+    scored_questions = [q for q in QUESTIONS if q[0] != CONTROL_QUESTION_NUM]
+    num_scored = len(scored_questions)
+
+    for q_num, q_text, necessary in QUESTIONS:
         tokenized_query = word_tokenize(q_text, engine="newmm")
         bm25_scores = np.array(bm25.get_scores(tokenized_query))
         bm25_norm = minmax_normalize(bm25_scores)
 
-        # --- Variant A: no prefix ---
-        q_emb_a = embed_model.encode(q_text)
-        vec_scores_a = cosine_sim(q_emb_a, emb_no_prefix)
-        final_a = 0.5 * minmax_normalize(vec_scores_a) + 0.5 * bm25_norm
-        top5_idx_a = final_a.argsort()[::-1][:5]
-        hybrid_top5_a = [i + 1 for i in top5_idx_a]
-        candidates_a = [chunks[i] for i in top5_idx_a]
-        pairs_a = [[q_text, c] for c in candidates_a]
-        rerank_scores_a = reranker.predict(pairs_a)
-        ranked_a = sorted(zip(top5_idx_a, rerank_scores_a), key=lambda x: x[1], reverse=True)
-        final_idx_a = [i for i, s in ranked_a[:3]]
-        final_scores_a = [float(s) for i, s in ranked_a[:3]]
-        final_chunks_a = [i + 1 for i in final_idx_a]
+        q_emb = embed_model.encode(q_text)  # no e5 prefix
+        vec_scores = cosine_sim(q_emb, emb_chunks)
+        final_scores = 0.5 * minmax_normalize(vec_scores) + 0.5 * bm25_norm
+        top5_idx = list(final_scores.argsort()[::-1][:5])
+        candidates = [chunks[i] for i in top5_idx]
+        pairs = [[q_text, c] for c in candidates]
+        rerank_scores = reranker.predict(pairs)
+        ranked = sorted(zip(top5_idx, rerank_scores), key=lambda x: x[1], reverse=True)
 
-        # --- Shared hybrid for B/C/D: passage/query prefix ---
-        q_emb_prefixed = embed_model.encode("query: " + q_text)
-        vec_scores_bcd = cosine_sim(q_emb_prefixed, emb_passage_prefix)
-        final_bcd = 0.5 * minmax_normalize(vec_scores_bcd) + 0.5 * bm25_norm
-        top5_idx_bcd = final_bcd.argsort()[::-1][:5]
-        hybrid_top5_bcd = [i + 1 for i in top5_idx_bcd]
-        candidates_bcd = [chunks[i] for i in top5_idx_bcd]
-        pairs_bcd = [[q_text, c] for c in candidates_bcd]
-        rerank_scores_bcd = reranker.predict(pairs_bcd)
-        ranked_bcd = sorted(zip(top5_idx_bcd, rerank_scores_bcd), key=lambda x: x[1], reverse=True)
-
-        # --- Variant B: rerank -> top3 ---
-        final_idx_b = [i for i, s in ranked_bcd[:3]]
-        final_scores_b = [float(s) for i, s in ranked_bcd[:3]]
-        final_chunks_b = [i + 1 for i in final_idx_b]
-
-        # --- Variant C: rerank -> keep all 5 ---
-        final_idx_c = [i for i, s in ranked_bcd]
-        final_scores_c = [float(s) for i, s in ranked_bcd]
-        final_chunks_c = [i + 1 for i in final_idx_c]
-
-        # --- Variant D: no reranker, hybrid top3 directly ---
-        top3_idx_d = top5_idx_bcd[:3]
-        final_chunks_d = [i + 1 for i in top3_idx_d]
-        final_scores_d = [float(final_bcd[i]) for i in top3_idx_d]
-
-        variant_results = {
-            "A": (hybrid_top5_a, final_chunks_a, final_scores_a),
-            "B": (hybrid_top5_bcd, final_chunks_b, final_scores_b),
-            "C": (hybrid_top5_bcd, final_chunks_c, final_scores_c),
-            "D": (hybrid_top5_bcd, final_chunks_d, final_scores_d),
+        variant_final_idx = {
+            "A": [i for i, s in ranked[:3]],
+            "C": [i for i, s in ranked],
+            "F": list(top5_idx),
+            "D": list(top5_idx[:3]),
         }
+        if bge_reranker is not None:
+            e_scores = bge_reranker.predict(pairs)
+            ranked_e = sorted(zip(top5_idx, e_scores), key=lambda x: x[1], reverse=True)
+            variant_final_idx["E"] = [i for i, s in ranked_e[:3]]
 
-        for v in "ABCD":
-            hybrid_top5, final_chunks, final_scores = variant_results[v]
-            hit = 1 if (set(final_chunks) & set(correct_chunks)) else 0
-            line = (
+        necessary_set = set(necessary)
+        for v in variant_names:
+            final_chunks = [i + 1 for i in variant_final_idx[v]]
+            final_set = set(final_chunks)
+            hit_strict = 1 if necessary_set.issubset(final_set) else 0
+            hit_lenient = 1 if (necessary_set & final_set) else 0
+
+            out_lines.append(
                 f"variant={v} q={q_num} "
-                f"hybrid_top5={','.join(str(c) for c in hybrid_top5)} "
                 f"final={','.join(str(c) for c in final_chunks)} "
-                f"scores={','.join(f'{s:.4f}' for s in final_scores)} "
-                f"hit={hit}"
+                f"hit_strict={hit_strict} hit_lenient={hit_lenient}"
             )
-            out_lines.append(line)
-            if q_num != 12:  # control question excluded from recall
-                recall_hits[v] += hit
-            if q_num == 1:
-                q1_hit[v] = hit
 
-    num_scored_questions = sum(1 for q_num, _, _ in QUESTIONS if q_num != 12)
+            if q_num != CONTROL_QUESTION_NUM:
+                recall_strict[v] += hit_strict
+            hit_strict_by_q[v][q_num] = hit_strict
 
-    with open("eval_out/eval_results.txt", "w", encoding="utf-8") as f:
+    with open("eval_out/eval_results_v2.txt", "w", encoding="utf-8") as f:
         for line in out_lines:
             f.write(line + "\n")
         f.write("\n")
-        for v in "ABCD":
-            f.write(f"recall_final_{v}={recall_hits[v]}/{num_scored_questions}\n")
+        for v in variant_names:
+            f.write(f"recall_strict_{v}={recall_strict[v]}/{num_scored}\n")
 
-    print("recall_A=%d/%d" % (recall_hits["A"], num_scored_questions))
-    print("recall_B=%d/%d" % (recall_hits["B"], num_scored_questions))
-    print("recall_C=%d/%d" % (recall_hits["C"], num_scored_questions))
-    print("recall_D=%d/%d" % (recall_hits["D"], num_scored_questions))
-    print("q1_hit_A=%d" % q1_hit["A"])
-    print("q1_hit_B=%d" % q1_hit["B"])
-    print("q1_hit_C=%d" % q1_hit["C"])
-    print("q1_hit_D=%d" % q1_hit["D"])
+    for v in variant_names:
+        print(f"recall_strict_{v}={recall_strict[v]}/{num_scored}")
+    for v in variant_names:
+        print(f"q1_hit_strict_{v}={hit_strict_by_q[v][1]}")
+    for v in variant_names:
+        print(f"q13_hit_strict_{v}={hit_strict_by_q[v][13]}")
 
 
 if __name__ == "__main__":
