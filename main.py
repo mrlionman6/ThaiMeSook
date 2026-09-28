@@ -915,7 +915,7 @@ def _prepare_rag_context(query, history, image_data):
 
     search_query = rewrite_query_for_retrieval(query_for_search, history)
     candidates = hybrid_search(search_query, k=5)
-    top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=3)
+    top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=5)
     context = "\n".join([f"- {c}" for c in top_chunks])
 
     system_prompt = (
