@@ -8,38 +8,43 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 </head>
 <body class="page-admin-BG">
-    <div class="box-admin-padding">  
-        <h1> Admin: จัดการระบบ
-            <a href="/admin/logout" style="font-size:14px; float:right;">🚪 Logout</a>
-        </h1>
-    
-        <div class="tab-bar">
-            <button id="tabBtnPending" class="tab-btn tab-btn-active" onclick="switchTab('pending')">
-                 รอตรวจสอบ
-            </button>
-            <button id="tabBtnKb" class="tab-btn" onclick="switchTab('kb')">
-                 Knowledge Base
-            </button>
-            <button id="tabBtnUserRequests" class="tab-btn" onclick="switchTab('userRequests')">
-                 คำขอสมัครสมาชิก
-            </button>
-            <button id="tabBtnUsers" class="tab-btn" onclick="switchTab('users')">
-                 จัดการบัญชี
-            </button>
-            <button id="tabBtnTags" class="tab-btn" onclick="switchTab('tags')">
-                 จัดการ Tag
-            </button>
-            <button id="tabBtnAgent" class="tab-btn" onclick="switchTab('agent')">
-                 AI Agent KB Management
-            </button>
-            <button id="tabBtnDealScreening" class="tab-btn" onclick="switchTab('dealScreening')">
-                 Deal Screening
-            </button>
-            <button id="tabBtnFeasibility" class="tab-btn" onclick="switchTab('feasibility')">
-                 Feasibility Summarizer
-            </button>
-        </div>
-    
+    <div class="box-admin-padding admin-layout">
+        <aside class="admin-sidebar">
+            <div class="admin-sidebar-header">Admin</div>
+
+            <div class="tab-bar">
+                <button id="tabBtnPending" class="tab-btn tab-btn-active" onclick="switchTab('pending')">
+                     รอตรวจสอบ
+                </button>
+                <button id="tabBtnKb" class="tab-btn" onclick="switchTab('kb')">
+                     Knowledge Base
+                </button>
+                <button id="tabBtnUserRequests" class="tab-btn" onclick="switchTab('userRequests')">
+                     คำขอสมัครสมาชิก
+                </button>
+                <button id="tabBtnUsers" class="tab-btn" onclick="switchTab('users')">
+                     จัดการบัญชี
+                </button>
+                <button id="tabBtnTags" class="tab-btn" onclick="switchTab('tags')">
+                     จัดการ Tag
+                </button>
+                <button id="tabBtnAgent" class="tab-btn" onclick="switchTab('agent')">
+                     AI Agent KB Management
+                </button>
+                <button id="tabBtnDealScreening" class="tab-btn" onclick="switchTab('dealScreening')">
+                     Deal Screening
+                </button>
+                <button id="tabBtnFeasibility" class="tab-btn" onclick="switchTab('feasibility')">
+                     Feasibility Summarizer
+                </button>
+            </div>
+
+            <a href="/admin/logout" class="admin-sidebar-logout">🚪 Logout</a>
+        </aside>
+
+        <main class="admin-main">
+        <h1 class="admin-main-title">จัดการระบบ</h1>
+
         <div id="tabPending" class="tab-panel">
             <div id="logsContainer">กำลังโหลด...</div>
             <div id="logsPagination" class="pagination-bar"></div>
@@ -288,6 +293,7 @@
 
             <div id="feasibilitySummaryBox" class="feasibility-summary-box" hidden></div>
         </div>
+        </main>
     </div>
     <script src="/static/admin.js"></script>
 </body>

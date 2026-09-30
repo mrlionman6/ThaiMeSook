@@ -368,6 +368,162 @@ button {
     border-bottom: 3px solid var(--color-primary);
 }
 
+/* ---------- Admin: sidebar เมนูด้านซ้าย ----------
+   ใช้ .box-admin-padding (มีเฉพาะใน admin.html) เป็น flex row: sidebar + เนื้อหาหลัก
+   ไม่แตะ .tab-bar/.tab-btn/.tab-btn-active เดิมเลย — override เฉพาะภายใต้ .admin-sidebar
+   ด้วย descendant selector (specificity สูงกว่าคลาสเดี่ยวเดิมอยู่แล้ว ไม่ต้องใช้ !important) */
+.admin-layout {
+    display: flex;
+    align-items: stretch;
+    min-height: 100vh;
+}
+
+.admin-sidebar {
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    flex: 0 0 230px;
+    width: 230px;
+    height: 100vh;
+    overflow-y: auto;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    background: #1f2937;
+    padding: 20px 0;
+}
+
+.admin-sidebar-header {
+    color: #fff;
+    font-size: 20px;
+    font-weight: bold;
+    padding: 0 20px 16px;
+    margin-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.admin-sidebar .tab-bar {
+    display: flex;
+    flex-direction: column;
+    flex-wrap: nowrap;
+    gap: 2px;
+    margin: 0;
+    border-bottom: none;
+    flex: 1;
+}
+
+.admin-sidebar .tab-btn {
+    width: 100%;
+    box-sizing: border-box;
+    text-align: left;
+    padding: 12px 20px;
+    font-size: 14px;
+    color: rgba(255, 255, 255, 0.75);
+    border-bottom: none;
+    border-left: 3px solid transparent;
+}
+
+.admin-sidebar .tab-btn:hover {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.admin-sidebar .tab-btn-active {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.12);
+    border-bottom: none;
+    border-left: 3px solid var(--color-primary-button-green);
+}
+
+.admin-sidebar-logout {
+    display: block;
+    margin-top: auto;
+    padding: 14px 20px;
+    color: #fff;
+    text-decoration: none;
+    font-size: 14px;
+    border-top: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+.admin-sidebar-logout:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+
+.admin-main {
+    flex: 1;
+    min-width: 0;
+    padding: 24px 32px;
+    box-sizing: border-box;
+}
+
+.admin-main-title {
+    margin: 0 0 20px;
+    font-size: 22px;
+}
+
+/* จอเล็ก: ยุบ sidebar เป็นแถบเมนูด้านบนเลื่อนแนวนอนได้ — ไม่แก้ switchTab() เลย
+   เพราะ id/onclick/class ของปุ่มเดิมไม่เปลี่ยน แค่ CSS layout เปลี่ยน */
+@media (max-width: 768px) {
+    .admin-layout {
+        flex-direction: column;
+        min-height: 0;
+    }
+
+    .admin-sidebar {
+        position: relative;
+        top: auto;
+        width: 100%;
+        height: auto;
+        flex-direction: row;
+        align-items: center;
+        overflow-x: auto;
+        overflow-y: visible;
+        padding: 10px 12px;
+        gap: 8px;
+    }
+
+    .admin-sidebar-header {
+        flex: 0 0 auto;
+        padding: 0 12px 0 0;
+        margin-bottom: 0;
+        border-bottom: none;
+        border-right: 1px solid rgba(255, 255, 255, 0.15);
+        white-space: nowrap;
+    }
+
+    .admin-sidebar .tab-bar {
+        flex-direction: row;
+        flex-wrap: nowrap;
+        flex: 0 0 auto;
+        overflow-x: auto;
+    }
+
+    .admin-sidebar .tab-btn {
+        width: auto;
+        white-space: nowrap;
+        border-left: none;
+        border-bottom: 3px solid transparent;
+        padding: 10px 14px;
+    }
+
+    .admin-sidebar .tab-btn-active {
+        border-left: none;
+        border-bottom: 3px solid var(--color-primary-button-green);
+    }
+
+    .admin-sidebar-logout {
+        flex: 0 0 auto;
+        margin-top: 0;
+        margin-left: auto;
+        border-top: none;
+        white-space: nowrap;
+    }
+
+    .admin-main {
+        padding: 16px;
+    }
+}
+
 /* ---------- Admin: การ์ดรายการ (ใช้ทั้งแท็บ pending และ kb) ---------- */
 .card {
     background: var(--color-peach);
