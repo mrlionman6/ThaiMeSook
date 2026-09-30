@@ -402,7 +402,7 @@ button {
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
-    background: var(--color-primary-button-green);
+    background: #50C770;
     padding: 20px 0;
 }
 
