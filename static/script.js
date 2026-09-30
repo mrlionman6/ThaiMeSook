@@ -502,8 +502,8 @@ function renderUserArea() {
             <div class="side-user-info">
                 <span class="side-user-email">${escapeHtml(currentUser.nickname || currentUser.username)}</span>
                 <div class="side-user-buttons">
-                    <button class="side-signout-btn,button_base_1" onclick="openProfileModal()">โปรไฟล์</button>
-                    <button class="side-signout-btn,button_base_1" onclick="handleSignOut()">ออกจากระบบ</button>
+                    <button class="side-signout-btn,button_base_1 askButton_1" onclick="openProfileModal()">โปรไฟล์</button>
+                    <button class="side-signout-btn,button_base_1 askButton_1" onclick="handleSignOut()">ออกจากระบบ</button>
                 </div>
             </div>
         `;
