@@ -29,6 +29,7 @@ function switchTab(tab) {
     document.getElementById("tabAgent").style.display = tab === "agent" ? "block" : "none";
     document.getElementById("tabDealScreening").style.display = tab === "dealScreening" ? "block" : "none";
     document.getElementById("tabFeasibility").style.display = tab === "feasibility" ? "block" : "none";
+    document.getElementById("tabFileLibrary").style.display = tab === "fileLibrary" ? "block" : "none";
 
     document.getElementById("tabBtnPending").classList.toggle("tab-btn-active", tab === "pending");
     document.getElementById("tabBtnKb").classList.toggle("tab-btn-active", tab === "kb");
@@ -38,6 +39,7 @@ function switchTab(tab) {
     document.getElementById("tabBtnAgent").classList.toggle("tab-btn-active", tab === "agent");
     document.getElementById("tabBtnDealScreening").classList.toggle("tab-btn-active", tab === "dealScreening");
     document.getElementById("tabBtnFeasibility").classList.toggle("tab-btn-active", tab === "feasibility");
+    document.getElementById("tabBtnFileLibrary").classList.toggle("tab-btn-active", tab === "fileLibrary");
 
     if (tab === "pending") {
         loadLogs(pendingPage);
@@ -59,6 +61,9 @@ function switchTab(tab) {
         loadAgentJobList();
     } else if (tab === "dealScreening") {
         loadDealScreeningHistory();
+    } else if (tab === "fileLibrary") {
+        loadFileLibraryCategories();
+        renderFileLibraryFilesPlaceholder();
     }
 }
 
@@ -1372,6 +1377,324 @@ async function uploadFeasibilityFile() {
         summaryBox.hidden = false;
     } catch (error) {
         statusEl.textContent = "❌ สรุปไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
+    }
+}
+
+// ---------- แท็บใหม่: คลังไฟล์ ----------
+let fileLibraryCategories = [];                  // [{id, name, file_count}] — id=null คือ "None"
+let fileLibrarySelectedCategoryId = undefined;   // undefined = ยังไม่เลือกอะไรเลย, null = "None", ตัวเลข = หมวดจริง
+let fileLibraryFiles = [];                       // ไฟล์ในหมวดที่เลือกอยู่ตอนนี้
+
+async function loadFileLibraryCategories() {
+    const container = document.getElementById("fileLibraryCategoryList");
+    try {
+        const res = await fetch("/admin/api/file-library/categories");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        fileLibraryCategories = data.categories;
+
+        container.innerHTML = "";
+        fileLibraryCategories.forEach(cat => {
+            const row = document.createElement("div");
+            const isActive = fileLibrarySelectedCategoryId === cat.id;
+            row.className = "file-library-category-row" + (isActive ? " file-library-category-row-active" : "");
+            row.onclick = () => selectFileLibraryCategory(cat.id);
+
+            const isNone = cat.id === null;
+            row.innerHTML = `
+                <span class="file-library-category-name">${escapeHtml(cat.name)}</span>
+                <span class="file-library-category-count">${cat.file_count}</span>
+                ${isNone ? "" : `
+                    <button type="button" class="file-library-category-btn" onclick="event.stopPropagation(); renameFileCategoryPrompt(${cat.id})">✏️</button>
+                    <button type="button" class="file-library-category-btn" onclick="event.stopPropagation(); deleteFileCategoryConfirm(${cat.id})">🗑️</button>
+                `}
+            `;
+            container.appendChild(row);
+        });
+    } catch (error) {
+        container.innerHTML = "<p style='color:red;'>โหลดโฟลเดอร์ไม่สำเร็จ: " + escapeHtml(String(error)) + "</p>";
+    }
+}
+
+function showAddFileCategoryForm() {
+    document.getElementById("fileLibraryAddCategoryForm").hidden = false;
+    document.getElementById("newFileCategoryName").focus();
+}
+
+function hideAddFileCategoryForm() {
+    document.getElementById("fileLibraryAddCategoryForm").hidden = true;
+    document.getElementById("newFileCategoryName").value = "";
+}
+
+async function createFileCategory() {
+    const nameInput = document.getElementById("newFileCategoryName");
+    const name = nameInput.value.trim();
+    if (!name) {
+        alert("ชื่อโฟลเดอร์ห้ามว่างเปล่า");
+        return;
+    }
+    try {
+        const res = await fetch("/admin/api/file-library/categories", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        hideAddFileCategoryForm();
+        loadFileLibraryCategories();
+    } catch (error) {
+        alert("สร้างโฟลเดอร์ไม่สำเร็จ: " + error);
+    }
+}
+
+function renameFileCategoryPrompt(categoryId) {
+    const cat = fileLibraryCategories.find(c => c.id === categoryId);
+    if (!cat) return;
+    const newName = prompt("ชื่อโฟลเดอร์ใหม่:", cat.name);
+    if (newName === null) return; // กดยกเลิก
+    const trimmed = newName.trim();
+    if (!trimmed) {
+        alert("ชื่อโฟลเดอร์ห้ามว่างเปล่า");
+        return;
+    }
+    renameFileCategory(categoryId, trimmed);
+}
+
+async function renameFileCategory(categoryId, newName) {
+    try {
+        const res = await fetch(`/admin/api/file-library/categories/${categoryId}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: newName }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        loadFileLibraryCategories();
+    } catch (error) {
+        alert("เปลี่ยนชื่อไม่สำเร็จ: " + error);
+    }
+}
+
+function deleteFileCategoryConfirm(categoryId) {
+    const cat = fileLibraryCategories.find(c => c.id === categoryId);
+    if (!cat) return;
+    const message = cat.file_count > 0
+        ? `ลบโฟลเดอร์ "${cat.name}"? ไฟล์ทั้ง ${cat.file_count} ไฟล์ในนี้จะถูกย้ายไปที่ "None" (ไม่ถูกลบ)`
+        : `ลบโฟลเดอร์ "${cat.name}"?`;
+    if (!confirm(message)) return;
+    deleteFileCategory(categoryId);
+}
+
+async function deleteFileCategory(categoryId) {
+    try {
+        const res = await fetch(`/admin/api/file-library/categories/${categoryId}`, { method: "DELETE" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        if (fileLibrarySelectedCategoryId === categoryId) {
+            fileLibrarySelectedCategoryId = undefined;
+            renderFileLibraryFilesPlaceholder();
+        }
+        loadFileLibraryCategories();
+    } catch (error) {
+        alert("ลบโฟลเดอร์ไม่สำเร็จ: " + error);
+    }
+}
+
+function selectFileLibraryCategory(categoryId) {
+    fileLibrarySelectedCategoryId = categoryId;
+    loadFileLibraryCategories(); // รีโหลดเพื่ออัปเดตแถวที่ไฮไลต์ว่ากำลังเลือกอยู่
+    loadFileLibraryFiles();
+    updateFileLibraryImportVisibility();
+}
+
+function updateFileLibraryImportVisibility() {
+    document.getElementById("fileLibraryImportRow").hidden = fileLibrarySelectedCategoryId === undefined;
+}
+
+function renderFileLibraryFilesPlaceholder() {
+    document.getElementById("fileLibraryFileList").innerHTML = "<p>เลือกโฟลเดอร์ทางซ้ายเพื่อดูไฟล์</p>";
+    document.getElementById("fileLibraryCurrentCategoryLabel").textContent = "";
+    updateFileLibraryImportVisibility();
+}
+
+async function loadFileLibraryFiles() {
+    if (fileLibrarySelectedCategoryId === undefined) {
+        renderFileLibraryFilesPlaceholder();
+        return;
+    }
+    const container = document.getElementById("fileLibraryFileList");
+    const label = document.getElementById("fileLibraryCurrentCategoryLabel");
+    const cat = fileLibraryCategories.find(c => c.id === fileLibrarySelectedCategoryId);
+    label.textContent = cat ? cat.name : "";
+    updateFileLibraryImportVisibility();
+
+    const queryParam = fileLibrarySelectedCategoryId === null ? "none" : fileLibrarySelectedCategoryId;
+    container.innerHTML = "กำลังโหลด...";
+    try {
+        const res = await fetch(`/admin/api/file-library/files?category_id=${queryParam}`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        fileLibraryFiles = data.files;
+
+        if (fileLibraryFiles.length === 0) {
+            container.innerHTML = "<p>ยังไม่มีไฟล์ในโฟลเดอร์นี้</p>";
+            return;
+        }
+
+        container.innerHTML = "";
+        fileLibraryFiles.forEach(f => {
+            const row = document.createElement("div");
+            row.className = "card";
+
+            const categoryOptions = fileLibraryCategories
+                .filter(c => c.id !== null)
+                .map(c => `<option value="${c.id}" ${c.id === f.category_id ? "selected" : ""}>${escapeHtml(c.name)}</option>`)
+                .join("");
+
+            row.innerHTML = `
+                <p><strong>${escapeHtml(f.filename)}</strong></p>
+                <p class="ts-note">${f.summary ? escapeHtml(f.summary) : "(ไม่มี summary)"}</p>
+                <p class="ts-note">อัปโหลดเมื่อ ${escapeHtml(String(f.uploaded_at))}</p>
+                <div class="file-library-file-actions">
+                    <button type="button" onclick="exportLibraryFile(${f.id})">📥 Export</button>
+                    <select id="fileLibraryMoveSelect-${f.id}">
+                        <option value="" ${f.category_id === null ? "selected" : ""}>None</option>
+                        ${categoryOptions}
+                    </select>
+                    <button type="button" onclick="moveLibraryFile(${f.id})">ย้าย</button>
+                    <button type="button" onclick="renameLibraryFilePrompt(${f.id})">✏️ เปลี่ยนชื่อ</button>
+                    <button type="button" class="danger-btn" onclick="deleteLibraryFileConfirm(${f.id})">🗑️ ลบ</button>
+                </div>
+            `;
+            container.appendChild(row);
+        });
+    } catch (error) {
+        container.innerHTML = "<p style='color:red;'>โหลดไฟล์ไม่สำเร็จ: " + escapeHtml(String(error)) + "</p>";
+    }
+}
+
+function exportLibraryFile(fileId) {
+    window.location.href = `/admin/api/file-library/files/${fileId}/export`;
+}
+
+async function moveLibraryFile(fileId) {
+    const select = document.getElementById(`fileLibraryMoveSelect-${fileId}`);
+    const value = select.value;
+    const categoryId = value === "" ? null : parseInt(value, 10);
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+
+    try {
+        const res = await fetch(`/admin/api/file-library/files/${fileId}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename: file.filename, category_id: categoryId }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        loadFileLibraryCategories();
+        loadFileLibraryFiles();
+    } catch (error) {
+        alert("ย้ายโฟลเดอร์ไม่สำเร็จ: " + error);
+    }
+}
+
+function renameLibraryFilePrompt(fileId) {
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+    const newName = prompt("ชื่อไฟล์ใหม่:", file.filename);
+    if (newName === null) return;
+    const trimmed = newName.trim();
+    if (!trimmed) {
+        alert("ชื่อไฟล์ห้ามว่างเปล่า");
+        return;
+    }
+    renameLibraryFile(fileId, trimmed);
+}
+
+async function renameLibraryFile(fileId, newFilename) {
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+    try {
+        const res = await fetch(`/admin/api/file-library/files/${fileId}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ filename: newFilename, category_id: file.category_id }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        loadFileLibraryFiles();
+    } catch (error) {
+        alert("เปลี่ยนชื่อไม่สำเร็จ: " + error);
+    }
+}
+
+function deleteLibraryFileConfirm(fileId) {
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+    if (!confirm(`ลบไฟล์ "${file.filename}" ถาวร? กู้คืนไม่ได้`)) return;
+    deleteLibraryFile(fileId);
+}
+
+async function deleteLibraryFile(fileId) {
+    try {
+        const res = await fetch(`/admin/api/file-library/files/${fileId}`, { method: "DELETE" });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        loadFileLibraryCategories();
+        loadFileLibraryFiles();
+    } catch (error) {
+        alert("ลบไม่สำเร็จ: " + error);
+    }
+}
+
+async function importLibraryFiles() {
+    const input = document.getElementById("fileLibraryImportInput");
+    const statusEl = document.getElementById("fileLibraryImportStatus");
+
+    if (!input.files || input.files.length === 0) {
+        statusEl.textContent = "เลือกไฟล์อย่างน้อยหนึ่งไฟล์ก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+    if (fileLibrarySelectedCategoryId === undefined) {
+        statusEl.textContent = "เลือกโฟลเดอร์ปลายทางทางซ้ายก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+
+    const formData = new FormData();
+    for (const file of input.files) {
+        formData.append("files", file);
+    }
+    if (fileLibrarySelectedCategoryId !== null) {
+        formData.append("category_id", fileLibrarySelectedCategoryId);
+    }
+
+    statusEl.textContent = "กำลังนำเข้า...";
+    statusEl.style.color = "#666";
+
+    try {
+        const res = await fetch("/admin/api/file-library/files/import", {
+            method: "POST",
+            body: formData,
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        input.value = "";
+        const okCount = data.results.filter(r => r.ok).length;
+        const failCount = data.results.length - okCount;
+        const failedNames = data.results.filter(r => !r.ok).map(r => `${r.filename}: ${r.error}`).join(", ");
+        statusEl.textContent = failCount === 0
+            ? `✅ นำเข้าสำเร็จ ${okCount} ไฟล์`
+            : `นำเข้าสำเร็จ ${okCount} ไฟล์, ผิดพลาด ${failCount} ไฟล์ (${failedNames})`;
+        statusEl.style.color = failCount === 0 ? "green" : "red";
+
+        loadFileLibraryCategories();
+        loadFileLibraryFiles();
+    } catch (error) {
+        statusEl.textContent = "❌ นำเข้าไม่สำเร็จ: " + error;
         statusEl.style.color = "red";
     }
 }

@@ -68,6 +68,20 @@ from db import (
     get_editable_document_by_chat,
     list_active_editable_documents_by_chat,
     update_editable_document_label_map,
+    StorageNotConfiguredError,
+    is_storage_configured,
+    storage_get,
+    create_file_category,
+    rename_file_category,
+    delete_file_category,
+    get_file_categories_with_counts,
+    get_uncategorized_file_count,
+    add_library_file,
+    get_library_files,
+    get_library_file,
+    move_library_file_category,
+    rename_library_file,
+    delete_library_file,
 )
 
 import os
@@ -1075,6 +1089,16 @@ class TagRangeAdd(BaseModel):
 
 class SnapshotCreate(BaseModel):
     label: Optional[str] = ""
+
+class FileCategoryCreate(BaseModel):
+    name: str
+
+class FileCategoryRename(BaseModel):
+    name: str
+
+class LibraryFileUpdate(BaseModel):
+    filename: str
+    category_id: Optional[int] = None
 
 class AgentJobStart(BaseModel):
     action_type: str  # "suggest_tags" | "merge_chunks"
@@ -3090,6 +3114,208 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={download_filename}"},
+    )
+
+
+# ---------- File Library (คลังไฟล์ Excel ของแอดมิน — แยกจาก Excel Editor/EditableDocument โดยสิ้นเชิง
+# ไฟล์ต้นฉบับในคลังนี้ห้ามถูกแก้เด็ดขาด — AI (ดู tool ใน phase 2) เปิดได้แค่สำเนาผ่าน EditableDocument เท่านั้น
+# ทุก endpoint ใต้นี้ใช้ require_login (แอดมิน) เหมือนแท็บอื่นๆ ในหน้า admin ไม่ใช่ require_user) ----------
+FILE_LIBRARY_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB ต่อไฟล์
+
+
+def _summarize_library_file_labels(label_map: dict) -> Optional[str]:
+    """สรุป label_map เป็นข้อความสั้น 1-2 ประโยค (ไม่เกิน 200 ตัวอักษร) ด้วย Claude Haiku
+    คืน None ถ้าเรียก Claude ไม่สำเร็จ (import ไฟล์ยังสำเร็จตามปกติ แค่ไม่มี summary — ตามที่กำหนดไว้)"""
+    try:
+        prompt = (
+            f"label และค่าทั้งหมดในไฟล์ Excel นี้ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
+            "สรุปว่าไฟล์นี้เกี่ยวกับอะไรเป็นภาษาไทย สั้นๆ 1-2 ประโยค ไม่เกิน 200 ตัวอักษร "
+            "ตอบแค่ข้อความสรุปเท่านั้น ห้ามมีคำนำ ห้ามใช้ Markdown"
+        )
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        summary = response.content[0].text.strip()
+        return summary[:200] if summary else None
+    except Exception:
+        return None
+
+
+# ---------- File Library: หมวดหมู่ (โฟลเดอร์) ----------
+@app.get("/admin/api/file-library/categories")
+def list_file_categories(_: bool = Depends(require_login)):
+    """คืนหมวดทั้งหมดพร้อมจำนวนไฟล์ รวมแถว 'None' (id=null) ต่อท้ายเสมอ — 'None' ไม่ใช่แถวจริงในตาราง
+    (ไฟล์ที่ category_id เป็น NULL) เลยต้องคำนวณแยกแล้วประกอบเข้าด้วยกันที่นี่"""
+    categories = get_file_categories_with_counts()
+    categories.append({"id": None, "name": "None", "file_count": get_uncategorized_file_count()})
+    return {"categories": categories}
+
+
+@app.post("/admin/api/file-library/categories")
+def create_file_category_endpoint(body: FileCategoryCreate, _: bool = Depends(require_login)):
+    result = create_file_category(body.name)
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="สร้างหมวดไม่สำเร็จ (ชื่อว่างเปล่า, ซ้ำกับหมวดที่มีอยู่แล้ว, หรือเป็นคำสงวน 'None')",
+        )
+    return result
+
+
+@app.put("/admin/api/file-library/categories/{category_id}")
+def rename_file_category_endpoint(category_id: int, body: FileCategoryRename, _: bool = Depends(require_login)):
+    ok = rename_file_category(category_id, body.name)
+    if not ok:
+        raise HTTPException(
+            status_code=400,
+            detail="เปลี่ยนชื่อไม่สำเร็จ (ไม่พบหมวดนี้, ชื่อว่างเปล่า, ซ้ำกับหมวดอื่น, หรือเป็นคำสงวน 'None')",
+        )
+    return {"status": "renamed"}
+
+
+@app.delete("/admin/api/file-library/categories/{category_id}")
+def delete_file_category_endpoint(category_id: int, _: bool = Depends(require_login)):
+    """ลบหมวด — ไฟล์ข้างในย้ายไป 'None' ให้อัตโนมัติที่ระดับ DB (ON DELETE SET NULL) ไม่ได้ลบไฟล์ทิ้งไปด้วย"""
+    ok = delete_file_category(category_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="ไม่พบหมวดนี้")
+    return {"status": "deleted"}
+
+
+# ---------- File Library: ไฟล์ ----------
+@app.post("/admin/api/file-library/files/import")
+async def import_library_files(
+    files: list[UploadFile] = File(...),
+    category_id: Optional[int] = Form(None),
+    _: bool = Depends(require_login),
+):
+    """รับหลายไฟล์พร้อมกัน (.xlsx/.xls เท่านั้น สูงสุด 5 MB/ไฟล์) — ไฟล์ที่ parse ไม่ได้แจ้งเป็นรายไฟล์
+    ไม่ทำให้ไฟล์อื่นในชุดเดียวกันล้มไปด้วย เช็ค storage ให้ครบก่อนเริ่ม (fail-fast) แทนที่จะปล่อยให้ทุกไฟล์
+    ล้มด้วยเหตุผลเดียวกันซ้ำๆ ทีละไฟล์"""
+    if not is_storage_configured():
+        raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า storage")
+
+    if category_id is not None:
+        valid_ids = {c["id"] for c in get_file_categories_with_counts()}
+        if category_id not in valid_ids:
+            raise HTTPException(status_code=400, detail="ไม่พบหมวดนี้")
+
+    results = []
+    for file in files:
+        filename = file.filename or "upload.xlsx"
+        try:
+            if not filename.lower().endswith((".xlsx", ".xls")):
+                results.append({"filename": filename, "ok": False, "error": "รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น"})
+                continue
+
+            raw = await file.read()
+            if len(raw) > FILE_LIBRARY_MAX_FILE_SIZE_BYTES:
+                results.append({"filename": filename, "ok": False, "error": "ไฟล์ใหญ่เกิน 5 MB"})
+                continue
+
+            if filename.lower().endswith(".xls"):
+                try:
+                    raw = _convert_xls_to_xlsx_bytes(raw)
+                except Exception:
+                    results.append({"filename": filename, "ok": False, "error": "แปลงไฟล์ .xls ไม่สำเร็จ — ตรวจสอบว่าเป็นไฟล์ .xls ที่ถูกต้อง"})
+                    continue
+                filename = filename[: -len(".xls")] + ".xlsx"
+
+            try:
+                label_map = _extract_excel_labels(raw)
+            except Exception:
+                results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ที่ถูกต้อง"})
+                continue
+
+            if not label_map:
+                results.append({"filename": filename, "ok": False, "error": "ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้"})
+                continue
+
+            summary = _summarize_library_file_labels(label_map)
+            file_id = add_library_file(
+                filename=filename, category_id=category_id, raw_bytes=raw, label_map=label_map, summary=summary,
+            )
+            results.append({"filename": filename, "ok": True, "file_id": file_id, "summary": summary})
+
+        except Exception as e:
+            print(f"[FileLibrary] import failed for filename={filename!r}: {e}")
+            results.append({"filename": filename, "ok": False, "error": "เกิดข้อผิดพลาดไม่ทราบสาเหตุระหว่างนำเข้าไฟล์นี้"})
+
+    return {"results": results}
+
+
+@app.get("/admin/api/file-library/files")
+def list_library_files_endpoint(category_id: Optional[str] = None, _: bool = Depends(require_login)):
+    """category_id ไม่ส่งมา = ทุกไฟล์ทุกหมวด, category_id="none" (ไม่สนตัวพิมพ์เล็กใหญ่) = เฉพาะไฟล์ไม่มีหมวด,
+    category_id=<เลข> = เฉพาะหมวดนั้น — ใช้ query param เป็น string เพราะ "none" ไม่ใช่ int"""
+    if category_id is None:
+        files = get_library_files()
+    elif category_id.strip().lower() == "none":
+        files = get_library_files(only_uncategorized=True)
+    else:
+        try:
+            parsed_id = int(category_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="category_id ต้องเป็นตัวเลขหรือ 'none'")
+        files = get_library_files(category_id=parsed_id)
+
+    # ไม่ส่ง label_map กลับไปหน้าเว็บ (ไม่จำเป็นต่อการแสดงรายการ ตัดออกลด payload)
+    return {"files": [{k: v for k, v in f.items() if k not in ("label_map", "storage_key")} for f in files]}
+
+
+@app.put("/admin/api/file-library/files/{file_id}")
+def update_library_file_endpoint(file_id: int, body: LibraryFileUpdate, _: bool = Depends(require_login)):
+    """ย้ายหมวด/เปลี่ยนชื่อพร้อมกันในคำขอเดียว — frontend ส่งค่าปัจจุบันของอีกฟิลด์มาด้วยเสมอถ้าไม่ได้ตั้งใจแก้"""
+    filename = body.filename.strip()
+    if not filename:
+        raise HTTPException(status_code=400, detail="ชื่อไฟล์ห้ามว่างเปล่า")
+
+    existing = get_library_file(file_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
+
+    if body.category_id is not None:
+        valid_ids = {c["id"] for c in get_file_categories_with_counts()}
+        if body.category_id not in valid_ids:
+            raise HTTPException(status_code=400, detail="ไม่พบหมวดนี้")
+
+    if not rename_library_file(file_id, filename):
+        raise HTTPException(status_code=400, detail="เปลี่ยนชื่อไม่สำเร็จ")
+    if not move_library_file_category(file_id, body.category_id):
+        raise HTTPException(status_code=400, detail="ย้ายหมวดไม่สำเร็จ")
+
+    return {"status": "updated"}
+
+
+@app.delete("/admin/api/file-library/files/{file_id}")
+def delete_library_file_endpoint(file_id: int, _: bool = Depends(require_login)):
+    ok = delete_library_file(file_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
+    return {"status": "deleted"}
+
+
+@app.get("/admin/api/file-library/files/{file_id}/export")
+def export_library_file(file_id: int, _: bool = Depends(require_login)):
+    """ดาวน์โหลดไฟล์ต้นฉบับตรงๆ ไม่มีการแก้ไขใดๆ ทั้งสิ้น (ต่างจาก Excel Editor download ที่คำนวณค่าจาก
+    label_map ปัจจุบันก่อนส่ง — ไฟล์ในคลังนี้ไม่เคยถูกแก้เลยตั้งแต่ import จึงส่ง bytes ดิบจาก storage ตรงๆ ได้)"""
+    file_row = get_library_file(file_id)
+    if file_row is None:
+        raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
+
+    try:
+        raw = storage_get(file_row["storage_key"])
+    except StorageNotConfiguredError:
+        raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า storage")
+    except Exception:
+        raise HTTPException(status_code=500, detail="ดึงไฟล์จาก storage ไม่สำเร็จ")
+
+    return StreamingResponse(
+        io.BytesIO(raw),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={file_row['filename']}"},
     )
 
 
