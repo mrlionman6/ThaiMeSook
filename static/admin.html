@@ -9,34 +9,34 @@
 </head>
 <body class="page-admin-BG">
     <div class="box-admin-padding">  
-        <h1>🔧 Admin: จัดการระบบ
+        <h1> Admin: จัดการระบบ
             <a href="/admin/logout" style="font-size:14px; float:right;">🚪 Logout</a>
         </h1>
     
         <div class="tab-bar">
             <button id="tabBtnPending" class="tab-btn tab-btn-active" onclick="switchTab('pending')">
-                📋 รอตรวจสอบ
+                 รอตรวจสอบ
             </button>
             <button id="tabBtnKb" class="tab-btn" onclick="switchTab('kb')">
-                📚 Knowledge Base
+                 Knowledge Base
             </button>
             <button id="tabBtnUserRequests" class="tab-btn" onclick="switchTab('userRequests')">
-                🙋 คำขอสมัครสมาชิก
+                 คำขอสมัครสมาชิก
             </button>
             <button id="tabBtnUsers" class="tab-btn" onclick="switchTab('users')">
-                👥 จัดการบัญชี
+                 จัดการบัญชี
             </button>
             <button id="tabBtnTags" class="tab-btn" onclick="switchTab('tags')">
-                🏷️ จัดการ Tag
+                 จัดการ Tag
             </button>
             <button id="tabBtnAgent" class="tab-btn" onclick="switchTab('agent')">
-                🤖 AI Agent KB Management
+                 AI Agent KB Management
             </button>
             <button id="tabBtnDealScreening" class="tab-btn" onclick="switchTab('dealScreening')">
-                🔍 Deal Screening
+                 Deal Screening
             </button>
             <button id="tabBtnFeasibility" class="tab-btn" onclick="switchTab('feasibility')">
-                🧾 Feasibility Summarizer
+                 Feasibility Summarizer
             </button>
         </div>
     
@@ -58,7 +58,7 @@
                     </div>
                 </details>
                 <details class="kb-toolbar-section">
-                    <summary>📁 Import จากไฟล์ (หลาย chunk พร้อมกัน)</summary>
+                    <summary> Import จากไฟล์ (หลาย chunk พร้อมกัน)</summary>
                     <div class="kb-toolbar-body">
                         <p class="ts-note">รองรับ .json (list ของข้อความ หรือ dict {"content":"...","tags":["ภาษี"]} ถ้าอยากใส่ tag มาด้วย) หรือ .txt (หนึ่งบรรทัดต่อหนึ่ง chunk ไม่มี tag)</p>
                         <input type="file" id="bulkFileInput" accept=".json,.txt">
@@ -93,7 +93,7 @@
     
             <!-- ส่วนที่ 1: รายการ tag ทั้งหมด แก้ชื่อ/ลบทั้งหมดได้ -->
             <details class="kb-toolbar-section" open>
-                <summary>🏷️ Tag ทั้งหมดในระบบ</summary>
+                <summary> Tag ทั้งหมดในระบบ</summary>
                 <div class="kb-toolbar-body">
                     <div id="tagManagerList">กำลังโหลด...</div>
                 </div>
@@ -146,7 +146,7 @@
     
             <!-- ขั้นตอนที่ 1: Scope filter ละเอียด -->
             <details class="kb-toolbar-section">
-                <summary>🎯 ขั้นตอนที่ 1: กำหนดขอบเขต (Scope)</summary>
+                <summary> ขั้นตอนที่ 1: กำหนดขอบเขต (Scope)</summary>
                 <div class="kb-toolbar-body">
                     <p class="ts-note">เลือกขอบเขตที่ Agent จะทำงานด้วย — เลือก "ทั้งหมด" จะปิดตัวเลือกอื่นอัตโนมัติ (กันเลือกขัดแย้งกัน)</p>
     
@@ -174,13 +174,13 @@
                         เฉพาะที่ยังไม่มี tag เลย
                     </label>
     
-                    <p class="scope-preview">📊 ตรงกับ <strong id="scopePreviewCount">-</strong> รายการ</p>
+                    <p class="scope-preview"> ตรงกับ <strong id="scopePreviewCount">-</strong> รายการ</p>
                 </div>
             </details>
     
             <!-- ขั้นตอนที่ 2: AI Agent -->
             <details class="kb-toolbar-section">
-                <summary>🤖 ขั้นตอนที่ 2: AI Agent</summary>
+                <summary> ขั้นตอนที่ 2: AI Agent</summary>
                 <div class="kb-toolbar-body">
                     <p class="ts-note">Agent จะทำงานภายในขอบเขต (Scope) ที่ตั้งไว้ในขั้นตอนที่ 1 ด้านบน</p>
     
@@ -221,7 +221,7 @@
     
             <!-- ขั้นตอนที่ 3: Review Queue -->
             <details class="kb-toolbar-section" open>
-                <summary>📋 ขั้นตอนที่ 3: รายการรอตรวจสอบจาก Agent (Review Queue)</summary>
+                <summary> ขั้นตอนที่ 3: รายการรอตรวจสอบจาก Agent (Review Queue)</summary>
                 <div class="kb-toolbar-body">
                     <div id="agentProposalList">กำลังโหลด...</div>
                 </div>
@@ -229,7 +229,7 @@
     
             <!-- ประวัติการทำงาน (ไม่ใช่ขั้นตอนที่ต้องทำ แค่ log ไว้ดูย้อนหลัง) -->
             <details class="kb-toolbar-section">
-                <summary>📜 ประวัติการทำงานของ Agent</summary>
+                <summary> ประวัติการทำงานของ Agent</summary>
                 <div class="kb-toolbar-body">
                     <div id="agentJobList">กำลังโหลด...</div>
                 </div>
@@ -253,7 +253,7 @@
                     </div>
                 </details>
                 <details class="kb-toolbar-section">
-                    <summary>📜 ประวัติการอัปโหลด (5 วันล่าสุด)</summary>
+                    <summary> ประวัติการอัปโหลด (5 วันล่าสุด)</summary>
                     <div class="kb-toolbar-body">
                         <div id="dealScreeningHistoryList">กำลังโหลด...</div>
                     </div>
