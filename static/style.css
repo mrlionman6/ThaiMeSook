@@ -468,6 +468,8 @@ button {
     margin-left: 230px;
     padding: 24px 16px;
     box-sizing: border-box;
+    border: 3px solid #64C18B;
+   
 }
 
 /* แผ่นเนื้อหาพื้นขาว กว้างสูงสุด ~1000px จัดกึ่งกลางพื้นที่ที่เหลือ (นอก sidebar) ด้วย margin auto
