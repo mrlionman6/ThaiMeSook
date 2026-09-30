@@ -449,8 +449,8 @@ function showConfirmDialog(message, onConfirm, options = {}) {
     openModal(`
         <p class="confirm-dialog-message">${escapeHtml(message)}</p>
         <div class="modal-buttons">
-            <button type="button" id="confirmDialogCancelBtn">${escapeHtml(cancelText)}</button>
-            <button type="button" id="confirmDialogOkBtn" class="danger-btn">${escapeHtml(confirmText)}</button>
+            <button type="button" class="base_btn_2" id="confirmDialogCancelBtn">${escapeHtml(cancelText)}</button>
+            <button type="button" class="base_btn_2" id="confirmDialogOkBtn" class="danger-btn">${escapeHtml(confirmText)}</button>
         </div>
     `);
 
