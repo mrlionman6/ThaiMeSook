@@ -1613,3 +1613,105 @@ button {
     font-size: 14px;
     line-height: 1.7;
 }
+
+/* ---------- Admin: คลังไฟล์ (File Library) — สองคอลัมน์ โฟลเดอร์ซ้าย/ไฟล์ขวา ---------- */
+.file-library-layout {
+    display: flex;
+    gap: 20px;
+    align-items: flex-start;
+}
+
+.file-library-folders {
+    flex: 0 0 260px;
+    min-width: 0;
+}
+
+.file-library-files {
+    flex: 1;
+    min-width: 0;
+}
+
+.file-library-folders-header,
+.file-library-files-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.file-library-add-category-form {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.file-library-add-category-form input {
+    flex: 1;
+    margin-top: 0;
+}
+
+.file-library-category-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 4px;
+}
+
+.file-library-category-row:hover {
+    background: var(--color-cream);
+}
+
+.file-library-category-row-active {
+    background: var(--color-sky-pale);
+    color: var(--color-sky-pale-text);
+    font-weight: bold;
+}
+
+.file-library-category-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.file-library-category-count {
+    font-size: 12px;
+    opacity: 0.75;
+}
+
+.file-library-category-btn {
+    padding: 2px 6px;
+    font-size: 13px;
+}
+
+.file-library-import-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+}
+
+.file-library-file-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 8px;
+}
+
+@media (max-width: 768px) {
+    .file-library-layout {
+        flex-direction: column;
+    }
+
+    .file-library-folders {
+        flex: 1 1 auto;
+        width: 100%;
+    }
+}

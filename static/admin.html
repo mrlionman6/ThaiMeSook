@@ -37,6 +37,9 @@
                 <button id="tabBtnFeasibility" class="tab-btn" onclick="switchTab('feasibility')">
                      Feasibility Summarizer
                 </button>
+                <button id="tabBtnFileLibrary" class="tab-btn" onclick="switchTab('fileLibrary')">
+                     คลังไฟล์
+                </button>
             </div>
 
             <a href="/admin/logout" class="admin-sidebar-logout">🚪 Logout</a>
@@ -293,6 +296,35 @@
             </div>
 
             <div id="feasibilitySummaryBox" class="feasibility-summary-box" hidden></div>
+        </div>
+
+        <div id="tabFileLibrary" class="tab-panel" style="display:none;">
+            <div class="file-library-layout">
+                <div class="file-library-folders">
+                    <div class="file-library-folders-header">
+                        <strong>โฟลเดอร์</strong>
+                        <button type="button" onclick="showAddFileCategoryForm()">➕ เพิ่มโฟลเดอร์</button>
+                    </div>
+                    <div id="fileLibraryAddCategoryForm" class="file-library-add-category-form" hidden>
+                        <input type="text" id="newFileCategoryName" class="kb-tag-input" placeholder="ชื่อโฟลเดอร์ใหม่">
+                        <button type="button" onclick="createFileCategory()">สร้าง</button>
+                        <button type="button" onclick="hideAddFileCategoryForm()">ยกเลิก</button>
+                    </div>
+                    <div id="fileLibraryCategoryList">กำลังโหลด...</div>
+                </div>
+
+                <div class="file-library-files">
+                    <div class="file-library-files-header">
+                        <strong id="fileLibraryCurrentCategoryLabel"></strong>
+                    </div>
+                    <div id="fileLibraryImportRow" class="file-library-import-row" hidden>
+                        <input type="file" id="fileLibraryImportInput" accept=".xlsx,.xls" multiple>
+                        <button type="button" onclick="importLibraryFiles()">📤 นำเข้าไฟล์เข้าโฟลเดอร์นี้</button>
+                        <span id="fileLibraryImportStatus" class="kb-toolbar-status"></span>
+                    </div>
+                    <div id="fileLibraryFileList">เลือกโฟลเดอร์ทางซ้ายเพื่อดูไฟล์</div>
+                </div>
+            </div>
         </div>
         </div>
         </main>

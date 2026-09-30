@@ -28,6 +28,7 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
 """
 
 import os
+import uuid
 import datetime
 from typing import Optional
 
@@ -193,6 +194,34 @@ class EditableDocument(Base):
     label_map = Column(JSON, nullable=False)  # {label: {sheet, row, col, current_value, number_format}}
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
     expires_at = Column(DateTime(timezone=True), nullable=False)  # เขียนตอน insert = created_at + EDITABLE_DOCUMENT_EXPIRY_DAYS
+
+
+class FileCategory(Base):
+    """หมวดหมู่ (โฟลเดอร์) ของคลังไฟล์ Excel ที่แอดมินจัดการ — "None" ไม่ใช่แถวในตารางนี้
+    (แทนด้วย library_files.category_id = NULL) ชื่อ "none" (ไม่สนตัวพิมพ์เล็กใหญ่) ถูกสงวนไว้
+    ห้ามสร้างเป็นชื่อหมวดจริง เพื่อไม่ให้ปนกับความหมาย "ไม่มีหมวด" ที่ใช้ NULL อยู่แล้ว"""
+    __tablename__ = "file_categories"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False, unique=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
+class LibraryFile(Base):
+    """ไฟล์ต้นฉบับในคลัง Excel ของแอดมิน — ไม่เคยถูกแก้ไขเลย (AI เปิดได้แค่สำเนาผ่าน EditableDocument
+    เท่านั้น ดู open_library_file ใน main.py) ไฟล์จริงเก็บใน Railway Storage Bucket ผ่าน storage_key
+    ไม่ใช่ column ในตารางนี้โดยตรง (ดู storage_put/storage_get/storage_delete ด้านล่าง) — ย้าย/เปลี่ยนชื่อไฟล์
+    แก้แค่แถวนี้ใน DB เท่านั้น ไม่แตะ object ใน storage เลย เพราะ key ไม่มีชื่อไฟล์/โฟลเดอร์ปนอยู่"""
+    __tablename__ = "library_files"
+
+    id = Column(Integer, primary_key=True)
+    filename = Column(String, nullable=False)
+    category_id = Column(Integer, ForeignKey("file_categories.id", ondelete="SET NULL"), nullable=True, index=True)
+    storage_key = Column(String, nullable=False, unique=True)  # รูปแบบ "library/<uuid4>.xlsx" — สร้างเองใน add_library_file()
+    label_map = Column(JSON, nullable=False)  # {label: {sheet, row, col, current_value, number_format}} จาก _extract_excel_labels
+    summary = Column(Text, nullable=True)  # สรุป 1-2 ประโยคจาก Claude ตอน import — None ถ้าเรียก Claude ไม่สำเร็จ
+    uploaded_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
 class ChatSession(Base):
@@ -1136,6 +1165,263 @@ def update_editable_document_label_map(document_id: int, label_map: dict) -> boo
         row.label_map = label_map
         session.commit()
         return True
+
+
+# ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------
+# ไฟล์จริงเก็บใน Railway Storage Bucket (S3-compatible) ผ่าน boto3 ไม่ใช่ LargeBinary ใน DB
+# เหมือน EditableDocument — ตารางนี้เก็บแค่ storage_key ที่ชี้ไปยัง object เท่านั้น
+
+class StorageNotConfiguredError(Exception):
+    """env vars ของ storage ไม่ครบ — endpoint ฝั่ง main.py จับ exception นี้แล้วตอบ 503 ให้ผู้ใช้ทราบ
+    ว่ายังไม่ได้ตั้งค่า storage แทนที่จะ error แบบไม่ทราบสาเหตุ"""
+    pass
+
+
+_STORAGE_ENV_VARS = [
+    "AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_S3_BUCKET_NAME", "AWS_DEFAULT_REGION",
+]
+
+_storage_client = None  # สร้างครั้งแรกที่เรียกใช้ (lazy) — กันแอป start ไม่ได้ถ้ายังไม่ตั้งค่า env พวกนี้
+_storage_bucket_name = None
+
+
+def is_storage_configured() -> bool:
+    """เช็คว่า env vars ของ storage ครบไหม โดยไม่ต้องสร้าง client จริง/ต่อ network เลย (เบา เรียกได้บ่อย)
+    ใช้ตรวจแบบ fail-fast ก่อนเริ่ม import ไฟล์หลายไฟล์พร้อมกัน แทนที่จะปล่อยให้ทุกไฟล์ล้มด้วยเหตุผลเดียวกันซ้ำๆ"""
+    return all(os.environ.get(key) for key in _STORAGE_ENV_VARS)
+
+
+def _get_storage_client():
+    """สร้าง boto3 client ตัวเดียวใช้ซ้ำตลอดอายุ process (lazy — ไม่สร้างตอน import module)
+    โยน StorageNotConfiguredError ถ้า env ไม่ครบ แทนที่จะปล่อยให้ boto3 โยน error ที่อ่านไม่รู้เรื่อง"""
+    global _storage_client, _storage_bucket_name
+    if _storage_client is not None:
+        return _storage_client, _storage_bucket_name
+
+    if not is_storage_configured():
+        raise StorageNotConfiguredError("Storage environment variables are not fully configured")
+
+    import boto3  # import ในนี้ (ไม่ใช่หัวไฟล์) กันแอป import db.py ไม่ได้ถ้า boto3 ยังไม่ได้ติดตั้ง/ตั้งค่า
+
+    _storage_client = boto3.client(
+        "s3",
+        endpoint_url=os.environ["AWS_ENDPOINT_URL"],
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        region_name=os.environ["AWS_DEFAULT_REGION"],
+    )
+    _storage_bucket_name = os.environ["AWS_S3_BUCKET_NAME"]
+    return _storage_client, _storage_bucket_name
+
+
+def storage_put(key: str, data: bytes) -> None:
+    client, bucket = _get_storage_client()
+    client.put_object(Bucket=bucket, Key=key, Body=data)
+
+
+def storage_get(key: str) -> bytes:
+    client, bucket = _get_storage_client()
+    response = client.get_object(Bucket=bucket, Key=key)
+    return response["Body"].read()
+
+
+def storage_delete(key: str) -> None:
+    client, bucket = _get_storage_client()
+    client.delete_object(Bucket=bucket, Key=key)
+
+
+FILE_LIBRARY_RESERVED_CATEGORY_NAME = "none"  # สงวนไว้แทนความหมาย "ไม่มีหมวด" (NULL) ห้ามตั้งเป็นชื่อหมวดจริง
+
+
+def create_file_category(name: str) -> Optional[dict]:
+    """สร้างหมวดใหม่ คืน {id, name, file_count: 0} คืน None ถ้าชื่อว่าง/ซ้ำ/เป็นคำสงวน 'none'
+    (ไม่สนตัวพิมพ์เล็กใหญ่) — endpoint ฝั่ง main.py แปลง None เป็น HTTPException ที่มีข้อความชัดเจนกว่า"""
+    name = name.strip()
+    if not name or name.lower() == FILE_LIBRARY_RESERVED_CATEGORY_NAME:
+        return None
+    with SessionLocal() as session:
+        existing = session.query(FileCategory).filter(FileCategory.name == name).first()
+        if existing is not None:
+            return None
+        row = FileCategory(name=name)
+        session.add(row)
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            return None
+        session.refresh(row)
+        return {"id": row.id, "name": row.name, "file_count": 0}
+
+
+def rename_file_category(category_id: int, new_name: str) -> bool:
+    new_name = new_name.strip()
+    if not new_name or new_name.lower() == FILE_LIBRARY_RESERVED_CATEGORY_NAME:
+        return False
+    with SessionLocal() as session:
+        row = session.get(FileCategory, category_id)
+        if row is None:
+            return False
+        conflict = (
+            session.query(FileCategory)
+            .filter(FileCategory.name == new_name, FileCategory.id != category_id)
+            .first()
+        )
+        if conflict is not None:
+            return False
+        row.name = new_name
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            return False
+        return True
+
+
+def delete_file_category(category_id: int) -> bool:
+    """ลบหมวด — ไฟล์ข้างในย้ายไป 'None' (category_id = NULL) เองโดยอัตโนมัติผ่าน ON DELETE SET NULL
+    ที่ระดับ DB อยู่แล้ว ไม่ต้อง UPDATE แถวไฟล์เองที่นี่เลย"""
+    with SessionLocal() as session:
+        row = session.get(FileCategory, category_id)
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
+        return True
+
+
+def get_file_categories_with_counts() -> list[dict]:
+    """คืนหมวดทั้งหมด (ไม่รวมแถว 'None' เพราะไม่ใช่แถวจริงในตารางนี้ —ดู get_uncategorized_file_count()
+    แยกต่างหาก) พร้อมจำนวนไฟล์ในแต่ละหมวด เรียงตามชื่อ"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(FileCategory, func.count(LibraryFile.id))
+            .outerjoin(LibraryFile, LibraryFile.category_id == FileCategory.id)
+            .group_by(FileCategory.id)
+            .order_by(FileCategory.name)
+            .all()
+        )
+        return [{"id": cat.id, "name": cat.name, "file_count": count} for cat, count in rows]
+
+
+def get_uncategorized_file_count() -> int:
+    with SessionLocal() as session:
+        return session.query(LibraryFile).filter(LibraryFile.category_id.is_(None)).count()
+
+
+def _library_file_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "filename": row.filename,
+        "category_id": row.category_id,
+        "storage_key": row.storage_key,
+        "label_map": row.label_map,
+        "summary": row.summary,
+        "uploaded_at": row.uploaded_at,
+        "updated_at": row.updated_at,
+    }
+
+
+def add_library_file(
+    filename: str, category_id: Optional[int], raw_bytes: bytes, label_map: dict, summary: Optional[str]
+) -> int:
+    """ลำดับตายตัว: สร้าง storage_key ใหม่ (caller ไม่ต้องรู้ format) -> storage_put ก่อน -> insert แถว DB
+    ถ้า insert ล้มเหลว (เช่น category_id ไม่มีอยู่จริง) จะลองลบ object ที่เพิ่ง put ทิ้งกันไฟล์กำพร้า
+    ค้างอยู่ใน storage แล้ว re-raise exception เดิมให้ caller (endpoint) ตัดสินใจตอบอะไรกลับ"""
+    storage_key = f"library/{uuid.uuid4()}.xlsx"
+    storage_put(storage_key, raw_bytes)
+
+    now = datetime.datetime.utcnow()
+    try:
+        with SessionLocal() as session:
+            row = LibraryFile(
+                filename=filename,
+                category_id=category_id,
+                storage_key=storage_key,
+                label_map=label_map,
+                summary=summary,
+                uploaded_at=now,
+                updated_at=now,
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            return row.id
+    except Exception:
+        try:
+            storage_delete(storage_key)
+        except Exception as cleanup_error:
+            print(f"[FileLibrary] warning: cleanup after failed insert also failed for key={storage_key!r}: {cleanup_error}")
+        raise
+
+
+def get_library_files(category_id: Optional[int] = None, only_uncategorized: bool = False) -> list[dict]:
+    """category_id=None และ only_uncategorized=False = ทุกไฟล์ทุกหมวด (ใช้โดย list_library_files tool)
+    only_uncategorized=True = เฉพาะไฟล์ที่ไม่มีหมวด (ไม่สนค่า category_id ที่ส่งมาด้วยกัน)"""
+    with SessionLocal() as session:
+        q = session.query(LibraryFile)
+        if only_uncategorized:
+            q = q.filter(LibraryFile.category_id.is_(None))
+        elif category_id is not None:
+            q = q.filter(LibraryFile.category_id == category_id)
+        rows = q.order_by(LibraryFile.filename).all()
+        return [_library_file_to_dict(r) for r in rows]
+
+
+def get_library_file(file_id: int) -> Optional[dict]:
+    with SessionLocal() as session:
+        row = session.get(LibraryFile, file_id)
+        return _library_file_to_dict(row) if row is not None else None
+
+
+def move_library_file_category(file_id: int, category_id: Optional[int]) -> bool:
+    with SessionLocal() as session:
+        row = session.get(LibraryFile, file_id)
+        if row is None:
+            return False
+        row.category_id = category_id
+        row.updated_at = datetime.datetime.utcnow()
+        try:
+            session.commit()
+        except Exception:
+            session.rollback()
+            return False
+        return True
+
+
+def rename_library_file(file_id: int, new_filename: str) -> bool:
+    new_filename = new_filename.strip()
+    if not new_filename:
+        return False
+    with SessionLocal() as session:
+        row = session.get(LibraryFile, file_id)
+        if row is None:
+            return False
+        row.filename = new_filename
+        row.updated_at = datetime.datetime.utcnow()
+        session.commit()
+        return True
+
+
+def delete_library_file(file_id: int) -> bool:
+    """ลำดับตายตัว: ลบแถว DB ก่อน -> storage_delete ทีหลัง ถ้าไม่พบไฟล์นี้อยู่แล้วคืน False
+    ถ้า storage_delete ไม่สำเร็จ (เช่น network พัง) log เป็น ASCII แล้วถือว่าลบสำเร็จอยู่ดี — แถว DB หายไปแล้ว
+    เป็นหลักฐานหลักว่า "ลบสำเร็จ" จากมุมผู้ใช้ object กำพร้าที่อาจเหลือค้างใน storage ไม่กระทบผู้ใช้เลย"""
+    with SessionLocal() as session:
+        row = session.get(LibraryFile, file_id)
+        if row is None:
+            return False
+        storage_key = row.storage_key
+        session.delete(row)
+        session.commit()
+
+    try:
+        storage_delete(storage_key)
+    except Exception as e:
+        print(f"[FileLibrary] warning: storage_delete failed for key={storage_key!r}: {e}")
+
+    return True
 
 
 # ---------- Chat sessions & messages ----------
