@@ -42,8 +42,20 @@ body.page-admin-BG {
 }
 
 .box-admin-padding {
-    background-color: white;
-    /* ไม่ต้องมี flex/min-height ตรงนี้แล้ว — คืนให้เหมือนเดิม */
+    /* พื้นขาวย้ายไปอยู่ที่ .admin-content-sheet แทน (กล่องนี้เต็มจอแล้ว ทาสีทับทั้งจอไม่ได้อีกต่อไป) */
+}
+
+/* กฎ body ทั่วไปด้านล่าง (max-width/width/margin auto/padding) บีบทุกหน้ารวมทั้ง admin ให้เป็น
+   คอลัมน์แคบกึ่งกลางจอ — override ให้เต็มจอเฉพาะหน้า admin ไม่แตะกฎ body เดิมเลย
+   ระวัง: .page-admin-BG ใช้ร่วมกันทั้ง admin.html และ login.html (login.html มี class
+   "page-admin-BG login-page-layout" คู่กัน) จึงต้อง :not(.login-page-layout) กันไม่ให้ไปกระทบ
+   การจัดกึ่งกลางการ์ด login เดิม — เหลือแค่ admin.html ที่มี .page-admin-BG อย่างเดียวจริงๆ
+   specificity ของ body.page-admin-BG:not(...) สูงกว่า body เฉยๆ อยู่แล้ว ไม่ต้องใช้ !important */
+body.page-admin-BG:not(.login-page-layout) {
+    max-width: none;
+    width: 100%;
+    margin: 0;
+    padding: 0;
 }
 
 /* ใช้เฉพาะหน้า login เท่านั้น แยกจาก dashboard */
@@ -379,9 +391,10 @@ button {
 }
 
 .admin-sidebar {
-    position: sticky;
+    position: fixed;
+    left: 0;
     top: 0;
-    align-self: flex-start;
+    z-index: 100;
     flex: 0 0 230px;
     width: 230px;
     height: 100vh;
@@ -452,6 +465,17 @@ button {
 .admin-main {
     flex: 1;
     min-width: 0;
+    margin-left: 230px;
+    padding: 24px 16px;
+    box-sizing: border-box;
+}
+
+/* แผ่นเนื้อหาพื้นขาว กว้างสูงสุด ~1000px จัดกึ่งกลางพื้นที่ที่เหลือ (นอก sidebar) ด้วย margin auto
+   ส่วนที่เหลือรอบๆ (.admin-main) โปร่งใส เห็นภาพพื้นหลังเดิมของ body.page-admin-BG */
+.admin-content-sheet {
+    max-width: 1000px;
+    margin: 0 auto;
+    background: #fff;
     padding: 24px 32px;
     box-sizing: border-box;
 }
@@ -470,8 +494,10 @@ button {
     }
 
     .admin-sidebar {
-        position: relative;
+        position: static;
         top: auto;
+        left: auto;
+        z-index: auto;
         width: 100%;
         height: auto;
         flex-direction: row;
@@ -520,6 +546,7 @@ button {
     }
 
     .admin-main {
+        margin-left: 0;
         padding: 16px;
     }
 }
