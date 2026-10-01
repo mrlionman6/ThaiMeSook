@@ -92,6 +92,7 @@ import base64
 import time
 import string
 import random
+import urllib.parse
 import bcrypt
 import pandas as pd
 import openpyxl
@@ -215,6 +216,22 @@ def normalize_answer(answer: str) -> str:
     """ทำให้คำตอบ security question เทียบกันได้ไม่ติดเรื่องตัวพิมพ์เล็ก-ใหญ่/ช่องว่างหัวท้าย
     เรียกก่อน hash เสมอ ทั้งตอนสมัครและตอนเช็คตอนลืมรหัสผ่าน"""
     return answer.strip().lower()
+
+def _content_disposition_attachment(filename: str) -> str:
+    """สร้างค่า header Content-Disposition ตาม RFC 6266/5987 — ใส่ทั้ง filename (ASCII fallback
+    สำหรับ client เก่าที่ไม่รองรับ filename*) และ filename* (UTF-8 percent-encoded ตัวจริง ที่เบราว์เซอร์
+    สมัยใหม่แทบทั้งหมดใช้แสดงชื่อไฟล์จริง) — header value ต้อง encode เป็น latin-1 ได้เสมอ (ข้อจำกัดของ
+    HTTP header ดิบๆ) การเขียนชื่อไฟล์ภาษาไทย/อักขระนอก ASCII ลง header ตรงๆ โดยไม่ผ่านฟังก์ชันนี้
+    จะทำให้ encode เป็น latin-1 ไม่ได้และ request พังทั้งอัน ใช้ฟังก์ชันนี้ทุกจุดที่ใส่ชื่อไฟล์ลง header เสมอ
+    ascii_fallback: แทนอักขระนอก ASCII ด้วย "_" แล้วตัด '"' กับ '\\' ออก (อันตรายต่อ quoted-string ใน header)
+    ถ้าเหลือแต่ "_" ล้วนๆ หรือว่างเปล่า ใช้ "download" ต่อด้วยนามสกุลเดิมของไฟล์แทน"""
+    ascii_fallback = re.sub(r"[^\x20-\x7e]", "_", filename)
+    ascii_fallback = ascii_fallback.replace('"', "").replace("\\", "")
+    if not ascii_fallback or ascii_fallback.strip("_") == "":
+        _, ext = os.path.splitext(filename)
+        ascii_fallback = f"download{ext}"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
 
 # ---------- Knowledge Base ----------
 # ไม่โหลดจากไฟล์ JSON ตอน import แล้ว — ข้อมูลจะถูกโหลดจาก DB ตอน startup event (ด้านล่าง)
@@ -2015,7 +2032,7 @@ def export_kb(tag_ids: str = "", _: bool = Depends(require_login)):
     return StreamingResponse(
         io.BytesIO(json_bytes),
         media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=knowledge_base_export.json"},
+        headers={"Content-Disposition": _content_disposition_attachment("knowledge_base_export.json")},
     )
 
 @app.post("/admin/api/kb")
@@ -2332,7 +2349,7 @@ def export_deal_screening_endpoint(batch_id: int, _: bool = Depends(require_logi
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=deal_screening_{batch_id}.xlsx"},
+        headers={"Content-Disposition": _content_disposition_attachment(f"deal_screening_{batch_id}.xlsx")},
     )
 
 
@@ -3249,7 +3266,7 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={download_filename}"},
+        headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
     )
 
 
@@ -3451,7 +3468,7 @@ def export_library_file(file_id: int, _: bool = Depends(require_login)):
     return StreamingResponse(
         io.BytesIO(raw),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={file_row['filename']}"},
+        headers={"Content-Disposition": _content_disposition_attachment(file_row["filename"])},
     )
 
 
