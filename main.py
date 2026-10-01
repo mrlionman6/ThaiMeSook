@@ -92,6 +92,7 @@ import base64
 import time
 import string
 import random
+import urllib.parse
 import bcrypt
 import pandas as pd
 import openpyxl
@@ -215,6 +216,22 @@ def normalize_answer(answer: str) -> str:
     """ทำให้คำตอบ security question เทียบกันได้ไม่ติดเรื่องตัวพิมพ์เล็ก-ใหญ่/ช่องว่างหัวท้าย
     เรียกก่อน hash เสมอ ทั้งตอนสมัครและตอนเช็คตอนลืมรหัสผ่าน"""
     return answer.strip().lower()
+
+def _content_disposition_attachment(filename: str) -> str:
+    """สร้างค่า header Content-Disposition ตาม RFC 6266/5987 — ใส่ทั้ง filename (ASCII fallback
+    สำหรับ client เก่าที่ไม่รองรับ filename*) และ filename* (UTF-8 percent-encoded ตัวจริง ที่เบราว์เซอร์
+    สมัยใหม่แทบทั้งหมดใช้แสดงชื่อไฟล์จริง) — header value ต้อง encode เป็น latin-1 ได้เสมอ (ข้อจำกัดของ
+    HTTP header ดิบๆ) การเขียนชื่อไฟล์ภาษาไทย/อักขระนอก ASCII ลง header ตรงๆ โดยไม่ผ่านฟังก์ชันนี้
+    จะทำให้ encode เป็น latin-1 ไม่ได้และ request พังทั้งอัน ใช้ฟังก์ชันนี้ทุกจุดที่ใส่ชื่อไฟล์ลง header เสมอ
+    ascii_fallback: แทนอักขระนอก ASCII ด้วย "_" แล้วตัด '"' กับ '\\' ออก (อันตรายต่อ quoted-string ใน header)
+    ถ้าเหลือแต่ "_" ล้วนๆ หรือว่างเปล่า ใช้ "download" ต่อด้วยนามสกุลเดิมของไฟล์แทน"""
+    ascii_fallback = re.sub(r"[^\x20-\x7e]", "_", filename)
+    ascii_fallback = ascii_fallback.replace('"', "").replace("\\", "")
+    if not ascii_fallback or ascii_fallback.strip("_") == "":
+        _, ext = os.path.splitext(filename)
+        ascii_fallback = f"download{ext}"
+    encoded = urllib.parse.quote(filename, safe="")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{encoded}'
 
 # ---------- Knowledge Base ----------
 # ไม่โหลดจากไฟล์ JSON ตอน import แล้ว — ข้อมูลจะถูกโหลดจาก DB ตอน startup event (ด้านล่าง)
@@ -449,6 +466,108 @@ AVAILABLE_TOOLS = [
     },
 ]
 
+# แยกจาก AVAILABLE_TOOLS โดยตั้งใจ — สอง tool นี้เข้าถึงข้อมูลส่วนตัวของ user (สร้าง EditableDocument
+# ผูกกับ user_id/chat_id) จึงต้องส่งให้ Claude เห็นเฉพาะตอนมี user_id ที่ล็อกอินอยู่จริงเท่านั้น
+# (เช็คใน run_agentic_tool_loop() ตอนประกอบ tools list ที่จะส่งจริง ไม่ใช่แค่ปฏิเสธตอน dispatch)
+LIBRARY_TOOLS = [
+    {
+        "name": "list_library_files",
+        "description": (
+            "ค้นหาไฟล์ในคลังเอกสาร Excel ที่แอดมินเตรียมไว้ให้ผู้ใช้ ต้องเรียกเครื่องมือนี้ก่อนเสมอเมื่อผู้ใช้ขอเปิด "
+            "อ่าน เปรียบเทียบ หรือแก้ไฟล์ในคลัง ห้ามเดาชื่อไฟล์หรือ file_id เองเด็ดขาด "
+            "เรียกโดยไม่ต้องระบุ parameter ใดเลยได้ถ้าผู้ใช้แค่อยากดูว่ามีไฟล์อะไรบ้างทั้งหมด"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "category_name": {
+                    "type": "string",
+                    "description": "ชื่อหมวด/โฟลเดอร์ที่จะกรอง (ไม่บังคับ) ไม่สนตัวพิมพ์เล็กใหญ่ จับบางส่วนของชื่อได้",
+                },
+                "name_query": {
+                    "type": "string",
+                    "description": "คำค้นหาบางส่วนของชื่อไฟล์ (ไม่บังคับ) ไม่สนตัวพิมพ์เล็กใหญ่ จับบางส่วนของชื่อได้",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "open_library_file",
+        "description": (
+            "เปิดไฟล์จากคลังเอกสารเข้ามาในแชทนี้เป็นสำเนาที่แก้ไข/เปรียบเทียบได้ ไม่แตะไฟล์ต้นฉบับในคลังเลย "
+            "ต้องเรียก list_library_files ก่อนเสมอเพื่อยืนยัน file_id ที่ถูกต้อง ห้ามเดา file_id เอง "
+            "หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_id": {
+                    "type": "integer",
+                    "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของ list_library_files เท่านั้น)",
+                },
+            },
+            "required": ["file_id"],
+        },
+    },
+]
+
+
+def execute_list_library_files(tool_input: dict) -> dict:
+    """ค้นหาไฟล์ในคลัง — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ library_files เลย
+    จับคู่ category_name/name_query แบบ case-insensitive และเป็นส่วนหนึ่งของชื่อได้ (ไม่ต้องตรงเป๊ะ)"""
+    category_name = (tool_input.get("category_name") or "").strip().lower()
+    name_query = (tool_input.get("name_query") or "").strip().lower()
+
+    files = get_library_files()
+    categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
+
+    results = []
+    for f in files:
+        cat_name = categories.get(f["category_id"], "None")
+        if category_name and category_name not in cat_name.lower():
+            continue
+        if name_query and name_query not in f["filename"].lower():
+            continue
+        results.append({
+            "file_id": f["id"],
+            "filename": f["filename"],
+            "category": cat_name,
+            "summary": f["summary"],
+        })
+
+    return {"files": results}
+
+
+def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """คัดลอกไฟล์จากคลังมาสร้างเป็น EditableDocument ใหม่ผูกกับแชท/user ปัจจุบัน — ไม่เขียนอะไรกลับไปที่
+    library_files เลยไม่ว่าทางไหน (ต้นฉบับในคลังไม่ถูกแก้เด็ดขาด) caller (run_agentic_tool_loop) รับประกัน
+    แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง"""
+    file_row = get_library_file(tool_input.get("file_id"))
+    if file_row is None:
+        return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
+
+    try:
+        raw = storage_get(file_row["storage_key"])
+    except StorageNotConfiguredError:
+        return {"error": "ยังไม่ได้ตั้งค่า storage ของคลังไฟล์ ติดต่อแอดมิน"}
+    except Exception:
+        return {"error": "ดึงไฟล์จากคลังไม่สำเร็จ ลองใหม่อีกครั้ง"}
+
+    document_id = create_editable_document(
+        user_id=user_id,
+        filename=file_row["filename"],
+        original_bytes=raw,
+        label_map=file_row["label_map"],
+        chat_id=chat_id,
+    )
+    return {
+        "opened": True,
+        "filename": file_row["filename"],
+        "document_id": document_id,
+        "message": f"เปิดไฟล์ '{file_row['filename']}' จากคลังเป็นสำเนาในแชทนี้แล้ว (ต้นฉบับในคลังไม่ถูกแก้)",
+    }
+
 
 def _calculate_progressive_tax(amount: float, brackets: list) -> dict:
     """สูตรคำนวณภาษีขั้นบันไดทั่วไป — ใช้ร่วมกันทั้งบุคคลธรรมดาและนิติบุคคล SME
@@ -626,20 +745,28 @@ def execute_estimate_investment_cost(tool_input: dict) -> dict:
     return result
 
 
-def run_agentic_tool_loop(system_prompt: str, initial_messages: list) -> str:
+def run_agentic_tool_loop(
+    system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None
+) -> str:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
-    - calculate_tax: เป็น custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
+    - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
+    - list_library_files/open_library_file: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่)
+      เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request เลยถ้าไม่ล็อกอิน
+      open_library_file ต้องมี chat_id ด้วย (สร้าง EditableDocument ผูกกับแชทจริง) — caller (rag_answer)
+      ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id ไม่ใช่ None (ดูการแก้ไขใน ask_question())
     วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ MAX_TOOL_ITERATIONS (กันวนไม่รู้จบ)"""
     messages = [dict(m) for m in initial_messages]  # copy กันแก้ list เดิมโดยไม่ตั้งใจ
     response = None
+
+    tools_for_this_call = AVAILABLE_TOOLS + LIBRARY_TOOLS if user_id else AVAILABLE_TOOLS
 
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=2500,  # เดิม 1500 — เพิ่มเพราะคำตอบสาย investment advisor มักมี breakdown + อ้างอิงกฎหมายยาวขึ้น
             system=system_prompt,
-            tools=AVAILABLE_TOOLS,
+            tools=tools_for_this_call,
             messages=messages,
         )
 
@@ -660,6 +787,20 @@ def run_agentic_tool_loop(system_prompt: str, initial_messages: list) -> str:
                 })
             elif block.type == "tool_use" and block.name == "estimate_investment_cost":
                 result = execute_estimate_investment_cost(block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "list_library_files" and user_id:
+                result = execute_list_library_files(block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "open_library_file" and user_id and chat_id:
+                result = execute_open_library_file(block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -958,6 +1099,11 @@ def _prepare_rag_context(query, history, image_data):
         "ให้เรียกเครื่องมือ estimate_investment_cost เสมอ ห้ามประมาณตัวเลขเองในหัวเด็ดขาด\n"
         "- ถ้าคำถามเกี่ยวกับตัวเลข/อัตรา/เกณฑ์ที่อาจเปลี่ยนแปลงบ่อย (เช่น ค่าธรรมเนียมราชการ, เกณฑ์ BOI ล่าสุด, อัตราภาษีปีปัจจุบัน) "
         "และไม่แน่ใจว่าข้อมูลที่มีเป็นข้อมูลล่าสุดหรือไม่ ให้ใช้เครื่องมือค้นเว็บ (web_search) เพื่อยืนยันจากเว็บราชการก่อนตอบ"
+        "\n- ถ้าผู้ใช้ขอไฟล์ในคลัง ให้เรียก list_library_files ก่อนเสมอ ห้ามเดาชื่อหรือ file_id\n"
+        "- ถ้าตรงหลายไฟล์ หรือไม่ตรงเลย หรือไม่แน่ใจว่าต้องการอ่าน เปรียบเทียบ หรือแก้ "
+        "ให้ถามผู้ใช้ก่อน โดยแสดงรายชื่อไฟล์ที่เป็นไปได้\n"
+        "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
+        "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้"
     )
 
     current_turn_text = (
@@ -1003,9 +1149,10 @@ def _log_if_low_confidence(query, answer, top_chunks, scores):
         log_low_confidence_query(log_query_text, answer, top_chunks, max(scores) if scores else 0)
 
 
-def rag_answer(query, history=None, image_data=None):
+def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None):
     """เวอร์ชันไม่ stream — รอคำตอบเต็มก่อนคืนค่าทีเดียว มี LanguageGuard retry + agentic tool use
-    (calculate_tax, web_search) ผ่าน run_agentic_tool_loop()"""
+    (calculate_tax, web_search, และ list_library_files/open_library_file ถ้ามี user_id) ผ่าน
+    run_agentic_tool_loop() — user_id/chat_id เป็น optional (None สำหรับ guest ที่ไม่ได้ล็อกอิน)"""
     history = history or []
     ctx = _prepare_rag_context(query, history, image_data)
 
@@ -1014,7 +1161,7 @@ def rag_answer(query, history=None, image_data=None):
 
     raw_answer = ""
     for attempt in range(1, MAX_ANSWER_RETRIES + 2):  # ลองครั้งแรก + retry อีก MAX_ANSWER_RETRIES ครั้ง
-        raw_answer = run_agentic_tool_loop(ctx["system_prompt"], ctx["messages"])
+        raw_answer = run_agentic_tool_loop(ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id)
 
         if not contains_unexpected_script(raw_answer):
             break  # ปกติดี ไม่ต้องลองใหม่
@@ -1303,18 +1450,21 @@ async def ask_question(
 
     query, image_data, history = await _parse_and_validate_ask_input(query, chat_id, image, user_id)
 
-    answer, sources = rag_answer(query, history=history, image_data=image_data)
+    # ย้ายมาไว้ "ก่อน" เรียก rag_answer() แทนที่เดิมที่สร้างแชท "หลัง" ได้คำตอบแล้ว — จำเป็นเพราะ tool
+    # open_library_file (ดู run_agentic_tool_loop/execute_open_library_file) ต้องมี chat_id จริงตอนสร้าง
+    # EditableDocument ผูกกับแชท แม้เป็นข้อความแรกสุดของแชทใหม่ก็ตาม ย้ายได้อย่างปลอดภัยเพราะ title ที่ใช้
+    # ตั้งชื่อแชทคำนวณจาก query/image_data ล้วนๆ (ผ่าน _build_saved_query) ไม่ได้ต้องรอคำตอบมาก่อนอยู่แล้ว
+    saved_query = _build_saved_query(query, image_data)
+    if user_id and chat_id is None:
+        title = saved_query.strip()[:50] or "แชทใหม่"
+        chat_id = create_chat_session(user_id, title=title)
+
+    answer, sources = rag_answer(query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id)
     if image_data:
         # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง — Vision อ่านภาพคลาดเคลื่อนได้มากกว่าอ่านไฟล์จริง
         answer += IMAGE_ANSWER_DISCLAIMER
 
     if user_id:
-        saved_query = _build_saved_query(query, image_data)
-        if chat_id is None:
-            # ยังไม่มีแชทอยู่ (ผู้ใช้เพิ่งเริ่มถามคำถามแรก) — สร้างแชทใหม่ ตั้งชื่อจากคำถามแรก
-            title = saved_query.strip()[:50] or "แชทใหม่"
-            chat_id = create_chat_session(user_id, title=title)
-
         add_chat_message(chat_id, "user", saved_query)
         add_chat_message(chat_id, "assistant", answer)
         touch_chat_session(chat_id)
@@ -1882,7 +2032,7 @@ def export_kb(tag_ids: str = "", _: bool = Depends(require_login)):
     return StreamingResponse(
         io.BytesIO(json_bytes),
         media_type="application/json",
-        headers={"Content-Disposition": "attachment; filename=knowledge_base_export.json"},
+        headers={"Content-Disposition": _content_disposition_attachment("knowledge_base_export.json")},
     )
 
 @app.post("/admin/api/kb")
@@ -2199,7 +2349,7 @@ def export_deal_screening_endpoint(batch_id: int, _: bool = Depends(require_logi
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=deal_screening_{batch_id}.xlsx"},
+        headers={"Content-Disposition": _content_disposition_attachment(f"deal_screening_{batch_id}.xlsx")},
     )
 
 
@@ -2794,8 +2944,9 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
     '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "unrelated"}\n\n'
     "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
-    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่น\n"
-    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับการแก้ไฟล์นี้เลย"
+    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่นที่ 'แนบเข้ามาในแชทแล้ว' เท่านั้น (ไม่ใช่ไฟล์จากคลังเอกสารที่ยังไม่ได้เปิด)\n"
+    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับการแก้ไฟล์นี้เลย รวมถึงกรณีที่ผู้ใช้ขอเปิด/อ่าน/"
+    "เปรียบเทียบ/ค้นหาไฟล์อื่นที่ไม่ใช่ไฟล์นี้ (เช่น ไฟล์จากคลังเอกสารของระบบ) ให้ถือว่า unrelated เสมอ ไม่ใช่ compare"
 )
 
 
@@ -2826,13 +2977,15 @@ EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     '"document_id": <เลข document_id ของไฟล์ที่จะแก้ ถ้า action เป็น edit ไม่งั้นใส่ null>, '
     '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
     "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน และสามารถระบุได้ว่าเป็นไฟล์ไหนไฟล์เดียว "
-    "(จาก label ที่ตรงกับแค่ไฟล์เดียว หรือเอ่ยชื่อไฟล์ตรงๆ) — ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
+    "(จาก label ที่ตรงกับแค่ไฟล์เดียว หรือเอ่ยชื่อไฟล์ที่อยู่ในรายการด้านบนตรงๆ) — ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
     "ถ้า label ที่พูดถึงมีอยู่ในมากกว่า 1 ไฟล์พร้อมกันและไม่ได้เอ่ยชื่อไฟล์ ห้ามเดาว่าเป็นไฟล์ไหนเด็ดขาด ให้ตอบ clarify แทน\n"
-    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
-    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์กัน\n"
-    "- clarify: คำสั่งคลุมเครือ ตีความไม่ออกว่าต้องการแก้ไฟล์ไหนหรือต้องการทำอะไรกันแน่ "
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (เฉพาะไฟล์ในรายการนี้)\n"
+    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์ที่อยู่ใน 'รายการด้านบน' กันเอง เท่านั้น\n"
+    "- clarify: คำสั่งเกี่ยวข้องกับไฟล์ใน 'รายการด้านบน' แน่ๆ แต่คลุมเครือ ตีความไม่ออกว่าต้องการแก้ไฟล์ไหนหรือต้องการทำอะไรกันแน่ "
     "ให้ตั้งคำถามกลับสั้นๆ ใน message เพื่อขอความชัดเจนจากผู้ใช้\n"
-    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับไฟล์ทั้งหมดนี้เลย"
+    "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับไฟล์ทั้งหมดในรายการด้านบนเลย รวมถึงกรณีที่ผู้ใช้ขอเปิด/อ่าน/"
+    "เปรียบเทียบ/ค้นหาไฟล์อื่นที่ 'ไม่อยู่ในรายการด้านบน' (เช่น ไฟล์จากคลังเอกสารของระบบ, ไฟล์ที่เอ่ยชื่อมาแต่ไม่ตรงกับไฟล์ไหนในรายการเลย) "
+    "— กรณีนี้ให้ตอบ unrelated เสมอ ห้ามตอบ clarify หรือเดาว่าหมายถึงไฟล์ใดไฟล์หนึ่งในรายการ"
 )
 
 
@@ -3113,7 +3266,7 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={download_filename}"},
+        headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
     )
 
 
@@ -3315,7 +3468,7 @@ def export_library_file(file_id: int, _: bool = Depends(require_login)):
     return StreamingResponse(
         io.BytesIO(raw),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={file_row['filename']}"},
+        headers={"Content-Disposition": _content_disposition_attachment(file_row["filename"])},
     )
 
 
