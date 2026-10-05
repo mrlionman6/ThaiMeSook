@@ -1179,6 +1179,20 @@ class StorageNotConfiguredError(Exception):
     pass
 
 
+class LibraryStorageError(Exception):
+    """add_library_file() ล้มเหลวตอน storage_put (เช่น network พัง, bucket ไม่มีสิทธิ์เขียน) — แยกจาก
+    LibraryDatabaseError ด้านล่าง เพื่อให้ caller (main.py) บอกผู้ใช้ได้ว่าล้มตอน 'เก็บไฟล์' ไม่ใช่
+    'บันทึกข้อมูล' เก็บ exception เดิมไว้ด้วย __cause__ (ดู 'raise ... from e') ไม่ได้ปิดบังสาเหตุจริง"""
+    pass
+
+
+class LibraryDatabaseError(Exception):
+    """add_library_file() ล้มเหลวตอน insert แถว library_files (เช่น label_map มีค่าที่ JSON เก็บไม่ได้,
+    category_id ไม่มีอยู่จริง) — แยกจาก LibraryStorageError ด้านบน เพื่อให้ caller (main.py) บอกผู้ใช้ได้ว่า
+    ล้มตอน 'บันทึกข้อมูล' ไม่ใช่ 'เก็บไฟล์' เก็บ exception เดิมไว้ด้วย __cause__ ไม่ได้ปิดบังสาเหตุจริง"""
+    pass
+
+
 _STORAGE_ENV_VARS = [
     "AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "AWS_S3_BUCKET_NAME", "AWS_DEFAULT_REGION",
@@ -1348,7 +1362,12 @@ def add_library_file(
     โดยไม่ต้องโหลด bytes จาก storage มาเช็คซ้ำ"""
     extension = ".xlsm" if _is_macro_workbook(raw_bytes) else ".xlsx"
     storage_key = f"library/{uuid.uuid4()}{extension}"
-    storage_put(storage_key, raw_bytes)
+    try:
+        storage_put(storage_key, raw_bytes)
+    except StorageNotConfiguredError:
+        raise
+    except Exception as e:
+        raise LibraryStorageError(str(e)) from e
 
     now = datetime.datetime.utcnow()
     try:
@@ -1366,12 +1385,12 @@ def add_library_file(
             session.commit()
             session.refresh(row)
             return row.id
-    except Exception:
+    except Exception as e:
         try:
             storage_delete(storage_key)
         except Exception as cleanup_error:
             print(f"[FileLibrary] warning: cleanup after failed insert also failed for key={storage_key!r}: {cleanup_error}")
-        raise
+        raise LibraryDatabaseError(str(e)) from e
 
 
 def get_library_files(category_id: Optional[int] = None, only_uncategorized: bool = False) -> list[dict]:
