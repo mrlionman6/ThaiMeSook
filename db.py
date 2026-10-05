@@ -28,7 +28,9 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
 """
 
 import os
+import io
 import uuid
+import zipfile
 import datetime
 from typing import Optional
 
@@ -1323,13 +1325,29 @@ def _library_file_to_dict(row) -> dict:
     }
 
 
+def _is_macro_workbook(raw_bytes: bytes) -> bool:
+    """เช็คว่าไฟล์ Excel (.xlsx/.xlsm) มีมาโคร VBA ฝังอยู่ไหม โดยดูว่าใน zip ของไฟล์มี xl/vbaProject.bin
+    หรือไม่ — ตัดสินจากเนื้อไฟล์จริงเสมอ ไม่ใช่จากนามสกุล/ชื่อไฟล์ (นามสกุลเพี้ยนได้ แต่เนื้อไฟล์ไม่โกหก)
+    ใช้ทั้งฝั่ง db.py เอง (เลือกนามสกุลของ storage_key ตอน import) และฝั่ง main.py (ตัดสิน media type
+    ตอนส่งไฟล์ให้ดาวน์โหลด) คืน False เงียบๆ ถ้าไฟล์เสีย/ไม่ใช่ zip จริง ไม่ raise ออกไปรบกวน caller"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+            return "xl/vbaProject.bin" in zf.namelist()
+    except Exception:
+        return False
+
+
 def add_library_file(
     filename: str, category_id: Optional[int], raw_bytes: bytes, label_map: dict, summary: Optional[str]
 ) -> int:
     """ลำดับตายตัว: สร้าง storage_key ใหม่ (caller ไม่ต้องรู้ format) -> storage_put ก่อน -> insert แถว DB
     ถ้า insert ล้มเหลว (เช่น category_id ไม่มีอยู่จริง) จะลองลบ object ที่เพิ่ง put ทิ้งกันไฟล์กำพร้า
-    ค้างอยู่ใน storage แล้ว re-raise exception เดิมให้ caller (endpoint) ตัดสินใจตอบอะไรกลับ"""
-    storage_key = f"library/{uuid.uuid4()}.xlsx"
+    ค้างอยู่ใน storage แล้ว re-raise exception เดิมให้ caller (endpoint) ตัดสินใจตอบอะไรกลับ
+    นามสกุลของ storage_key เป็น .xlsm ถ้าไฟล์มีมาโคร ไม่งั้นเป็น .xlsx เสมอ — schema เดิมไม่มีคอลัมน์
+    has_macros แยก (ห้าม ALTER ตาราง) จึงใช้นามสกุลนี้เป็นตัวบอกแทนทุกจุดที่ต้องรู้ว่าไฟล์มีมาโครไหม
+    โดยไม่ต้องโหลด bytes จาก storage มาเช็คซ้ำ"""
+    extension = ".xlsm" if _is_macro_workbook(raw_bytes) else ".xlsx"
+    storage_key = f"library/{uuid.uuid4()}{extension}"
     storage_put(storage_key, raw_bytes)
 
     now = datetime.datetime.utcnow()
