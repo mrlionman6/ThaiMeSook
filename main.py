@@ -2733,12 +2733,12 @@ async def upload_user_document(
     user_id: int = Depends(require_user),
 ):
     filename = file.filename or ""
-    if not filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+    if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx, .xls และ .xlsm เท่านั้น")
 
     _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
-    raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ
+    raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ — อ่านอย่างเดียว ไม่ save กลับ
 
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
