@@ -83,6 +83,8 @@ from db import (
     rename_library_file,
     delete_library_file,
     _is_macro_workbook,
+    LibraryStorageError,
+    LibraryDatabaseError,
 )
 
 import os
@@ -93,11 +95,13 @@ import base64
 import time
 import string
 import random
+import datetime
 import urllib.parse
 import bcrypt
 import pandas as pd
 import openpyxl
 import xlrd
+from openpyxl.styles.numbers import is_date_format
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -2865,6 +2869,31 @@ def _convert_xls_to_xlsx_bytes(raw: bytes) -> bytes:
 EXCEL_LABEL_SECTION_HEADING_LOOKBACK = 10  # ระยะสูงสุด (แถว) ที่จะมองย้อนหาหัวข้อหมวดก่อนหน้า
 
 
+def _json_safe_cell_value(value):
+    """แปลงค่าเซลล์ที่ JSON column ของ DB เก็บตรงๆ ไม่ได้ (datetime.datetime/date/time — openpyxl คืนค่า
+    พวกนี้ตรงๆ สำหรับเซลล์ที่ format เป็นวันที่/เวลา) ให้เป็น ISO string ก่อน — ไม่งั้น session.commit()
+    จะพังด้วย TypeError: Object of type datetime is not JSON serializable ตอน insert ทั้ง library_files
+    และ editable_documents (ทั้งสองใช้ label_map จาก _extract_excel_labels() เหมือนกัน) ค่าอื่นๆ ผ่านตรงๆ
+    ไม่แตะ — reverse กันกับ _parse_iso_datetime_like() ที่แปลงกลับตอนเขียนค่าลงเซลล์จริงใน _coerce_value_for_cell()"""
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    return value
+
+
+def _parse_iso_datetime_like(text: str):
+    """พยายามแปลง string กลับเป็น datetime/date/time object ตามลำดับ (datetime ก่อน เพราะ isoformat()
+    ของ datetime กับ date ขึ้นต้นเหมือนกันแต่ datetime มี 'T' ต่อท้าย parse ด้วย date ก่อนจะเพี้ยน)
+    คืน None ถ้า parse ไม่ได้สักแบบ (ไม่ error — ให้ caller ปล่อยตกไปเขียนเป็น string ธรรมดาแทน เช่น
+    กรณีผู้ใช้แก้ค่าในช่องวันที่เป็นข้อความอื่นที่ไม่ใช่ ISO ผ่านการคุยกับ Claude) reverse ของ
+    _json_safe_cell_value() ด้านบน"""
+    for parser in (datetime.datetime.fromisoformat, datetime.date.fromisoformat, datetime.time.fromisoformat):
+        try:
+            return parser(text)
+        except ValueError:
+            continue
+    return None
+
+
 def _extract_excel_labels(raw: bytes) -> dict:
     """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ)
     ไล่ทุกแถวทุกชีต ถ้าแถวมีเซลล์ไม่ว่างพอดี 2 เซลล์ ให้เซลล์แรก=label เซลล์หลัง=value+พิกัด
@@ -2915,7 +2944,7 @@ def _extract_excel_labels(raw: bytes) -> dict:
                 "label": label_text,
                 "row": value_cell.row,
                 "col": value_cell.column,
-                "value": value_cell.value,
+                "value": _json_safe_cell_value(value_cell.value),
                 "format": value_cell.number_format,
                 "heading": heading_text,
             })
@@ -2960,9 +2989,18 @@ def _coerce_value_for_cell(current_value, number_format: Optional[str]):
     เด็ดขาด (บั๊กเดิม: หารด้วย 100 ซ้ำอีกรอบทำให้ label ที่ยังไม่ถูกแก้เพี้ยนขนาดไปเลย เช่น 0.0807 -> 0.000807)
     ถ้าเป็น string (แปลว่าผ่านการแก้จาก Claude มาแล้ว เป็นตัวเลขเปอร์เซ็นต์ธรรมดาตามที่ prompt สั่ง เช่น "10")
     และเซลล์เป็น %-format: ตัด '%' ออกแล้วหารด้วย 100 เสมอ (แปลงไม่ได้ = error ชัดเจน ไม่เขียนค่าผิดขนาดแบบเงียบๆ)
-    ถ้าไม่ใช่ %-format: ลองแปลง string เป็นตัวเลขถ้าทำได้ ไม่ได้ก็เขียนเป็น string ตามเดิม (ไม่ใช่ error เพราะบาง label เป็นข้อความ)"""
+    ถ้าไม่ใช่ %-format: ลองแปลง string เป็นตัวเลขถ้าทำได้ ไม่ได้ก็เขียนเป็น string ตามเดิม (ไม่ใช่ error เพราะบาง label เป็นข้อความ)
+    ถ้า number_format ของเซลล์เป็นวันที่/เวลา (เช็คด้วย openpyxl.styles.numbers.is_date_format) และ
+    current_value เป็น ISO string (มาจาก _json_safe_cell_value ตอน extract) ให้แปลงกลับเป็น
+    datetime/date/time object ก่อนเขียนลงเซลล์ กัน Excel เห็นเป็นข้อความดิบแทนวันที่จริง — parse ไม่ได้
+    (เช่นถูกแก้เป็นข้อความอื่นที่ไม่ใช่ ISO ผ่านการคุยกับ Claude) ปล่อยตกไปเป็น string ธรรมดาด้านล่าง ไม่ error"""
     if isinstance(current_value, (int, float)):
         return True, current_value, None
+
+    if isinstance(current_value, str) and number_format and is_date_format(number_format):
+        parsed_date = _parse_iso_datetime_like(current_value)
+        if parsed_date is not None:
+            return True, parsed_date, None
 
     is_percent = bool(number_format) and "%" in number_format
 
@@ -3425,29 +3463,41 @@ async def import_library_files(
             if filename.lower().endswith(".xls"):
                 try:
                     raw = _convert_xls_to_xlsx_bytes(raw)
-                except Exception:
-                    results.append({"filename": filename, "ok": False, "error": "แปลงไฟล์ .xls ไม่สำเร็จ — ตรวจสอบว่าเป็นไฟล์ .xls ที่ถูกต้อง"})
+                except Exception as e:
+                    print(f"[FileLibrary] read step (.xls convert) failed for filename={filename!r}: {type(e).__name__}")
+                    results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ไม่สำเร็จ: แปลงไฟล์ .xls ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ .xls ที่ถูกต้อง"})
                     continue
                 filename = filename[: -len(".xls")] + ".xlsx"
 
             try:
                 label_map = _extract_excel_labels(raw)
-            except Exception:
-                results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ที่ถูกต้อง"})
+            except Exception as e:
+                print(f"[FileLibrary] read step (extract labels) failed for filename={filename!r}: {type(e).__name__}")
+                results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ไม่สำเร็จ: อ่านไฟล์ Excel ไม่ได้ — ตรวจสอบว่าเป็นไฟล์ที่ถูกต้อง"})
                 continue
 
             if not label_map:
-                results.append({"filename": filename, "ok": False, "error": "ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้"})
+                results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ไม่สำเร็จ: ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้"})
                 continue
 
             summary = _summarize_library_file_labels(label_map)
-            file_id = add_library_file(
-                filename=filename, category_id=category_id, raw_bytes=raw, label_map=label_map, summary=summary,
-            )
+            try:
+                file_id = add_library_file(
+                    filename=filename, category_id=category_id, raw_bytes=raw, label_map=label_map, summary=summary,
+                )
+            except LibraryStorageError as e:
+                print(f"[FileLibrary] store step failed for filename={filename!r}: {type(e).__name__}: {e}")
+                results.append({"filename": filename, "ok": False, "error": "เก็บไฟล์ไม่สำเร็จ: บันทึกไฟล์ลง storage ไม่ได้ ลองใหม่อีกครั้ง"})
+                continue
+            except LibraryDatabaseError as e:
+                print(f"[FileLibrary] save step failed for filename={filename!r}: {type(e).__name__}: {e}")
+                results.append({"filename": filename, "ok": False, "error": "บันทึกข้อมูลไม่สำเร็จ: บันทึกข้อมูลไฟล์ลงฐานข้อมูลไม่ได้"})
+                continue
+
             results.append({"filename": filename, "ok": True, "file_id": file_id, "summary": summary})
 
         except Exception as e:
-            print(f"[FileLibrary] import failed for filename={filename!r}: {e}")
+            print(f"[FileLibrary] import failed for filename={filename!r}: {type(e).__name__}: {e}")
             results.append({"filename": filename, "ok": False, "error": "เกิดข้อผิดพลาดไม่ทราบสาเหตุระหว่างนำเข้าไฟล์นี้"})
 
     return {"results": results}
