@@ -26,7 +26,7 @@ function resetAttachmentKindCache() {
 async function getAttachmentKind(file) {
     if (IMAGE_MIME_TYPES.includes(file.type)) return "image";
     const name = file.name.toLowerCase();
-    if (!name.endsWith(".xlsx") && !name.endsWith(".xls")) {
+    if (!name.endsWith(".xlsx") && !name.endsWith(".xls") && !name.endsWith(".xlsm")) {
         return "unsupported"; // เช่น PDF ที่ accept ยอมให้เลือกได้แต่ backend ยังไม่รองรับจริง (phase ถัดไป)
     }
 
@@ -69,7 +69,7 @@ async function handleImageSelected() {
     if (imageInput.files[0] !== file) return;
 
     if (kind === "unsupported") {
-        showAlertDialog("ยังไม่รองรับไฟล์ประเภทนี้ (รองรับเฉพาะภาพ JPEG/PNG/WEBP/GIF และ Excel .xlsx/.xls)");
+        showAlertDialog("ยังไม่รองรับไฟล์ประเภทนี้ (รองรับเฉพาะภาพ JPEG/PNG/WEBP/GIF และ Excel .xlsx/.xls/.xlsm)");
         imageInput.value = "";
         return;
     }

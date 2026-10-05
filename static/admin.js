@@ -1552,8 +1552,10 @@ async function loadFileLibraryFiles() {
                 .map(c => `<option value="${c.id}" ${c.id === f.category_id ? "selected" : ""}>${escapeHtml(c.name)}</option>`)
                 .join("");
 
+            const macroBadge = f.has_macros ? '<span class="file-library-macro-badge">มีมาโคร</span>' : "";
+
             row.innerHTML = `
-                <p><strong>${escapeHtml(f.filename)}</strong></p>
+                <p><strong>${escapeHtml(f.filename)}</strong> ${macroBadge}</p>
                 <p class="ts-note">${f.summary ? escapeHtml(f.summary) : "(ไม่มี summary)"}</p>
                 <p class="ts-note">อัปโหลดเมื่อ ${escapeHtml(String(f.uploaded_at))}</p>
                 <div class="file-library-file-actions">

@@ -82,6 +82,7 @@ from db import (
     move_library_file_category,
     rename_library_file,
     delete_library_file,
+    _is_macro_workbook,
 )
 
 import os
@@ -534,6 +535,7 @@ def execute_list_library_files(tool_input: dict) -> dict:
             "filename": f["filename"],
             "category": cat_name,
             "summary": f["summary"],
+            "has_macros": _library_file_has_macros(f),
         })
 
     return {"files": results}
@@ -561,11 +563,15 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
         label_map=file_row["label_map"],
         chat_id=chat_id,
     )
+    # เช็คจาก bytes จริงที่เพิ่งดึงมาตรงๆ (มีอยู่แล้วในมือ แม่นยำกว่าเดาจากนามสกุล storage_key)
+    has_macros = _is_macro_workbook(raw)
+    macro_note = " ไฟล์นี้มีมาโคร (VBA) ฝังอยู่ — ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติ" if has_macros else ""
     return {
         "opened": True,
         "filename": file_row["filename"],
         "document_id": document_id,
-        "message": f"เปิดไฟล์ '{file_row['filename']}' จากคลังเป็นสำเนาในแชทนี้แล้ว (ต้นฉบับในคลังไม่ถูกแก้)",
+        "has_macros": has_macros,
+        "message": f"เปิดไฟล์ '{file_row['filename']}' จากคลังเป็นสำเนาในแชทนี้แล้ว (ต้นฉบับในคลังไม่ถูกแก้){macro_note}",
     }
 
 
@@ -1103,7 +1109,9 @@ def _prepare_rag_context(query, history, image_data):
         "- ถ้าตรงหลายไฟล์ หรือไม่ตรงเลย หรือไม่แน่ใจว่าต้องการอ่าน เปรียบเทียบ หรือแก้ "
         "ให้ถามผู้ใช้ก่อน โดยแสดงรายชื่อไฟล์ที่เป็นไปได้\n"
         "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
-        "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้"
+        "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
+        "- ถ้าไฟล์ (จากคลังหรือที่แนบมาเอง) มีมาโคร (has_macros เป็น true) ให้บอกผู้ใช้ว่าไฟล์นี้มีมาโคร "
+        "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์"
     )
 
     current_turn_text = (
@@ -2400,12 +2408,14 @@ def _save_attachment_result_to_chat(chat_id: int, user_message: str, assistant_m
 
 @app.post("/api/attachment-kind")
 async def detect_attachment_kind(file: UploadFile = File(...), _: int = Depends(require_user)):
-    """classify ไฟล์ .xlsx/.xls ที่แนบมาว่าตรง schema Deal Screening หรือไม่ ก่อนหน้าบ้านจะเลือกว่า
+    """classify ไฟล์ .xlsx/.xls/.xlsm ที่แนบมาว่าตรง schema Deal Screening หรือไม่ ก่อนหน้าบ้านจะเลือกว่า
     จะส่งไฟล์จริงไป endpoint ไหนต่อ (/api/deal-screening/upload หรือ /api/user-documents/upload)
-    อ่านแค่แถวหัวตาราง ไม่โหลดทั้งไฟล์ กันเปลืองงานถ้าไฟล์ใหญ่"""
+    อ่านแค่แถวหัวตาราง ไม่โหลดทั้งไฟล์ กันเปลืองงานถ้าไฟล์ใหญ่ — .xlsm อ่านด้วย openpyxl ได้ปกติทุกอย่าง
+    เหมือน .xlsx เป๊ะ (เป็น OOXML/zip แบบเดียวกัน มีแค่ vbaProject.bin เพิ่มมา) จึงปล่อยให้ตกไปอ่านแบบ
+    เดียวกับ .xlsx ด้านล่างได้เลย ไม่ต้องแยก branch พิเศษเหมือน .xls"""
     filename = (file.filename or "").lower()
-    if not filename.endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+    if not filename.endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx, .xls และ .xlsm เท่านั้น")
 
     raw = await file.read()
 
@@ -2723,12 +2733,12 @@ async def upload_user_document(
     user_id: int = Depends(require_user),
 ):
     filename = file.filename or ""
-    if not filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+    if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx, .xls และ .xlsm เท่านั้น")
 
     _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
-    raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ
+    raw_text = _extract_excel_text(raw)  # recycle ฟังก์ชันเดิมจาก Feasibility Summarizer ตรงๆ — อ่านอย่างเดียว ไม่ save กลับ
 
     if not raw_text.strip():
         raise HTTPException(status_code=400, detail="ไม่พบข้อความใดๆ ในไฟล์นี้")
@@ -2771,6 +2781,39 @@ EXCEL_EDITOR_SYSTEM_PROMPT = (
     '{"matched": true/false, "label": "...หรือ null ถ้า matched เป็น false", '
     '"new_value": "...หรือ null ถ้า matched เป็น false", "reason": "คำอธิบายสั้นๆ"}'
 )
+
+
+MACRO_ENABLED_MEDIA_TYPE = "application/vnd.ms-excel.sheet.macroEnabled.12"
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def _load_workbook_preserving_macros(raw_bytes: bytes, **kwargs):
+    """เรียก openpyxl.load_workbook() พร้อมส่ง keep_vba=True อัตโนมัติถ้าไฟล์มีมาโคร (เช็คจาก
+    _is_macro_workbook ตรงๆ จากเนื้อไฟล์ ไม่ใช่จากชื่อ/นามสกุล) กันมาโครหายตอน wb.save() ทีหลัง
+    ทุกจุดที่โหลดไฟล์มาแก้ค่าแล้วบันทึกกลับ (ต่างจากจุดที่โหลดมาแค่ 'อ่าน' เฉยๆ ไม่เคย save) ต้องเรียก
+    ผ่านฟังก์ชันนี้แทน openpyxl.load_workbook ตรงๆ เสมอ ไม่งั้นมาโครจะถูกตัดทิ้งเงียบๆ ตอน save"""
+    if _is_macro_workbook(raw_bytes):
+        kwargs["keep_vba"] = True
+    return openpyxl.load_workbook(io.BytesIO(raw_bytes), **kwargs)
+
+
+def _library_file_has_macros(file_row: dict) -> bool:
+    """เดาว่าไฟล์นี้มีมาโครไหมจากนามสกุลของ storage_key (".xlsm" ถ้ามี ไม่งั้น ".xlsx") — schema เดิม
+    ของ library_files ไม่มีคอลัมน์ has_macros แยก (ห้าม ALTER ตาราง) จึง derive จากนามสกุลที่ add_library_file()
+    ตั้งไว้ตั้งแต่ตอน import แทน ใช้ได้เฉพาะตอนแสดง "รายการ" เท่านั้น — จุดที่ต้องตัดสิน media type ตอน
+    ส่งไฟล์ให้ดาวน์โหลดจริง ต้องเช็คจากเนื้อไฟล์ตรงๆ ด้วย _is_macro_workbook เสมอ ไม่ใช่จากนามสกุลแบบนี้"""
+    return file_row["storage_key"].lower().endswith(".xlsm")
+
+
+def _ensure_correct_extension(filename: str, has_macros: bool) -> str:
+    """ถ้าชื่อไฟล์ไม่ได้ลงท้ายด้วยนามสกุลที่ตรงกับเนื้อไฟล์จริง (.xlsm ถ้ามีมาโคร, .xlsx ถ้าไม่มี)
+    ให้ตัดนามสกุลเดิม (ถ้ามี) ออกแล้วเติมนามสกุลที่ถูกต้องให้แทน — กันแอดมินเปลี่ยนชื่อไฟล์ในคลังแล้ว
+    เผลอทำนามสกุลไม่ตรงกับเนื้อไฟล์จริง (เช่น พิมพ์ชื่อใหม่ลงท้าย .xlsx ทั้งที่ไฟล์ยังมีมาโครอยู่จริง)"""
+    correct_ext = ".xlsm" if has_macros else ".xlsx"
+    if filename.lower().endswith(correct_ext):
+        return filename
+    name_root, _ = os.path.splitext(filename)
+    return f"{name_root}{correct_ext}"
 
 
 def _convert_xls_to_xlsx_bytes(raw: bytes) -> bytes:
@@ -3162,15 +3205,18 @@ async def upload_excel_editor_document(
     chat_id: Optional[int] = Form(None),
     user_id: int = Depends(require_user),
 ):
-    """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx/.xls
+    """ทำงานในแชทปกติทั้งหมดเหมือน Feasibility Summarizer/Deal Screening — เรียกตอนแนบไฟล์ .xlsx/.xls/.xlsm
     ที่ไม่ตรง schema Deal Screening เสมอ ไม่ว่าจะพิมพ์คำสั่งมาด้วยหรือไม่ก็ตาม (frontend เรียก endpoint นี้
     ทางเดียวเท่านั้นสำหรับไฟล์ประเภทนี้) — ถ้าไม่มีคำสั่งมาด้วย ถือว่าเป็นการขอสรุปเนื้อหาไปเลยแบบ deterministic
     ไม่ต้องเสีย API call เรียก Claude ไปตีความว่า intent คืออะไร เพราะไม่มีข้อความให้ตีความอยู่แล้ว
     .xls จะถูกแปลงเป็น .xlsx อัตโนมัติเบื้องหลังก่อน (ดู _convert_xls_to_xlsx_bytes()) — ตั้งแต่บรรทัดที่แปลง
-    แล้วเป็นต้นไป โค้ดด้านล่างทั้งหมดทำงานกับ .xlsx เสมอ ไม่ต้องรู้เลยว่าไฟล์ต้นฉบับเป็น .xls หรือ .xlsx"""
+    แล้วเป็นต้นไป โค้ดด้านล่างทั้งหมดทำงานกับ .xlsx เสมอ ไม่ต้องรู้เลยว่าไฟล์ต้นฉบับเป็น .xls หรือ .xlsx
+    .xlsm ไม่ต้องแปลงอะไรเลย (เป็น OOXML อยู่แล้วเหมือน .xlsx) เก็บ bytes/นามสกุลเดิมไว้ตรงๆ เพื่อรักษา
+    มาโครในไฟล์ไว้ครบ — สำคัญมากคือห้ามมีจุดไหนโหลดไฟล์นี้มาแก้แล้ว save ทับโดยไม่ผ่าน
+    _load_workbook_preserving_macros() (ดู download_excel_editor_document ด้านล่าง)"""
     filename = file.filename or "upload.xlsx"
-    if not filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น")
+    if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+        raise HTTPException(status_code=400, detail="รองรับเฉพาะไฟล์ .xlsx, .xls และ .xlsm เท่านั้น")
 
     _validate_chat_ownership(chat_id, user_id)
     raw = await file.read()
@@ -3248,24 +3294,31 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
             )
         resolved[label] = value
 
-    wb = openpyxl.load_workbook(io.BytesIO(doc["original_bytes"]))  # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว
+    # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว — ผ่าน helper นี้แทน load_workbook ตรงๆ
+    # เพื่อส่ง keep_vba=True อัตโนมัติถ้าไฟล์มีมาโคร กันมาโครหายตอน wb.save() ด้านล่าง
+    wb = _load_workbook_preserving_macros(doc["original_bytes"])
     for label, info in doc["label_map"].items():
         ws = wb[info["sheet"]]
         ws.cell(row=info["row"], column=info["col"], value=resolved[label])
 
     buf = io.BytesIO()
     wb.save(buf)
+    output_bytes = buf.getvalue()  # เช็คจากเนื้อไฟล์ที่ save ออกมาจริง ไม่ใช่เดาจากชื่อ/นามสกุลเดิม
     buf.seek(0)
+
+    has_macros = _is_macro_workbook(output_bytes)
+    media_type = MACRO_ENABLED_MEDIA_TYPE if has_macros else XLSX_MEDIA_TYPE
 
     # ต่อท้าย "_thaimesook" ก่อนนามสกุลเฉพาะชื่อไฟล์ที่ใช้ดาวน์โหลด (Content-Disposition) เท่านั้น
     # กันเบราว์เซอร์บันทึกทับไฟล์ต้นฉบับชื่อเดียวกันในโฟลเดอร์ดาวน์โหลดของผู้ใช้โดยไม่ตั้งใจ
     # ไม่กระทบ doc["filename"] ที่เก็บใน DB เลย — ใช้ os.path.splitext() กันเดาผิดถ้าชื่อไฟล์มีจุดหลายจุด (เช่น "report.v2.xlsx")
-    name_root, name_ext = os.path.splitext(doc["filename"])
-    download_filename = f"{name_root}_thaimesook{name_ext}"
+    # นามสกุลใช้ผลเช็ค has_macros ด้านบนเสมอ (ไม่ใช่ name_ext เดิมของ doc["filename"]) ให้ตรงเนื้อไฟล์จริง
+    name_root, _ = os.path.splitext(doc["filename"])
+    download_filename = f"{name_root}_thaimesook{'.xlsm' if has_macros else '.xlsx'}"
 
     return StreamingResponse(
         buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        media_type=media_type,
         headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
     )
 
@@ -3344,9 +3397,10 @@ async def import_library_files(
     category_id: Optional[int] = Form(None),
     _: bool = Depends(require_login),
 ):
-    """รับหลายไฟล์พร้อมกัน (.xlsx/.xls เท่านั้น สูงสุด 5 MB/ไฟล์) — ไฟล์ที่ parse ไม่ได้แจ้งเป็นรายไฟล์
+    """รับหลายไฟล์พร้อมกัน (.xlsx/.xls/.xlsm สูงสุด 5 MB/ไฟล์) — ไฟล์ที่ parse ไม่ได้แจ้งเป็นรายไฟล์
     ไม่ทำให้ไฟล์อื่นในชุดเดียวกันล้มไปด้วย เช็ค storage ให้ครบก่อนเริ่ม (fail-fast) แทนที่จะปล่อยให้ทุกไฟล์
-    ล้มด้วยเหตุผลเดียวกันซ้ำๆ ทีละไฟล์"""
+    ล้มด้วยเหตุผลเดียวกันซ้ำๆ ทีละไฟล์ — .xlsm เก็บ bytes ต้นฉบับตรงๆ ไม่แปลง (เหมือน .xlsx) add_library_file()
+    จะเลือกนามสกุลของ storage_key เป็น .xlsm ให้เองถ้าเช็คแล้วไฟล์มีมาโครจริง (ดู _is_macro_workbook)"""
     if not is_storage_configured():
         raise HTTPException(status_code=503, detail="ยังไม่ได้ตั้งค่า storage")
 
@@ -3359,8 +3413,8 @@ async def import_library_files(
     for file in files:
         filename = file.filename or "upload.xlsx"
         try:
-            if not filename.lower().endswith((".xlsx", ".xls")):
-                results.append({"filename": filename, "ok": False, "error": "รองรับเฉพาะไฟล์ .xlsx และ .xls เท่านั้น"})
+            if not filename.lower().endswith((".xlsx", ".xls", ".xlsm")):
+                results.append({"filename": filename, "ok": False, "error": "รองรับเฉพาะไฟล์ .xlsx, .xls และ .xlsm เท่านั้น"})
                 continue
 
             raw = await file.read()
@@ -3414,8 +3468,14 @@ def list_library_files_endpoint(category_id: Optional[str] = None, _: bool = Dep
             raise HTTPException(status_code=400, detail="category_id ต้องเป็นตัวเลขหรือ 'none'")
         files = get_library_files(category_id=parsed_id)
 
-    # ไม่ส่ง label_map กลับไปหน้าเว็บ (ไม่จำเป็นต่อการแสดงรายการ ตัดออกลด payload)
-    return {"files": [{k: v for k, v in f.items() if k not in ("label_map", "storage_key")} for f in files]}
+    # ไม่ส่ง label_map/storage_key กลับไปหน้าเว็บ (ไม่จำเป็นต่อการแสดงรายการ ตัดออกลด payload) แต่เพิ่ม
+    # has_macros เข้าไปแทน (derive จากนามสกุลของ storage_key ก่อนตัดทิ้ง — ดู _library_file_has_macros)
+    response_files = []
+    for f in files:
+        item = {k: v for k, v in f.items() if k not in ("label_map", "storage_key")}
+        item["has_macros"] = _library_file_has_macros(f)
+        response_files.append(item)
+    return {"files": response_files}
 
 
 @app.put("/admin/api/file-library/files/{file_id}")
@@ -3433,6 +3493,10 @@ def update_library_file_endpoint(file_id: int, body: LibraryFileUpdate, _: bool 
         valid_ids = {c["id"] for c in get_file_categories_with_counts()}
         if body.category_id not in valid_ids:
             raise HTTPException(status_code=400, detail="ไม่พบหมวดนี้")
+
+    # เติม/แก้นามสกุลให้ตรงกับเนื้อไฟล์จริงเสมอ เผื่อแอดมินพิมพ์ชื่อใหม่ไม่ได้ลงท้ายถูกต้อง
+    # (เช่นไฟล์มีมาโครจริงแต่พิมพ์ชื่อใหม่ลงท้าย .xlsx) — ไม่งั้นนามสกุลจะไม่ตรงเนื้อไฟล์จริงตอนดาวน์โหลด
+    filename = _ensure_correct_extension(filename, _library_file_has_macros(existing))
 
     if not rename_library_file(file_id, filename):
         raise HTTPException(status_code=400, detail="เปลี่ยนชื่อไม่สำเร็จ")
@@ -3465,10 +3529,17 @@ def export_library_file(file_id: int, _: bool = Depends(require_login)):
     except Exception:
         raise HTTPException(status_code=500, detail="ดึงไฟล์จาก storage ไม่สำเร็จ")
 
+    # เช็คจากเนื้อไฟล์จริง ไม่ใช่จากนามสกุลของ storage_key/filename ตามที่กำหนด — ปกติต้องตรงกันอยู่แล้ว
+    # เพราะ add_library_file()/rename ผ่าน _ensure_correct_extension มาตลอด แต่เช็คซ้ำให้ชัวร์ตรงจุดที่
+    # ส่งไฟล์ออกจริง (จุดที่สำคัญที่สุดถ้ามีอะไรไม่ตรงกัน)
+    has_macros = _is_macro_workbook(raw)
+    media_type = MACRO_ENABLED_MEDIA_TYPE if has_macros else XLSX_MEDIA_TYPE
+    download_filename = _ensure_correct_extension(file_row["filename"], has_macros)
+
     return StreamingResponse(
         io.BytesIO(raw),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": _content_disposition_attachment(file_row["filename"])},
+        media_type=media_type,
+        headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
     )
 
 
