@@ -85,6 +85,8 @@ from db import (
     _is_macro_workbook,
     LibraryStorageError,
     LibraryDatabaseError,
+    set_chat_document_focus,
+    get_chat_document_focus,
 )
 
 import os
@@ -95,6 +97,7 @@ import base64
 import time
 import string
 import random
+import difflib
 import datetime
 import urllib.parse
 import bcrypt
@@ -501,18 +504,24 @@ LIBRARY_TOOLS = [
         "name": "open_library_file",
         "description": (
             "เปิดไฟล์จากคลังเอกสารเข้ามาในแชทนี้เป็นสำเนาที่แก้ไข/เปรียบเทียบได้ ไม่แตะไฟล์ต้นฉบับในคลังเลย "
-            "ต้องเรียก list_library_files ก่อนเสมอเพื่อยืนยัน file_id ที่ถูกต้อง ห้ามเดา file_id เอง "
-            "หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
+            "ระบุได้ทั้ง file_id (ถ้ารู้แน่ชัดจาก list_library_files มาก่อนแล้ว) หรือ name_query (ให้ระบบจับคู่ "
+            "ชื่อไฟล์ให้เอง) อย่างใดอย่างหนึ่ง — ถ้า name_query ตรงหลายไฟล์พร้อมกัน จะได้รายชื่อกลับมาโดยไม่เปิด "
+            "ไฟล์ไหนเลย ให้ถามผู้ใช้หรือเรียกใหม่ด้วย file_id ที่ชัดเจน ถ้าไฟล์ชื่อเดียวกันเปิดอยู่ในแชทนี้แล้ว "
+            "จะใช้ตัวเดิม ไม่สร้างสำเนาซ้ำ หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_id": {
                     "type": "integer",
-                    "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของ list_library_files เท่านั้น)",
+                    "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของ list_library_files หรือ open_library_file ครั้งก่อน)",
+                },
+                "name_query": {
+                    "type": "string",
+                    "description": "ชื่อไฟล์หรือส่วนหนึ่งของชื่อไฟล์ที่ต้องการเปิด (ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด)",
                 },
             },
-            "required": ["file_id"],
+            "required": [],
         },
     },
 ]
@@ -548,10 +557,47 @@ def execute_list_library_files(tool_input: dict) -> dict:
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
     """คัดลอกไฟล์จากคลังมาสร้างเป็น EditableDocument ใหม่ผูกกับแชท/user ปัจจุบัน — ไม่เขียนอะไรกลับไปที่
     library_files เลยไม่ว่าทางไหน (ต้นฉบับในคลังไม่ถูกแก้เด็ดขาด) caller (run_agentic_tool_loop) รับประกัน
-    แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง"""
-    file_row = get_library_file(tool_input.get("file_id"))
-    if file_row is None:
-        return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
+    แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง
+
+    รับ file_id ตรงๆ หรือ name_query (ให้โค้ดจับคู่ชื่อเอง) อย่างใดอย่างหนึ่ง — name_query ตรงหลายไฟล์
+    จะคืนรายชื่อโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้
+    Claude เลือก file_id ผิด) ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน (normalize แล้ว) เปิดอยู่ใน
+    แชทนี้แล้วหรือยัง ถ้ามีให้ใช้ตัวเดิมแทนที่จะสร้างซ้ำ (แก้ปัญหาที่เคยเจอ: เปิดไฟล์เดิมซ้ำสองครั้งในแชทเดียว)"""
+    file_id = tool_input.get("file_id")
+    name_query = (tool_input.get("name_query") or "").strip()
+
+    if file_id is None and not name_query:
+        return {"error": "ต้องระบุ file_id หรือ name_query อย่างน้อยหนึ่งอย่าง"}
+
+    if file_id is not None:
+        file_row = get_library_file(file_id)
+        if file_row is None:
+            return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
+    else:
+        normalized_query = name_query.lower()
+        matches = [f for f in get_library_files() if normalized_query in f["filename"].lower()]
+        if len(matches) == 0:
+            return {"error": f"ไม่พบไฟล์ชื่อ '{name_query}' ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
+        if len(matches) > 1:
+            return {
+                "matched_multiple": True,
+                "files": [{"file_id": f["id"], "filename": f["filename"]} for f in matches],
+                "message": f"พบ {len(matches)} ไฟล์ที่ชื่อตรงกับ '{name_query}' กรุณาระบุให้ชัดเจนขึ้น หรือเรียกใหม่ด้วย file_id ที่ต้องการจากรายการนี้",
+            }
+        file_row = matches[0]
+
+    # กันเปิดไฟล์ชื่อเดียวกันซ้ำในแชทเดียวกัน — ถ้ามีอยู่แล้วให้ใช้ตัวเดิม ไม่สร้าง EditableDocument ใหม่
+    target_normalized_name = _normalize_filename_for_matching(file_row["filename"])
+    for existing in list_active_editable_documents_by_chat(chat_id, user_id):
+        if _normalize_filename_for_matching(existing["filename"]) == target_normalized_name:
+            set_chat_document_focus(chat_id, existing["id"])
+            return {
+                "opened": True,
+                "already_open": True,
+                "filename": existing["filename"],
+                "document_id": existing["id"],
+                "message": f"ไฟล์ '{existing['filename']}' เปิดอยู่ในแชทนี้แล้ว ใช้ไฟล์เดิมนี้ต่อได้เลย ไม่ได้เปิดซ้ำ",
+            }
 
     try:
         raw = storage_get(file_row["storage_key"])
@@ -567,6 +613,7 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
         label_map=file_row["label_map"],
         chat_id=chat_id,
     )
+    set_chat_document_focus(chat_id, document_id)
     # เช็คจาก bytes จริงที่เพิ่งดึงมาตรงๆ (มีอยู่แล้วในมือ แม่นยำกว่าเดาจากนามสกุล storage_key)
     has_macros = _is_macro_workbook(raw)
     macro_note = " ไฟล์นี้มีมาโคร (VBA) ฝังอยู่ — ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติ" if has_macros else ""
@@ -576,6 +623,129 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
         "document_id": document_id,
         "has_macros": has_macros,
         "message": f"เปิดไฟล์ '{file_row['filename']}' จากคลังเป็นสำเนาในแชทนี้แล้ว (ต้นฉบับในคลังไม่ถูกแก้){macro_note}",
+    }
+
+
+# แยกจาก LIBRARY_TOOLS โดยตั้งใจเหมือนกัน — tool กลุ่มนี้ทำงานกับไฟล์ที่ "เปิดอยู่ในแชทนี้แล้ว" เท่านั้น
+# (EditableDocument ที่ active อยู่) ไม่ใช่ไฟล์ในคลัง ต้องมี user_id ที่ล็อกอินอยู่เหมือนกัน (เช็คใน
+# run_agentic_tool_loop ตอนประกอบ tools list — ไม่ส่ง tool พวกนี้เข้าไปเลยถ้าไม่ล็อกอิน)
+CHAT_DOCUMENT_TOOLS = [
+    {
+        "name": "list_chat_documents",
+        "description": (
+            "ดูรายการไฟล์ Excel ทั้งหมดที่เปิดอยู่ในแชทนี้ตอนนี้ (ทั้งที่แนบเองหรือเปิดจากคลัง) "
+            "ต้องเรียกเครื่องมือนี้ก่อนเสมอถ้าไม่แน่ใจว่า document_id ไหนตรงกับไฟล์ที่ผู้ใช้พูดถึง "
+            "ไม่ต้องระบุ parameter ใดเลย"
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "compare_chat_documents",
+        "description": (
+            "เปรียบเทียบไฟล์ 2 ไฟล์ที่เปิดอยู่ในแชทนี้แล้ว ต้องเป็น document_id ที่ได้จาก list_chat_documents "
+            "หรือจากผลลัพธ์ของ open_library_file เท่านั้น ห้ามเดา document_id เอง ระบบคำนวณผลต่างด้วยโค้ดจริง "
+            "ไม่ใช่เดาเอง"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id_a": {"type": "integer", "description": "document_id ของไฟล์แรกที่จะเปรียบเทียบ"},
+                "document_id_b": {"type": "integer", "description": "document_id ของไฟล์ที่สองที่จะเปรียบเทียบ"},
+            },
+            "required": ["document_id_a", "document_id_b"],
+        },
+    },
+    {
+        "name": "edit_chat_document",
+        "description": (
+            "แก้ค่าในไฟล์ Excel ที่เปิดอยู่ในแชทนี้แล้ว ต้องเป็น document_id ที่ได้จาก list_chat_documents "
+            "หรือจากผลลัพธ์ของ open_library_file เท่านั้น ห้ามเดา document_id เอง ระบบจะจับคู่คำสั่งกับ label "
+            "ในไฟล์ให้เองด้วยโค้ดจริง"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะแก้"},
+                "instruction": {"type": "string", "description": "คำสั่งแก้ค่า เช่น 'เปลี่ยนอัตราภาษีเป็น 10%'"},
+            },
+            "required": ["document_id", "instruction"],
+        },
+    },
+    {
+        "name": "get_document_download_link",
+        "description": (
+            "ขอลิงก์ดาวน์โหลดไฟล์ Excel ที่เปิด/แก้อยู่ในแชทนี้แล้ว ต้องเป็น document_id ที่ได้จาก "
+            "list_chat_documents เท่านั้น ห้ามเดา document_id เอง"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะขอลิงก์ดาวน์โหลด"},
+            },
+            "required": ["document_id"],
+        },
+    },
+]
+
+
+def _get_active_chat_document(document_id, user_id: int, chat_id: int) -> Optional[dict]:
+    """เช็คว่า document_id เป็น EditableDocument ที่ active อยู่จริงในแชทนี้ของ user คนนี้ — ใช้ validate
+    ก่อนทุก tool ใน CHAT_DOCUMENT_TOOLS เสมอ กัน Claude ส่ง document_id ของแชท/user อื่นมาแล้วเผลอทำงานข้าม"""
+    if document_id is None:
+        return None
+    for doc in list_active_editable_documents_by_chat(chat_id, user_id):
+        if doc["id"] == document_id:
+            return doc
+    return None
+
+
+def execute_list_chat_documents(user_id: int, chat_id: int) -> dict:
+    active_docs = list_active_editable_documents_by_chat(chat_id, user_id)
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    focus_id = focus_doc["id"] if focus_doc else None
+    return {
+        "documents": [
+            {
+                "document_id": doc["id"],
+                "filename": doc["filename"],
+                "has_macros": _is_macro_workbook(doc["original_bytes"]),
+                "is_focused": doc["id"] == focus_id,
+            }
+            for doc in active_docs
+        ]
+    }
+
+
+def execute_compare_chat_documents(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    doc_a = _get_active_chat_document(tool_input.get("document_id_a"), user_id, chat_id)
+    doc_b = _get_active_chat_document(tool_input.get("document_id_b"), user_id, chat_id)
+    if doc_a is None or doc_b is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    if doc_a["id"] == doc_b["id"]:
+        return {"error": "ต้องเลือกไฟล์ 2 ไฟล์ที่ต่างกัน"}
+    diff_text = _compare_editable_documents(doc_a, doc_b)
+    set_chat_document_focus(chat_id, doc_b["id"])
+    return {"compared": True, "result": diff_text}
+
+
+def execute_edit_chat_document(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    instruction = tool_input.get("instruction") or ""
+    # _match_and_apply_excel_edit ตั้งโฟกัสเองอยู่แล้วถ้าแก้สำเร็จ (ดูฟังก์ชันนั้น) ไม่ต้องตั้งซ้ำตรงนี้
+    return _match_and_apply_excel_edit(doc["id"], user_id, instruction)
+
+
+def execute_get_document_download_link(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    set_chat_document_focus(chat_id, doc["id"])
+    return {
+        "filename": doc["filename"],
+        "download_url": f"/api/excel-editor/{doc['id']}/download",
+        "message": f"ไฟล์ '{doc['filename']}' พร้อมดาวน์โหลดแล้วครับ",
     }
 
 
@@ -761,15 +931,18 @@ def run_agentic_tool_loop(
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
-    - list_library_files/open_library_file: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่)
-      เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request เลยถ้าไม่ล็อกอิน
-      open_library_file ต้องมี chat_id ด้วย (สร้าง EditableDocument ผูกกับแชทจริง) — caller (rag_answer)
-      ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id ไม่ใช่ None (ดูการแก้ไขใน ask_question())
+    - list_library_files/open_library_file/list_chat_documents/compare_chat_documents/edit_chat_document/
+      get_document_download_link: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่) และ
+      chat_id (อยู่ในแชทจริง) เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request
+      เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
+      ไม่ใช่ None (ดูการแก้ไขใน ask_question())
     วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ MAX_TOOL_ITERATIONS (กันวนไม่รู้จบ)"""
     messages = [dict(m) for m in initial_messages]  # copy กันแก้ list เดิมโดยไม่ตั้งใจ
     response = None
 
-    tools_for_this_call = AVAILABLE_TOOLS + LIBRARY_TOOLS if user_id else AVAILABLE_TOOLS
+    tools_for_this_call = (
+        AVAILABLE_TOOLS + LIBRARY_TOOLS + CHAT_DOCUMENT_TOOLS if (user_id and chat_id) else AVAILABLE_TOOLS
+    )
 
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
@@ -811,6 +984,34 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "open_library_file" and user_id and chat_id:
                 result = execute_open_library_file(block.input, user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "list_chat_documents" and user_id and chat_id:
+                result = execute_list_chat_documents(user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "compare_chat_documents" and user_id and chat_id:
+                result = execute_compare_chat_documents(block.input, user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "edit_chat_document" and user_id and chat_id:
+                result = execute_edit_chat_document(block.input, user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "get_document_download_link" and user_id and chat_id:
+                result = execute_get_document_download_link(block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1115,7 +1316,10 @@ def _prepare_rag_context(query, history, image_data):
         "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
         "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
         "- ถ้าไฟล์ (จากคลังหรือที่แนบมาเอง) มีมาโคร (has_macros เป็น true) ให้บอกผู้ใช้ว่าไฟล์นี้มีมาโคร "
-        "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์"
+        "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์\n"
+        "- ห้ามบอกว่าเปิด แก้ เปรียบเทียบ หรือส่งไฟล์แล้ว ถ้าไม่มีผลจาก tool ยืนยันในเทิร์นนี้\n"
+        "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
+        "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว"
     )
 
     current_turn_text = (
@@ -1394,6 +1598,7 @@ async def ask_question(
                 return {"answer": result["message"], "sources": [], "chat_id": chat_id}
 
             if intent == "finalize":
+                set_chat_document_focus(chat_id, editable_doc["id"])
                 download_url = f"/api/excel-editor/{editable_doc['id']}/download"
                 answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
                 add_chat_message(chat_id, "user", query)
@@ -1404,7 +1609,7 @@ async def ask_question(
             if intent == "compare":
                 answer = (
                     f"ตอนนี้มีแค่ไฟล์เดียวในแชทนี้ (ชื่อ {editable_doc['filename']}) "
-                    "กรุณาแนบอีกไฟล์ที่ต้องการเปรียบเทียบด้วยครับ"
+                    "กรุณาแนบอีกไฟล์ หรือเปิดอีกไฟล์จากคลังเอกสาร เพื่อเปรียบเทียบด้วยครับ"
                 )
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
@@ -1414,12 +1619,29 @@ async def ask_question(
             # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
 
         elif len(active_docs) >= 2:
-            route = _route_multi_file_instruction(active_docs, query)
+            valid_ids = {doc["id"] for doc in active_docs}
+            docs_by_id = {doc["id"]: doc for doc in active_docs}
+
+            # จับคู่ชื่อไฟล์ด้วยโค้ดก่อนเรียก LLM เสมอ (match_documents_by_name) — ถ้าตรงไฟล์เดียวชัดเจน
+            # ใช้ไฟล์นั้นเลย ไม่ต้องให้ LLM เดา ส่งผลลัพธ์นี้เป็น hint เข้าไปในตัวจัดเส้นทางด้วย
+            name_matches = match_documents_by_name(query, active_docs)
+            code_matched_document_id = name_matches[0]["id"] if len(name_matches) == 1 else None
+
+            focus_doc = get_chat_document_focus(chat_id, user_id)
+            focus_document_id = focus_doc["id"] if focus_doc else None
+            recent_history = get_chat_messages(chat_id)[-4:]
+
+            route = _route_multi_file_instruction(
+                active_docs, query,
+                focus_document_id=focus_document_id,
+                recent_history=recent_history,
+                code_matched_document_id=code_matched_document_id,
+            )
             action = route.get("action")
 
             if action == "edit":
-                valid_ids = {doc["id"] for doc in active_docs}
-                target_id = route.get("document_id")
+                # โค้ดจับคู่ชื่อไฟล์ได้ชัดเจนแล้ว ใช้ตรงนี้เสมอ (authoritative กว่า LLM) ไม่งั้นค่อยใช้ของตัวจัดเส้นทาง
+                target_id = code_matched_document_id or route.get("document_id")
                 if target_id in valid_ids:
                     result = _match_and_apply_excel_edit(target_id, user_id, query)
                     answer = result["message"]
@@ -1431,17 +1653,29 @@ async def ask_question(
                 return {"answer": answer, "sources": [], "chat_id": chat_id}
 
             if action == "finalize":
-                # หลายไฟล์พร้อมกัน ไม่เดาว่าต้องการไฟล์ไหน — ให้ pattern เดียวกับ compare ตอน 3+ ไฟล์
-                names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
-                answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการดาวน์โหลดไฟล์ไหนครับ"
+                # เดิม: มี 2+ ไฟล์พร้อมกันจะถามว่าต้องการไฟล์ไหนเสมอ แม้ผู้ใช้ระบุชื่อไฟล์มาแล้วก็ตาม
+                # (ตัวจัดเส้นทางไม่เคยถูกขอ document_id สำหรับ finalize เลย) ตอนนี้ใช้ผลจับคู่ชื่อด้วยโค้ด
+                # หรือ document_id จากตัวจัดเส้นทางเหมือน edit แทน — ถามกลับเฉพาะตอนระบุไม่ได้จริงๆ
+                target_id = code_matched_document_id or route.get("document_id")
+                if target_id in valid_ids:
+                    set_chat_document_focus(chat_id, target_id)
+                    download_url = f"/api/excel-editor/{target_id}/download"
+                    filename = docs_by_id[target_id]["filename"]
+                    answer = f"ไฟล์ '{filename}' พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
+                else:
+                    names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
+                    answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการดาวน์โหลดไฟล์ไหนครับ"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
                 return {"answer": answer, "sources": [], "chat_id": chat_id}
 
             if action == "compare":
-                if len(active_docs) == 2:
-                    answer = _compare_editable_documents(active_docs[0], active_docs[1])
+                id_a = route.get("document_id_a")
+                id_b = route.get("document_id_b")
+                if id_a in valid_ids and id_b in valid_ids and id_a != id_b:
+                    answer = _compare_editable_documents(docs_by_id[id_a], docs_by_id[id_b])
+                    set_chat_document_focus(chat_id, id_b)
                 else:
                     names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
                     answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการเปรียบเทียบไฟล์ไหนกับไฟล์ไหนครับ"
@@ -3052,35 +3286,73 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
 
 EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าคำสั่งของผู้ใช้ในบทสนทนานี้ต้องการทำอะไร โดยมีไฟล์ Excel ที่กำลังแก้อยู่พร้อมกัน "
-    "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON)\n\n"
+    "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON) "
+    "ไฟล์ที่กำลังโฟกัสอยู่ล่าสุด (ถ้ามี) และข้อความ 4 เทิร์นล่าสุดในบทสนทนานี้ (ถ้ามี)\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
     '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "clarify" หรือ "unrelated", '
-    '"document_id": <เลข document_id ของไฟล์ที่จะแก้ ถ้า action เป็น edit ไม่งั้นใส่ null>, '
+    '"document_id": <เลข document_id ถ้า action เป็น edit หรือ finalize ไม่งั้นใส่ null>, '
+    '"document_id_a": <เลข document_id ไฟล์แรกถ้า action เป็น compare ไม่งั้นใส่ null>, '
+    '"document_id_b": <เลข document_id ไฟล์ที่สองถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
-    "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน และสามารถระบุได้ว่าเป็นไฟล์ไหนไฟล์เดียว "
-    "(จาก label ที่ตรงกับแค่ไฟล์เดียว หรือเอ่ยชื่อไฟล์ที่อยู่ในรายการด้านบนตรงๆ) — ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
-    "ถ้า label ที่พูดถึงมีอยู่ในมากกว่า 1 ไฟล์พร้อมกันและไม่ได้เอ่ยชื่อไฟล์ ห้ามเดาว่าเป็นไฟล์ไหนเด็ดขาด ให้ตอบ clarify แทน\n"
-    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (เฉพาะไฟล์ในรายการนี้)\n"
-    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์ที่อยู่ใน 'รายการด้านบน' กันเอง เท่านั้น\n"
-    "- clarify: คำสั่งเกี่ยวข้องกับไฟล์ใน 'รายการด้านบน' แน่ๆ แต่คลุมเครือ ตีความไม่ออกว่าต้องการแก้ไฟล์ไหนหรือต้องการทำอะไรกันแน่ "
-    "ให้ตั้งคำถามกลับสั้นๆ ใน message เพื่อขอความชัดเจนจากผู้ใช้\n"
+    "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
+    "ตัดสินใจว่าเป็นไฟล์ไหนตามลำดับนี้: 1) เอ่ยชื่อไฟล์หรือ label ที่ตรงกับไฟล์เดียวในรายการชัดเจน ให้ใช้ไฟล์นั้น "
+    "2) ถ้าไม่ได้ระบุไฟล์เลยแต่มีไฟล์ที่กำลังโฟกัสอยู่ ให้ใช้ไฟล์ที่โฟกัส 3) ถ้าคำสั่งอ้างอิงบทสนทนาก่อนหน้า "
+    "(เช่น 'ไฟล์ที่แก้ไปเมื่อกี้') ให้ดูจากข้อความล่าสุดหรือไฟล์โฟกัสประกอบกัน ถ้ายังกำกวมจริงๆ (ไม่มีโฟกัสและ "
+    "ตัดสินไม่ได้จากขั้นตอนข้างต้นเลย) ให้ตอบ clarify แทน ห้ามเดา\n"
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (เฉพาะไฟล์ในรายการนี้) ตัดสินใจว่าเป็นไฟล์ไหน "
+    "ด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ\n"
+    "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์ที่อยู่ใน 'รายการด้านบน' กันเอง ต้องระบุ document_id_a และ "
+    "document_id_b เสมอ ถ้าผู้ใช้เอ่ยชื่อไฟล์มาแค่ไฟล์เดียวที่จะเปรียบเทียบ ให้ใช้ไฟล์ที่กำลังโฟกัส (ถ้ามี) "
+    "เป็นอีกไฟล์หนึ่งโดยอัตโนมัติ ถ้าไม่มีไฟล์โฟกัสและระบุมาแค่ไฟล์เดียว ให้ตอบ clarify แทน\n"
+    "- clarify: คำสั่งเกี่ยวข้องกับไฟล์ใน 'รายการด้านบน' แน่ๆ แต่ข้อมูลที่มี (ไฟล์โฟกัส + บทสนทนาก่อนหน้า + "
+    "ข้อความล่าสุด) ไม่พอตัดสินใจได้จริงๆ ว่าต้องการทำอะไรกับไฟล์ไหน ให้ตั้งคำถามกลับสั้นๆ ใน message เพื่อขอความชัดเจนจากผู้ใช้\n"
     "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับไฟล์ทั้งหมดในรายการด้านบนเลย รวมถึงกรณีที่ผู้ใช้ขอเปิด/อ่าน/"
     "เปรียบเทียบ/ค้นหาไฟล์อื่นที่ 'ไม่อยู่ในรายการด้านบน' (เช่น ไฟล์จากคลังเอกสารของระบบ, ไฟล์ที่เอ่ยชื่อมาแต่ไม่ตรงกับไฟล์ไหนในรายการเลย) "
     "— กรณีนี้ให้ตอบ unrelated เสมอ ห้ามตอบ clarify หรือเดาว่าหมายถึงไฟล์ใดไฟล์หนึ่งในรายการ"
 )
 
 
-def _route_multi_file_instruction(documents: list[dict], instruction: str) -> dict:
+def _route_multi_file_instruction(
+    documents: list[dict],
+    instruction: str,
+    focus_document_id: Optional[int] = None,
+    recent_history: Optional[list[dict]] = None,
+    code_matched_document_id: Optional[int] = None,
+) -> dict:
     """เรียก Claude ครั้งเดียวตัดสินใจว่าคำสั่งล่าสุด (มีไฟล์ excel active พร้อมกันหลายไฟล์) ต้องการทำอะไร
-    คืน dict {"action":, "document_id":, "message":} เสมอ ไม่ raise เลย — parse ไม่ได้ถือว่า action='clarify'
-    (fail-safe แบบเดียวกับ pattern เดิมทุกจุดในไฟล์นี้ — ไม่เดาแล้วแก้ผิดไฟล์)"""
+    คืน dict {"action":, "document_id":, "document_id_a":, "document_id_b":, "message":} เสมอ ไม่ raise เลย
+    parse ไม่ได้ถือว่า action='clarify' (fail-safe แบบเดียวกับ pattern เดิมทุกจุดในไฟล์นี้ — ไม่เดาแล้วแก้ผิดไฟล์)
+
+    focus_document_id: ไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (จาก get_chat_document_focus) ถ้ามี ช่วยตัดสินใจตอน
+    ผู้ใช้ไม่ได้ระบุไฟล์ชัดเจน recent_history: ข้อความล่าสุดในแชท (เช่น 4 เทิร์นสุดท้าย) ช่วยตีความคำสั่งที่
+    อ้างอิงบทสนทนาก่อนหน้า เช่น "ไฟล์ที่แก้ไปเมื่อกี้" code_matched_document_id: ผลจับคู่ชื่อไฟล์ด้วยโค้ด
+    (match_documents_by_name) ก่อนเรียกฟังก์ชันนี้ — ถ้าไม่ None แปลว่าโค้ดเจอไฟล์ตรงตัวเดียวชัดเจนแล้ว
+    ให้ LLM ใช้ document_id นี้เสมอสำหรับ action ที่เกี่ยวกับไฟล์เดียว ไม่ต้องเดาใหม่"""
     files_context = [
         {"document_id": doc["id"], "filename": doc["filename"], "label_map": doc["label_map"]}
         for doc in documents
     ]
+
+    focus_text = (
+        f"\n\nไฟล์ที่กำลังโฟกัสอยู่ล่าสุด: document_id={focus_document_id}"
+        if focus_document_id is not None else "\n\nตอนนี้ไม่มีไฟล์ที่กำลังโฟกัสอยู่"
+    )
+
+    history_text = ""
+    if recent_history:
+        history_lines = [f"{m['role']}: {m['content']}" for m in recent_history]
+        history_text = "\n\nบทสนทนาล่าสุด (4 ข้อความสุดท้าย):\n" + "\n".join(history_lines)
+
+    code_match_text = (
+        f"\n\nระบบตรวจจับชื่อไฟล์จากข้อความล่าสุดได้แล้วว่าหมายถึง document_id={code_matched_document_id} "
+        "ชัดเจน — ถ้า action เป็น edit หรือ finalize ให้ใช้ document_id นี้เสมอ ไม่ต้องเดาใหม่"
+        if code_matched_document_id is not None else ""
+    )
+
     prompt = (
-        f"ไฟล์ทั้งหมดที่กำลังแก้อยู่ (JSON):\n{json.dumps(files_context, ensure_ascii=False)}\n\n"
-        f"คำสั่งจากผู้ใช้: {instruction}"
+        f"ไฟล์ทั้งหมดที่กำลังแก้อยู่ (JSON):\n{json.dumps(files_context, ensure_ascii=False)}"
+        f"{focus_text}{history_text}{code_match_text}\n\n"
+        f"คำสั่งล่าสุดจากผู้ใช้: {instruction}"
     )
     response = client.messages.create(
         model="claude-haiku-4-5-20251001",
@@ -3090,10 +3362,12 @@ def _route_multi_file_instruction(documents: list[dict], instruction: str) -> di
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "clarify", "unrelated"):
-        return {"action": "clarify", "document_id": None, "message": None}
+        return {"action": "clarify", "document_id": None, "document_id_a": None, "document_id_b": None, "message": None}
     return {
         "action": parsed.get("action"),
         "document_id": parsed.get("document_id"),
+        "document_id_a": parsed.get("document_id_a"),
+        "document_id_b": parsed.get("document_id_b"),
         "message": parsed.get("message"),
     }
 
@@ -3178,6 +3452,45 @@ def _normalize_label(s: str) -> str:
     return result
 
 
+def _suggest_similar_labels(text: str, label_map: dict, limit: int = 3) -> list[str]:
+    """เสนอ label ที่ชื่อใกล้เคียงกับ text (difflib — string similarity ล้วนๆ ไม่ใช้ AI) ใช้ตอน
+    _match_and_apply_excel_edit() จับคู่ไม่ได้ จะได้บอกผู้ใช้ตรงๆ ว่ามี label ไหนใกล้เคียงบ้างแทนที่จะ
+    ปล่อยให้ผู้ใช้เดาเอง คืน list ว่างถ้าไม่มีอะไรใกล้เคียงพอ (cutoff ต่ำไปจะแนะนำมั่วๆ)"""
+    if not text:
+        return []
+    return difflib.get_close_matches(text, list(label_map.keys()), n=limit, cutoff=0.3)
+
+
+def _normalize_filename_for_matching(name: str) -> str:
+    """normalize ชื่อไฟล์/ข้อความก่อนเทียบกัน: ตัดนามสกุล (ถ้ามี), lowercase, รวมช่องว่างซ้ำเป็นช่องเดียว,
+    ตัดช่องว่างหัวท้าย — ใช้คู่กับ match_documents_by_name() ด้านล่าง"""
+    name_root, _ = os.path.splitext(name)
+    return re.sub(r"\s+", " ", name_root.strip().lower())
+
+
+def match_documents_by_name(instruction: str, documents: list[dict]) -> list[dict]:
+    """หาว่าข้อความผู้ใช้ (instruction) อ้างถึงไฟล์ไหนในรายการ documents (แต่ละตัวมี key 'filename' อย่างน้อย)
+    ด้วยโค้ดล้วนๆ ไม่เรียก LLM เลย — เทียบแบบ bidirectional substring หลัง normalize (ตัดนามสกุล/lowercase/
+    รวมช่องว่าง) แล้ว: ชื่อไฟล์เป็นส่วนหนึ่งของข้อความ (เช่นผู้ใช้พิมพ์ชื่อเต็มในประโยคยาว) หรือข้อความเป็น
+    ส่วนหนึ่งของชื่อไฟล์ (เช่นผู้ใช้พิมพ์แค่ส่วนย่อยที่จำได้ อย่าง 'ป่าไม้เขียว' ซึ่งเป็นส่วนหนึ่งของ
+    '...ป่าไม้เขียวจำกัด.xlsm') คืน list ของไฟล์ที่ตรง: ว่างเปล่า = ไม่ตรงเลย, มี 1 ตัว = ตรงชัดเจนใช้ได้เลย,
+    มากกว่า 1 ตัว = กำกวม (เช่นข้อความเป็นคำที่ทุกไฟล์มีร่วมกัน อย่าง 'ใบประเมินความคุ้มค่า' ที่เป็น prefix
+    ของทุกไฟล์) — ปล่อยให้ตัวจัดเส้นทาง (LLM) หรือถามกลับผู้ใช้ตัดสินใจต่อในกรณีนั้น ไม่เดาเอง"""
+    normalized_instruction = _normalize_filename_for_matching(instruction)
+    if not normalized_instruction:
+        return []
+
+    matched = []
+    for doc in documents:
+        normalized_filename = _normalize_filename_for_matching(doc["filename"])
+        if not normalized_filename:
+            continue
+        if normalized_instruction in normalized_filename or normalized_filename in normalized_instruction:
+            matched.append(doc)
+
+    return matched
+
+
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
     """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
     คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
@@ -3205,7 +3518,11 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
         return {"matched": False, "message": "ประมวลผลคำสั่งไม่สำเร็จ ลองใหม่อีกครั้ง"}
 
     if not parsed.get("matched"):
-        return {"matched": False, "message": str(parsed.get("reason") or "ไม่พบ label ที่ตรงกับคำสั่งนี้")}
+        # ห้ามส่ง parsed["reason"] (ข้อความภายในของตัวจับคู่) ให้ผู้ใช้เห็นตรงๆ — สร้างข้อความเองเสมอ
+        # แล้วเสนอ label ที่ใกล้เคียงจากข้อความคำสั่งแทน ช่วยผู้ใช้เดาต่อได้ว่าจริงๆ หมายถึง label ไหน
+        suggestions = _suggest_similar_labels(instruction, label_map)
+        suggestion_text = f" label ที่ใกล้เคียง: {', '.join(suggestions)}" if suggestions else ""
+        return {"matched": False, "message": f"ไม่พบ label ที่ตรงกับคำสั่งนี้ในไฟล์ '{doc['filename']}'{suggestion_text}"}
 
     label = parsed.get("label")
     if label not in label_map:
@@ -3217,9 +3534,12 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
             label = candidates[0]  # ใช้ key จริงจาก label_map เสมอ ไม่ใช่ข้อความที่ Claude ตอบมา
         else:
             # เจอมากกว่า 1 ตัวชนกัน (กำกวม) หรือไม่เจอเลย -> ปฏิเสธเหมือนเดิม ไม่เดาแก้ผิดจุด
+            # เสนอ label ใกล้เคียงจาก label ที่ Claude พยายามจับคู่มา (ไม่ใช่ instruction ดิบ แม่นกว่า)
+            suggestions = _suggest_similar_labels(label or instruction, label_map)
+            suggestion_text = f" label ที่ใกล้เคียง: {', '.join(suggestions)}" if suggestions else ""
             return {
                 "matched": False,
-                "message": f"ระบบจับคู่กับ '{label}' แต่ไม่พบ label นี้จริงในไฟล์ กรุณาลองสั่งใหม่ให้ชัดเจนขึ้น",
+                "message": f"ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}'{suggestion_text}",
             }
 
     new_value = parsed.get("new_value")
@@ -3227,12 +3547,18 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
     label_map[label]["current_value"] = new_value
     update_editable_document_label_map(document_id, label_map)
 
+    # แก้สำเร็จ = ไฟล์นี้กลายเป็นไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (ถ้ามี chat_id ผูกอยู่จริง — อัปโหลดบางเส้นทาง
+    # อาจยังไม่มี chat_id ตอนเรียกครั้งแรกสุด แต่ไม่เคยเกิดในทางปฏิบัติเพราะ _resolve_chat_id เรียกมาก่อนเสมอ)
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
+
     return {
         "matched": True,
         "label": label,
         "old_value": old_value,
         "new_value": new_value,
-        "message": str(parsed.get("reason") or f"แก้ '{label}' จาก {old_value} เป็น {new_value}"),
+        # สร้างข้อความยืนยันเองด้วยโค้ดเสมอ ห้ามใช้ parsed["reason"] (ข้อความภายในของตัวจับคู่)
+        "message": f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value}' แล้ว",
     }
 
 
@@ -3284,6 +3610,7 @@ async def upload_excel_editor_document(
     document_id = create_editable_document(
         user_id=user_id, filename=filename, original_bytes=raw, label_map=label_map, chat_id=final_chat_id,
     )
+    set_chat_document_focus(final_chat_id, document_id)
 
     # ไม่มีคำสั่งมาด้วย -> ไม่มีอะไรให้ตีความ ถือเป็นการขอสรุปตรงๆ เลย ไม่ต้องเรียก Claude มา classify
     intent = _classify_excel_editor_upload_intent(label_map, instruction) if instruction else "summarize"
@@ -3315,11 +3642,15 @@ async def upload_excel_editor_document(
 
 @app.get("/api/excel-editor/{document_id}/download")
 def download_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
-    """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้)
-    ไม่มี side effect ใดๆ กับ DB จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ"""
+    """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้) ไม่แก้ไฟล์/
+    label_map เลย จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ (side effect เดียว
+    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
 
     # ตรวจสอบให้ผ่านทุก label ก่อน ค่อยเริ่มเขียนไฟล์จริง — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
     resolved = {}
