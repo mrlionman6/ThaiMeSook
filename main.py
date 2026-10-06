@@ -3449,15 +3449,6 @@ def _route_multi_file_instruction(
     }
 
 
-def _short_filename(filename: str, max_len: int = 25) -> str:
-    """ตัดชื่อไฟล์ (ไม่รวมนามสกุล) ให้สั้นลงสำหรับใช้เป็นหัวคอลัมน์ตารางเปรียบเทียบ"""
-    name, _ext = os.path.splitext(filename)
-    name = name.strip() or filename
-    if len(name) > max_len:
-        return name[: max_len - 1] + "…"
-    return name
-
-
 def _escape_table_cell(value, max_len: int = 120) -> str:
     """เตรียมค่าก่อนใส่ในตาราง markdown: escape '|' และขึ้นบรรทัดใหม่ (กันโครงสร้างตารางพัง)
     ตัดให้สั้นลงพร้อม … ถ้ายาวเกิน max_len ตัวอักษร"""
@@ -3547,7 +3538,7 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
 
         rows_by_group[group].append(f"| {cell_label} | {cell_a} | {cell_b} | {cell_result} |")
 
-    header = f"| หัวข้อ | {_escape_table_cell(_short_filename(filename_a))} | {_escape_table_cell(_short_filename(filename_b))} | ผล |"
+    header = "| หัวข้อ | ไฟล์ A | ไฟล์ B | ผล |"
     separator = "| --- | --- | --- | --- |"
     lines = [header, separator]
     for group in group_order:
@@ -3555,7 +3546,14 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             lines.append(f"| **{_escape_table_cell(group)}** | | | |")
         lines.extend(rows_by_group[group])
 
-    return "\n".join(lines)
+    # หัวคอลัมน์ตายตัว "ไฟล์ A"/"ไฟล์ B" (ไม่ตัดชื่อไฟล์ให้สั้นแล้ว — เคยใช้ _short_filename() ตัดเหลือ
+    # 24 ตัวแรก ทำให้ไฟล์ที่ขึ้นต้นเหมือนกันได้หัวคอลัมน์ซ้ำกัน แยกไม่ออกว่าคอลัมน์ไหนคือไฟล์ไหน) ชื่อเต็ม
+    # จริงแสดงเป็น 2 บรรทัดเหนือตารางแทน
+    filename_lines = (
+        f"ไฟล์ A: {_escape_table_cell(filename_a)}\n"
+        f"ไฟล์ B: {_escape_table_cell(filename_b)}\n\n"
+    )
+    return filename_lines + "\n".join(lines)
 
 
 def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
