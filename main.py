@@ -350,7 +350,8 @@ def contains_unexpected_script(text: str) -> bool:
 MAX_ANSWER_RETRIES = 2  # ลองใหม่ได้สูงสุดกี่ครั้งถ้าเจอภาษาแปลกปลอม ก่อนยอมส่งคำตอบล่าสุดกลับไป
 
 # ---------- Agentic Tools: Tax Calculator + Web Search (จำกัดเว็บราชการ) ----------
-MAX_TOOL_ITERATIONS = 5  # กันเผลอวน loop เรียก tool ไม่รู้จบ (ปกติ 1-2 รอบก็พอสำหรับงานนี้)
+MAX_TOOL_ITERATIONS = 8  # เดิม 5 — คำสั่งหลายขั้นแบบ "เปิดไฟล์จากคลังแล้วเปรียบเทียบ" ใช้จริง 4-5 รอบแล้ว
+# กันเผลอวน loop เรียก tool ไม่รู้จบ (งานทั่วไปปกติ 1-2 รอบก็พอ)
 
 # คำนวณภาษีขั้นบันไดด้วยโค้ด Python ล้วนๆ ไม่พึ่ง LLM คำนวณเองเด็ดขาด — กัน hallucination เรื่องตัวเลข
 PERSONAL_INCOME_TAX_BRACKETS = [
@@ -1021,9 +1022,21 @@ def run_agentic_tool_loop(
         if not tool_results:
             break  # ไม่มี custom tool ให้ execute (เช่นมีแค่ web_search ที่ resolve ไปแล้วที่ server) กันวน loop เปล่า
         messages.append({"role": "user", "content": tool_results})
+    else:
+        # for...else: ส่วนนี้ทำงานเฉพาะตอนวนครบ MAX_TOOL_ITERATIONS โดยไม่เคย break เลยสักครั้ง — แปลว่า
+        # ทุกรอบ Claude ยังขอเรียก tool อยู่ต่อเนื่อง (งานหลายขั้นเกินไปสำหรับเพดานที่ตั้งไว้) ถ้า stop_reason
+        # ล่าสุดยังเป็น tool_use อยู่ (ไม่ได้บังเอิญจบพอดีที่รอบสุดท้าย) ต้องบอกผู้ใช้ตรงๆ ไม่ปล่อยคำตอบว่าง/
+        # ขาดกลางคัน (response ล่าสุดมักมีแต่ tool_use block ไม่มี text block เลย -> text_parts จะว่างเปล่า)
+        if response.stop_reason == "tool_use":
+            return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
 
     text_parts = [block.text for block in response.content if block.type == "text"]
-    return "\n\n".join(text_parts).strip()
+    final_text = "\n\n".join(text_parts).strip()
+    if not final_text:
+        # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
+        # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
+        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
+    return final_text
 
 
 # ---------- ระยะ 3: AI Agent สำหรับจัดการ KB (เสนอ tag / ยุบรวม chunk) ----------
