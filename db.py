@@ -198,6 +198,18 @@ class EditableDocument(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)  # เขียนตอน insert = created_at + EDITABLE_DOCUMENT_EXPIRY_DAYS
 
 
+class ChatDocumentFocus(Base):
+    """ไฟล์ Excel ที่ 'กำลังโฟกัส' อยู่ในแชทหนึ่งๆ ตอนนี้ — ใช้เป็นค่า default เวลาคำสั่งผู้ใช้ไม่ได้ระบุไฟล์
+    ชัดเจน (เช่น "ไฟล์ที่แก้ไปเมื่อกี้") 1 แชทมีโฟกัสได้แค่ไฟล์เดียว ณ เวลาหนึ่ง (chat_id เป็น primary key ตรงๆ
+    แทนที่แถวเดิมเสมอเมื่อโฟกัสเปลี่ยน) อัปเดตทุกครั้งที่เปิด/แก้/เปรียบเทียบ/ดาวน์โหลดไฟล์ หรือเมื่อโค้ด
+    จับคู่ชื่อไฟล์จากข้อความผู้ใช้ได้ตรงไฟล์เดียวชัดเจน — ไม่ต้อง ALTER ตารางเดิมเลย เป็นตารางใหม่ล้วนๆ"""
+    __tablename__ = "chat_document_focus"
+
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    document_id = Column(Integer, ForeignKey("editable_documents.id", ondelete="CASCADE"), nullable=False)
+    updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class FileCategory(Base):
     """หมวดหมู่ (โฟลเดอร์) ของคลังไฟล์ Excel ที่แอดมินจัดการ — "None" ไม่ใช่แถวในตารางนี้
     (แทนด้วย library_files.category_id = NULL) ชื่อ "none" (ไม่สนตัวพิมพ์เล็กใหญ่) ถูกสงวนไว้
@@ -1102,6 +1114,7 @@ def _is_editable_document_expired(expires_at: Optional[datetime.datetime]) -> bo
 def _editable_document_to_dict(row) -> dict:
     return {
         "id": row.id,
+        "chat_id": row.chat_id,
         "filename": row.filename,
         "original_bytes": row.original_bytes,
         "label_map": row.label_map,
@@ -1167,6 +1180,32 @@ def update_editable_document_label_map(document_id: int, label_map: dict) -> boo
         row.label_map = label_map
         session.commit()
         return True
+
+
+def set_chat_document_focus(chat_id: int, document_id: int) -> None:
+    """ตั้ง/อัปเดตไฟล์ที่กำลังโฟกัสของแชทนี้ (upsert — 1 แชทมีโฟกัสได้แค่ไฟล์เดียว แทนที่แถวเดิมเสมอ)"""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        row = session.get(ChatDocumentFocus, chat_id)
+        if row is None:
+            row = ChatDocumentFocus(chat_id=chat_id, document_id=document_id, updated_at=now)
+            session.add(row)
+        else:
+            row.document_id = document_id
+            row.updated_at = now
+        session.commit()
+
+
+def get_chat_document_focus(chat_id: int, user_id: int) -> Optional[dict]:
+    """คืน EditableDocument dict ที่กำลังโฟกัสอยู่ในแชทนี้ หรือ None ถ้าไม่มีโฟกัส/เอกสารหมดอายุ/ถูกลบไปแล้ว/
+    ไม่ใช่ของ user คนนี้ — ไม่ raise ไม่ error เลย ถือว่า 'ไม่มีโฟกัส' เงียบๆ ให้ caller ตัดสินใจต่อเอง
+    (reuse get_editable_document() ตรงๆ เพื่อใช้ ownership+expiry check เดียวกันทั้งระบบ)"""
+    with SessionLocal() as session:
+        row = session.get(ChatDocumentFocus, chat_id)
+        if row is None:
+            return None
+        document_id = row.document_id
+    return get_editable_document(document_id, user_id)
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------
