@@ -87,6 +87,10 @@ from db import (
     LibraryDatabaseError,
     set_chat_document_focus,
     get_chat_document_focus,
+    get_library_file_meta,
+    get_all_library_file_meta,
+    get_library_file_ids_without_meta,
+    upsert_library_file_meta,
 )
 
 import os
@@ -483,19 +487,24 @@ LIBRARY_TOOLS = [
         "name": "list_library_files",
         "description": (
             "ค้นหาไฟล์ในคลังเอกสาร Excel ที่แอดมินเตรียมไว้ให้ผู้ใช้ ต้องเรียกเครื่องมือนี้ก่อนเสมอเมื่อผู้ใช้ขอเปิด "
-            "อ่าน เปรียบเทียบ หรือแก้ไฟล์ในคลัง ห้ามเดาชื่อไฟล์หรือ file_id เองเด็ดขาด "
-            "เรียกโดยไม่ต้องระบุ parameter ใดเลยได้ถ้าผู้ใช้แค่อยากดูว่ามีไฟล์อะไรบ้างทั้งหมด"
+            "อ่าน เปรียบเทียบ หรือแก้ไฟล์ในคลัง ห้ามเดาชื่อไฟล์หรือ file_id เองเด็ดขาด เรียกโดยไม่ต้องระบุ parameter "
+            "ใดเลยได้ถ้าผู้ใช้แค่อยากดูว่ามีไฟล์อะไรบ้างทั้งหมด ถ้ารู้ทั้งชื่อลูกค้าและประเภทเอกสาร(โฟลเดอร์) "
+            "ให้แยกส่งเป็น customer และ folder เสมอ แม่นยำกว่าใส่รวมกันใน text อย่างเดียว"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "category_name": {
+                "text": {
                     "type": "string",
-                    "description": "ชื่อหมวด/โฟลเดอร์ที่จะกรอง (ไม่บังคับ) ไม่สนตัวพิมพ์เล็กใหญ่ จับบางส่วนของชื่อได้",
+                    "description": "คำค้นหาทั่วไป (ไม่บังคับ) จับคู่กับชื่อไฟล์ ชื่อโฟลเดอร์ ชื่อลูกค้า ชื่อโครงการ และเลขอ้างอิงของไฟล์",
                 },
-                "name_query": {
+                "customer": {
                     "type": "string",
-                    "description": "คำค้นหาบางส่วนของชื่อไฟล์ (ไม่บังคับ) ไม่สนตัวพิมพ์เล็กใหญ่ จับบางส่วนของชื่อได้",
+                    "description": "ชื่อลูกค้า/บริษัทที่เอกสารนี้เกี่ยวข้อง (ไม่บังคับ) ส่งแยกจาก text ถ้ารู้ชื่อลูกค้าชัดเจน แม่นยำกว่า",
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "ชื่อโฟลเดอร์/ประเภทเอกสาร (ไม่บังคับ) ส่งแยกจาก text ถ้ารู้ประเภทเอกสารชัดเจน แม่นยำกว่า",
                 },
             },
             "required": [],
@@ -505,8 +514,9 @@ LIBRARY_TOOLS = [
         "name": "open_library_file",
         "description": (
             "เปิดไฟล์จากคลังเอกสารเข้ามาในแชทนี้เป็นสำเนาที่แก้ไข/เปรียบเทียบได้ ไม่แตะไฟล์ต้นฉบับในคลังเลย "
-            "ระบุได้ทั้ง file_id (ถ้ารู้แน่ชัดจาก list_library_files มาก่อนแล้ว) หรือ name_query (ให้ระบบจับคู่ "
-            "ชื่อไฟล์ให้เอง) อย่างใดอย่างหนึ่ง — ถ้า name_query ตรงหลายไฟล์พร้อมกัน จะได้รายชื่อกลับมาโดยไม่เปิด "
+            "ระบุได้ทั้ง file_id (ถ้ารู้แน่ชัดจาก list_library_files มาก่อนแล้ว) หรือ text/customer/folder (ให้ "
+            "ระบบค้นหาให้เอง) — ถ้ารู้ทั้งชื่อลูกค้าและประเภทเอกสาร(โฟลเดอร์) ให้แยกส่งเป็น customer และ folder "
+            "เสมอ แม่นยำกว่าใส่รวมกันใน text อย่างเดียว ถ้าผลลัพธ์มีมากกว่า 1 ไฟล์ จะได้รายชื่อกลับมาโดยไม่เปิด "
             "ไฟล์ไหนเลย ให้ถามผู้ใช้หรือเรียกใหม่ด้วย file_id ที่ชัดเจน ถ้าไฟล์ชื่อเดียวกันเปิดอยู่ในแชทนี้แล้ว "
             "จะใช้ตัวเดิม ไม่สร้างสำเนาซ้ำ หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
         ),
@@ -517,13 +527,17 @@ LIBRARY_TOOLS = [
                     "type": "integer",
                     "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของ list_library_files หรือ open_library_file ครั้งก่อน)",
                 },
-                "name_query": {
+                "text": {
                     "type": "string",
-                    "description": (
-                        "ส่งข้อความที่ผู้ใช้ใช้อ้างถึงไฟล์นี้ทั้งวลี (เช่น \"ใบประเมินของป่าไม้เขียว\" หรือ "
-                        "\"ใบเสนอราคาห้างทองร่ำรวย\") ไม่ใช่แค่ชื่อลูกค้าคำเดียว — ระบบจะตัดคำแล้วให้คะแนนจับคู่เอง "
-                        "ยิ่งส่งวลีที่มีบริบทครบ (ประเภทเอกสาร + ชื่อลูกค้า) ยิ่งจับคู่แม่นขึ้น ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด"
-                    ),
+                    "description": "คำค้นหาทั่วไปที่ผู้ใช้ใช้อ้างถึงไฟล์นี้ ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด",
+                },
+                "customer": {
+                    "type": "string",
+                    "description": "ชื่อลูกค้า/บริษัทที่เอกสารนี้เกี่ยวข้อง — ส่งแยกจาก text ถ้ารู้ชื่อลูกค้าชัดเจน แม่นยำกว่า",
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "ชื่อโฟลเดอร์/ประเภทเอกสาร — ส่งแยกจาก text ถ้ารู้ประเภทเอกสารชัดเจน แม่นยำกว่า",
                 },
             },
             "required": [],
@@ -532,73 +546,157 @@ LIBRARY_TOOLS = [
 ]
 
 
-def execute_list_library_files(tool_input: dict) -> dict:
-    """ค้นหาไฟล์ในคลัง — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ library_files เลย
-    จับคู่ category_name/name_query แบบ case-insensitive และเป็นส่วนหนึ่งของชื่อได้ (ไม่ต้องตรงเป๊ะ)"""
-    category_name = (tool_input.get("category_name") or "").strip().lower()
-    name_query = (tool_input.get("name_query") or "").strip().lower()
-
-    files = get_library_files()
-    categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
-
-    results = []
-    for f in files:
-        cat_name = categories.get(f["category_id"], "None")
-        if category_name and category_name not in cat_name.lower():
-            continue
-        if name_query and name_query not in f["filename"].lower():
-            continue
-        results.append({
-            "file_id": f["id"],
-            "filename": f["filename"],
-            "category": cat_name,
-            "summary": f["summary"],
-            "has_macros": _library_file_has_macros(f),
-        })
-
-    return {"files": results}
-
-
-# คำทั่วไปที่ไม่ช่วยระบุว่าผู้ใช้หมายถึงไฟล์ไหน — ตัดทิ้งก่อนให้คะแนนใน _score_library_files_by_name_query
+# คำทั่วไปที่ไม่ช่วยระบุว่าผู้ใช้หมายถึงไฟล์ไหน — ตัดทิ้งก่อนให้คะแนนใน search_library_files
 # (กันคำเหล่านี้ไปบวกคะแนนปลอมให้ทุกไฟล์เท่าๆ กัน ซึ่งไม่ช่วยแยกไฟล์เลย)
 _LIBRARY_QUERY_STOPWORDS = {
     "เปิด", "ดู", "อ่าน", "ไฟล์", "ของ", "ด้วย", "และ", "ให้", "หน่อย", "ขอ", "แล้ว", "เปรียบเทียบ", "แก้",
 }
 
+# วรรณยุกต์ไทย (่ ้ ๊ ๋) และไม้ไต่คู้ (็) — ตัดออกก่อนเทียบกันคีย์คำค้นหา/ชื่อไฟล์ต่างกันแค่พิมพ์ผิดวรรณยุกต์
+_THAI_TONE_MARKS_RE = re.compile("[่้๊๋็]")
 
-def _tokenize_library_query(name_query: str) -> list[str]:
-    """ตัดคำ name_query ด้วย pythainlp (engine='newmm') แล้วกรองคำที่ไม่ช่วยระบุไฟล์ออก: ช่องว่างล้วน/สั้นกว่า
-    2 ตัวอักษร และคำทั่วไปใน _LIBRARY_QUERY_STOPWORDS — ใช้ให้คะแนนไฟล์ใน _score_library_files_by_name_query"""
-    tokens = word_tokenize(name_query, engine="newmm")
+# คำนำหน้า/สถานะนิติบุคคลที่ผู้ใช้มักพิมพ์ปนมากับชื่อลูกค้า แต่ชื่อไฟล์/ข้อมูลประกอบมักไม่มีคำเหล่านี้ —
+# ตัดออกเฉพาะตอนเทียบชื่อลูกค้าเท่านั้น (ไม่ใช้กับ text/folder ทั่วไป)
+_CUSTOMER_NAME_NOISE_WORDS = ("บริษัท", "จำกัด", "บจก.", "หจก.")
+
+
+def _normalize_library_search_text(text: str) -> str:
+    """normalize ข้อความก่อนเทียบใน search_library_files — ตัวพิมพ์เล็ก ตัดวรรณยุกต์ไทย/ไม้ไต่คู้ (กันพิมพ์ผิด
+    วรรณยุกต์ทำให้หาไม่เจอ) แล้วยุบช่องว่างซ้ำ/ตัดหัวท้าย"""
+    result = (text or "").lower()
+    result = _THAI_TONE_MARKS_RE.sub("", result)
+    result = re.sub(r"\s+", " ", result).strip()
+    return result
+
+
+def _normalize_customer_name(name: str) -> str:
+    """เหมือน _normalize_library_search_text แต่ตัดคำว่า บริษัท/จำกัด/บจก./หจก. ออกด้วย — ใช้เทียบชื่อลูกค้า
+    เท่านั้น (ผู้ใช้มักพิมพ์ "บริษัท ป่าไม้เขียว จำกัด" ทั้งที่ไฟล์/ข้อมูลประกอบระบุแค่ "ป่าไม้เขียว")"""
+    result = _normalize_library_search_text(name)
+    for word in _CUSTOMER_NAME_NOISE_WORDS:
+        result = result.replace(word, " ")
+    return re.sub(r"\s+", " ", result).strip()
+
+
+def _tokenize_library_query(text: str) -> list[str]:
+    """ตัดคำด้วย pythainlp (engine='newmm') แล้ว normalize ทีละ token (ดู _normalize_library_search_text —
+    กันพิมพ์ผิดวรรณยุกต์) กรองคำที่ไม่ช่วยระบุไฟล์ออก: ช่องว่างล้วน/สั้นกว่า 2 ตัวอักษร และคำทั่วไปใน
+    _LIBRARY_QUERY_STOPWORDS — ใช้ให้คะแนนไฟล์ใน search_library_files"""
+    tokens = word_tokenize(text, engine="newmm")
     result = []
     for tok in tokens:
-        tok = tok.strip().lower()
+        tok = _normalize_library_search_text(tok)
         if len(tok) < 2 or tok in _LIBRARY_QUERY_STOPWORDS:
             continue
         result.append(tok)
     return result
 
 
-def _score_library_files_by_name_query(name_query: str, files: list[dict], categories: dict) -> list[tuple[dict, int]]:
-    """ให้คะแนนไฟล์ในคลังจาก token ที่ตัดคำแล้วของ name_query (ดู _tokenize_library_query) คะแนนของแต่ละไฟล์
-    = จำนวน token ที่พบเป็นส่วนหนึ่งของชื่อไฟล์หรือชื่อโฟลเดอร์ (normalize ตัวพิมพ์เล็ก/ช่องว่างซ้ำแล้ว) คืน
-    list (ไฟล์, คะแนน) เฉพาะไฟล์ที่คะแนน > 0 เท่านั้น เรียงคะแนนมากไปน้อย — ไม่มี token เหลือเลยหรือไม่มีไฟล์
-    ไหนได้คะแนน คืน list ว่าง"""
-    tokens = _tokenize_library_query(name_query)
-    if not tokens:
+def _find_similar_library_files(query: str, files: list[dict], limit: int = 3) -> list[dict]:
+    """ไม่พบไฟล์ตรงเงื่อนไขเลยใน search_library_files — เสนอไฟล์ที่ชื่อไฟล์หรือชื่อลูกค้าใกล้เคียง query
+    มากที่สุด limit ไฟล์ (difflib string similarity ล้วนๆ ไม่ใช่ AI) คืน list ของไฟล์ (รูปแบบเดียวกับ
+    search_library_files) เรียงความใกล้เคียงมากไปน้อย"""
+    if not query or not files:
         return []
-
+    normalized_query = _normalize_library_search_text(query)
     scored = []
-    for f in files:
-        folder_name = categories.get(f["category_id"], "") or ""
-        filename_haystack = re.sub(r"\s+", " ", f["filename"].lower())
-        folder_haystack = re.sub(r"\s+", " ", folder_name.lower())
-        score = sum(1 for tok in tokens if tok in filename_haystack or tok in folder_haystack)
-        if score > 0:
-            scored.append((f, score))
-
+    for item in files:
+        candidates = [item["filename"]]
+        if item.get("customer_name"):
+            candidates.append(item["customer_name"])
+        best_ratio = max(
+            difflib.SequenceMatcher(None, normalized_query, _normalize_library_search_text(c)).ratio()
+            for c in candidates
+        )
+        scored.append((item, best_ratio))
     scored.sort(key=lambda pair: pair[1], reverse=True)
-    return scored
+    return [item for item, _ in scored[:limit]]
+
+
+def search_library_files(
+    text: Optional[str] = None, customer: Optional[str] = None, folder: Optional[str] = None
+) -> dict:
+    """ฟังก์ชันค้นกลางตัวเดียวสำหรับคลังไฟล์ — ใช้ร่วมกันทั้ง execute_list_library_files และ
+    execute_open_library_file แทนการเดาจากชื่อไฟล์เพียงอย่างเดียว (จำเป็นเมื่อคลังสะสมเอกสารจากหลายบริษัท/
+    โครงการจนชื่อไฟล์ไม่พอแยกไฟล์ได้แม่นยำอีกต่อไป) รวม library_files กับข้อมูลประกอบใน library_file_meta
+    (ลูกค้า/โครงการ/เลขอ้างอิง) เข้าด้วยกันก่อนค้น
+
+    - customer: กรองไฟล์ที่ customer_name (หรือชื่อไฟล์ถ้าไม่มี customer_name) หลัง normalize ด้วย
+      _normalize_customer_name มี customer เป็นส่วนหนึ่ง หรือกลับกัน
+    - folder: กรองไฟล์ที่ชื่อโฟลเดอร์หลัง normalize มี folder เป็นส่วนหนึ่ง
+    - text: ตัดคำแล้วให้คะแนนแบบเดียวกับที่ _tokenize_library_query ใช้ เทียบกับชื่อไฟล์+ชื่อโฟลเดอร์+
+      customer_name+project_name+reference_no หลัง normalize รวมกัน เรียงคะแนนมากไปน้อย
+    - ไม่พบไฟล์เลยทั้งที่ระบุเงื่อนไขมาอย่างน้อยหนึ่งอย่าง: คืนชื่อไฟล์/ชื่อลูกค้าที่ใกล้เคียงที่สุด 3 รายการ
+      (ดู _find_similar_library_files) พร้อม not_found=True
+
+    คืน {"files": [...], "not_found": bool, "similar": [...]} — แต่ละไฟล์ใน files/similar คืน file_id,
+    filename, folder, customer_name, project_name, reference_no, summary, has_macros"""
+    categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
+    meta_map = get_all_library_file_meta()
+
+    enriched = []
+    for f in get_library_files():
+        meta = meta_map.get(f["id"], {})
+        folder_name = categories.get(f["category_id"]) or "ไม่มีหมวดหมู่"
+        enriched.append({
+            "file_id": f["id"],
+            "filename": f["filename"],
+            "folder": folder_name,
+            "customer_name": meta.get("customer_name"),
+            "project_name": meta.get("project_name"),
+            "reference_no": meta.get("reference_no"),
+            "summary": f["summary"],
+            "has_macros": _library_file_has_macros(f),
+        })
+
+    candidates = enriched
+
+    if customer:
+        normalized_customer = _normalize_customer_name(customer)
+        filtered = []
+        for item in candidates:
+            normalized_source = _normalize_customer_name(item["customer_name"] or item["filename"])
+            if normalized_customer in normalized_source or normalized_source in normalized_customer:
+                filtered.append(item)
+        candidates = filtered
+
+    if folder:
+        normalized_folder = _normalize_library_search_text(folder)
+        candidates = [
+            item for item in candidates
+            if normalized_folder in _normalize_library_search_text(item["folder"])
+        ]
+
+    if text:
+        tokens = _tokenize_library_query(text)
+        if not tokens:
+            candidates = []
+        else:
+            scored = []
+            for item in candidates:
+                haystack = _normalize_library_search_text(" ".join([
+                    item["filename"], item["folder"], item["customer_name"] or "",
+                    item["project_name"] or "", item["reference_no"] or "",
+                ]))
+                score = sum(1 for tok in tokens if tok in haystack)
+                if score > 0:
+                    scored.append((item, score))
+            scored.sort(key=lambda pair: pair[1], reverse=True)
+            candidates = [item for item, _ in scored]
+
+    if candidates or not (text or customer or folder):
+        return {"files": candidates, "not_found": False, "similar": []}
+
+    similar = _find_similar_library_files(text or customer or folder, enriched)
+    return {"files": [], "not_found": True, "similar": similar}
+
+
+def execute_list_library_files(tool_input: dict) -> dict:
+    """ค้นหาไฟล์ในคลัง — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ library_files/library_file_meta เลย
+    เป็น wrapper บาง ๆ ของ search_library_files() (ดูด้านบน)"""
+    return search_library_files(
+        text=tool_input.get("text"), customer=tool_input.get("customer"), folder=tool_input.get("folder"),
+    )
 
 
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
@@ -606,35 +704,40 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
     library_files เลยไม่ว่าทางไหน (ต้นฉบับในคลังไม่ถูกแก้เด็ดขาด) caller (run_agentic_tool_loop) รับประกัน
     แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง
 
-    รับ file_id ตรงๆ หรือ name_query (ให้โค้ดให้คะแนนจับคู่เอง — ดู _score_library_files_by_name_query)
-    อย่างใดอย่างหนึ่ง — ไฟล์คะแนนสูงสุดมีไฟล์เดียวและ > 0 เปิดไฟล์นั้นเลย คะแนนสูงสุดเสมอกันหลายไฟล์ คืนรายชื่อ
-    ไฟล์ที่เสมอกันโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้
-    Claude เลือก file_id ผิด) ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน (normalize แล้ว) เปิดอยู่ใน
-    แชทนี้แล้วหรือยัง ถ้ามีให้ใช้ตัวเดิมแทนที่จะสร้างซ้ำ (แก้ปัญหาที่เคยเจอ: เปิดไฟล์เดิมซ้ำสองครั้งในแชทเดียว)"""
+    รับ file_id ตรงๆ หรือ text/customer/folder (ให้ search_library_files() ค้นให้เอง) อย่างใดอย่างหนึ่ง —
+    ผลค้นเหลือไฟล์เดียวเปิดไฟล์นั้นเลย เหลือหลายไฟล์คืนรายชื่อที่เจอโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ
+    (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้ Claude เลือก file_id ผิด) ไม่เจอเลยคืนชื่อไฟล์ใกล้เคียง
+    ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน (normalize แล้ว) เปิดอยู่ในแชทนี้แล้วหรือยัง ถ้ามีให้ใช้
+    ตัวเดิมแทนที่จะสร้างซ้ำ (แก้ปัญหาที่เคยเจอ: เปิดไฟล์เดิมซ้ำสองครั้งในแชทเดียว)"""
     file_id = tool_input.get("file_id")
-    name_query = (tool_input.get("name_query") or "").strip()
+    text = tool_input.get("text")
+    customer = tool_input.get("customer")
+    folder = tool_input.get("folder")
 
-    if file_id is None and not name_query:
-        return {"error": "ต้องระบุ file_id หรือ name_query อย่างน้อยหนึ่งอย่าง"}
+    if file_id is None and not (text or customer or folder):
+        return {"error": "ต้องระบุ file_id หรือ text/customer/folder อย่างน้อยหนึ่งอย่าง"}
 
     if file_id is not None:
         file_row = get_library_file(file_id)
         if file_row is None:
             return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
     else:
-        categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
-        scored = _score_library_files_by_name_query(name_query, get_library_files(), categories)
-        if not scored:
-            return {"error": f"ไม่พบไฟล์ที่ตรงกับ '{name_query}' ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
-        top_score = scored[0][1]
-        top_matches = [f for f, score in scored if score == top_score]
-        if len(top_matches) > 1:
+        result = search_library_files(text=text, customer=customer, folder=folder)
+        files = result["files"]
+        if not files:
+            if result["similar"]:
+                names = ", ".join(f"'{f['filename']}'" for f in result["similar"])
+                return {"error": f"ไม่พบไฟล์ที่ตรงกับเงื่อนไขนี้ในคลัง ไฟล์ที่ชื่อใกล้เคียงที่สุด: {names}"}
+            return {"error": "ไม่พบไฟล์ที่ตรงกับเงื่อนไขนี้ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
+        if len(files) > 1:
             return {
                 "matched_multiple": True,
-                "files": [{"file_id": f["id"], "filename": f["filename"]} for f in top_matches],
-                "message": f"พบ {len(top_matches)} ไฟล์ที่ตรงกับ '{name_query}' พอๆ กัน กรุณาระบุให้ชัดเจนขึ้น หรือเรียกใหม่ด้วย file_id ที่ต้องการจากรายการนี้",
+                "files": [{"file_id": f["file_id"], "filename": f["filename"]} for f in files],
+                "message": f"พบ {len(files)} ไฟล์ที่ตรงกับเงื่อนไขนี้ ยังไม่ได้เปิดไฟล์ใด ต้องถามผู้ใช้ว่าหมายถึงไฟล์ไหน",
             }
-        file_row = top_matches[0]
+        file_row = get_library_file(files[0]["file_id"])
+        if file_row is None:
+            return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
 
     # กันเปิดไฟล์ชื่อเดียวกันซ้ำในแชทเดียวกัน — ถ้ามีอยู่แล้วให้ใช้ตัวเดิม ไม่สร้าง EditableDocument ใหม่
     target_normalized_name = _normalize_filename_for_matching(file_row["filename"])
@@ -1329,6 +1432,11 @@ LIBRARY_LOGGED_IN_RULES = (
     "- เมื่อคุณถามกลับว่าหมายถึงไฟล์ไหน แล้วผู้ใช้ตอบยืนยัน (เช่น \"ใช่\", \"ใช่ไฟล์นั้น\") ให้เรียก "
     "open_library_file เปิดไฟล์ที่ถามไปทันที ห้ามถามยืนยันซ้ำอีก\n"
     "- ถ้ายังไม่ได้เปิดไฟล์ (ไม่มีผลจาก tool ยืนยัน) ห้ามอธิบายว่าเอกสารประเภทนี้มักมีเนื้อหาอะไรจากความรู้ทั่วไป\n"
+    "- รายชื่อไฟล์ในคลังที่ให้ไว้ด้านล่างเป็นข้อมูลจริง ห้ามบอกว่าไม่มีไฟล์ใดถ้าไฟล์นั้นอยู่ในรายชื่อนี้ "
+    "ถ้าเครื่องมือค้น (list_library_files/open_library_file) ไม่เจอ ให้ลองค้นใหม่โดยแยกส่ง customer "
+    "และ folder ออกจากกันก่อนสรุปว่าไม่พบ\n"
+    "- เมื่อเครื่องมือค้นคืนผลมาหลายไฟล์ ห้ามเลือกไฟล์เองเด็ดขาด ต้องถามผู้ใช้ก่อนทุกครั้ง\n"
+    "- ก่อนบอกผู้ใช้ว่าไฟล์ไหนเปิดอยู่ในแชทนี้ ต้องเรียก list_chat_documents ก่อนเสมอ ห้ามเดาจากความจำ\n"
 )
 
 LIBRARY_GUEST_RULES = (
@@ -1339,10 +1447,11 @@ LIBRARY_GUEST_RULES = (
 
 
 def _build_library_file_listing_text(limit: int = 50) -> str:
-    """สร้างข้อความรายชื่อไฟล์ในคลังจัดตามโฟลเดอร์ (ชื่อโฟลเดอร์ + ชื่อไฟล์เท่านั้น ไม่ใส่ summary) ต่อท้าย
-    system prompt ให้ผู้ล็อกอิน สร้างใหม่จาก DB จริงทุกครั้งที่เรียก (ผ่าน execute_list_library_files()) ไม่แคช
-    ไว้ กันกรณีแอดมินเพิ่ม/ลบ/ย้ายไฟล์แล้วเห็นผลไม่ทันที จำกัดไว้ไม่เกิน limit ไฟล์ ถ้าเกินบอกจำนวนที่เหลือ
-    ถ้าดึงรายชื่อล้มเหลว (เช่น DB มีปัญหาชั่วคราว) คืนสตริงว่างเงียบๆ ไม่ทำให้ทั้งคำขอล้มเพราะเรื่องนี้"""
+    """สร้างข้อความรายชื่อไฟล์ในคลังจัดตามโฟลเดอร์ต่อท้าย system prompt ให้ผู้ล็อกอิน แต่ละไฟล์แสดงเป็น
+    "ชื่อไฟล์ | ลูกค้า: ... | เลขอ้างอิง: ..." (ข้ามส่วนที่ไม่มีข้อมูล) สร้างใหม่จาก DB จริงทุกครั้งที่เรียก
+    (ผ่าน execute_list_library_files()) ไม่แคชไว้ กันกรณีแอดมินเพิ่ม/ลบ/ย้ายไฟล์แล้วเห็นผลไม่ทันที จำกัดไว้
+    ไม่เกิน limit ไฟล์ ถ้าเกินบอกจำนวนที่เหลือ ถ้าดึงรายชื่อล้มเหลว (เช่น DB มีปัญหาชั่วคราว) คืนสตริงว่างเงียบๆ
+    ไม่ทำให้ทั้งคำขอล้มเพราะเรื่องนี้"""
     try:
         files = execute_list_library_files({}).get("files", [])
     except Exception:
@@ -1353,10 +1462,13 @@ def _build_library_file_listing_text(limit: int = 50) -> str:
 
     by_folder: dict[str, list[str]] = {}
     for f in files:
-        folder = f.get("category") or "ไม่มีหมวดหมู่"
-        if folder == "None":  # ดู execute_list_library_files — categories.get(None, "None") คืนสตริงนี้ตรงๆ
-            folder = "ไม่มีหมวดหมู่"
-        by_folder.setdefault(folder, []).append(f["filename"])
+        folder = f.get("folder") or "ไม่มีหมวดหมู่"
+        parts = [f["filename"]]
+        if f.get("customer_name"):
+            parts.append(f"ลูกค้า: {f['customer_name']}")
+        if f.get("reference_no"):
+            parts.append(f"เลขอ้างอิง: {f['reference_no']}")
+        by_folder.setdefault(folder, []).append(" | ".join(parts))
 
     total = len(files)
     shown = 0
@@ -1365,10 +1477,10 @@ def _build_library_file_listing_text(limit: int = 50) -> str:
         if shown >= limit:
             break
         lines.append(f"- โฟลเดอร์ {folder}:")
-        for filename in by_folder[folder]:
+        for line in by_folder[folder]:
             if shown >= limit:
                 break
-            lines.append(f"  - {filename}")
+            lines.append(f"  - {line}")
             shown += 1
 
     if total > limit:
@@ -1592,6 +1704,14 @@ class FileCategoryRename(BaseModel):
 class LibraryFileUpdate(BaseModel):
     filename: str
     category_id: Optional[int] = None
+
+class LibraryFileMetaUpdate(BaseModel):
+    customer_name: Optional[str] = None
+    project_name: Optional[str] = None
+    reference_no: Optional[str] = None
+
+class LibraryMetaGenerateRequest(BaseModel):
+    file_id: Optional[int] = None
 
 class AgentJobStart(BaseModel):
     action_type: str  # "suggest_tags" | "merge_chunks"
@@ -3932,24 +4052,97 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
 FILE_LIBRARY_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB ต่อไฟล์
 
 
-def _summarize_library_file_labels(label_map: dict) -> Optional[str]:
-    """สรุป label_map เป็นข้อความสั้น 1-2 ประโยค (ไม่เกิน 200 ตัวอักษร) ด้วย Claude Haiku
-    คืน None ถ้าเรียก Claude ไม่สำเร็จ (import ไฟล์ยังสำเร็จตามปกติ แค่ไม่มี summary — ตามที่กำหนดไว้)"""
+def _extract_library_file_cell_text(raw_bytes: bytes, max_chars: int = 6000) -> str:
+    """อ่านข้อความทุกเซลล์ที่ไม่ว่างของไฟล์ Excel ทุกชีต (openpyxl data_only=True) — ครอบคลุมกว่า label_map
+    จาก _extract_excel_labels เพราะข้อมูลลูกค้า/โครงการ/เลขอ้างอิงมักอยู่เป็นหัวเอกสารที่ไม่ตรงรูปแบบแถว
+    label:value พอดี 2 เซลล์ ต่อกันด้วยช่องว่าง ตัดรวมไม่เกิน max_chars ตัวอักษร กันพรอมต์ยาวเกินสำหรับไฟล์ใหญ่
+    คืนสตริงว่างเงียบๆ ถ้าอ่านไฟล์ไม่ได้ (ไม่ raise ออกไปรบกวน caller)"""
     try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+    except Exception:
+        return ""
+
+    parts = []
+    total_len = 0
+    for sheet_name in wb.sheetnames:
+        for row in wb[sheet_name].iter_rows():
+            for cell in row:
+                if cell.value is None:
+                    continue
+                text = str(cell.value).strip()
+                if not text:
+                    continue
+                parts.append(text)
+                total_len += len(text)
+                if total_len >= max_chars:
+                    break
+            if total_len >= max_chars:
+                break
+        if total_len >= max_chars:
+            break
+
+    return " ".join(parts)[:max_chars]
+
+
+def _clean_library_meta_field(value) -> Optional[str]:
+    """ทำความสะอาดค่า field ข้อมูลประกอบที่ Claude ตอบกลับมา (ดู _extract_library_file_summary_and_metadata/
+    _extract_library_file_metadata) — ค่าที่ไม่ใช่ string ที่มีเนื้อหาจริง (เช่น null, "", ตัวเลข) ถือว่าไม่พบ"""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value else None
+
+
+def _extract_library_file_summary_and_metadata(
+    label_map: dict, raw_bytes: bytes, include_summary: bool = True
+) -> tuple[Optional[str], dict]:
+    """เรียก Claude Haiku ครั้งเดียวขอทั้ง summary (ถ้า include_summary) และข้อมูลประกอบ (customer_name,
+    project_name, reference_no) จาก label_map + ข้อความทุกเซลล์ของไฟล์ (ดู _extract_library_file_cell_text
+    — ครอบคลุมกว่า label_map เพียงอย่างเดียว) ใช้ตอน import ไฟล์ใหม่ (include_summary=True — รวมเป็นเรียก
+    Claude ครั้งเดียวกับการสร้าง summary กันเรียกซ้ำสองรอบต่อไฟล์) และตอนสร้างข้อมูลประกอบย้อนหลังให้ไฟล์ที่
+    import ไปแล้ว (include_summary=False — มี summary อยู่แล้ว ไม่ต้องขอซ้ำ)
+
+    ค่าไหนไม่พบในเอกสารจริงเป็น null ห้ามเดา คืน (summary, meta) — summary เป็น None ถ้า include_summary=False
+    เสมอ เรียกหรือ parse ไม่สำเร็จ คืน (None, {ทุกฟิลด์เป็น None}) ไม่ raise ออกไป (import ต้องสำเร็จตามปกติ)"""
+    empty_meta = {"customer_name": None, "project_name": None, "reference_no": None}
+    try:
+        cell_text = _extract_library_file_cell_text(raw_bytes)
+        summary_field = (
+            '"summary": "สรุปว่าไฟล์นี้เกี่ยวกับอะไร เป็นภาษาไทย สั้นๆ 1-2 ประโยค ไม่เกิน 200 ตัวอักษร", '
+            if include_summary else ""
+        )
         prompt = (
             f"label และค่าทั้งหมดในไฟล์ Excel นี้ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
-            "สรุปว่าไฟล์นี้เกี่ยวกับอะไรเป็นภาษาไทย สั้นๆ 1-2 ประโยค ไม่เกิน 200 ตัวอักษร "
-            "ตอบแค่ข้อความสรุปเท่านั้น ห้ามมีคำนำ ห้ามใช้ Markdown"
+            f"ข้อความทั้งหมดในทุกเซลล์ของไฟล์ (อาจถูกตัดถ้ายาวเกิน):\n{cell_text}\n\n"
+            "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON ห้ามใช้ Markdown รูปแบบ:\n"
+            "{" + summary_field +
+            '"customer_name": "ชื่อลูกค้า/บริษัทที่เอกสารนี้ทำขึ้นให้ หรือ null ถ้าไม่พบในเอกสาร", '
+            '"project_name": "ชื่อโครงการ/งานที่เอกสารนี้เกี่ยวข้อง หรือ null ถ้าไม่พบ", '
+            '"reference_no": "เลขที่เอกสาร/เลขอ้างอิงของเอกสารนี้ หรือ null ถ้าไม่พบ"}\n'
+            "ห้ามเดาค่าที่ไม่มีอยู่จริงในเอกสารเด็ดขาด ไม่พบให้ใส่ null เท่านั้น"
         )
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=150,
+            max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )
-        summary = response.content[0].text.strip()
-        return summary[:200] if summary else None
+        parsed = _parse_json_response(response.content[0].text.strip(), dict)
+        if parsed is None:
+            return None, empty_meta
+
+        summary = None
+        if include_summary:
+            summary = _clean_library_meta_field(parsed.get("summary"))
+            summary = summary[:200] if summary else None
+
+        meta = {
+            "customer_name": _clean_library_meta_field(parsed.get("customer_name")),
+            "project_name": _clean_library_meta_field(parsed.get("project_name")),
+            "reference_no": _clean_library_meta_field(parsed.get("reference_no")),
+        }
+        return summary, meta
     except Exception:
-        return None
+        return None, empty_meta
 
 
 # ---------- File Library: หมวดหมู่ (โฟลเดอร์) ----------
@@ -4045,7 +4238,7 @@ async def import_library_files(
                 results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ไม่สำเร็จ: ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้"})
                 continue
 
-            summary = _summarize_library_file_labels(label_map)
+            summary, meta = _extract_library_file_summary_and_metadata(label_map, raw, include_summary=True)
             try:
                 file_id = add_library_file(
                     filename=filename, category_id=category_id, raw_bytes=raw, label_map=label_map, summary=summary,
@@ -4058,6 +4251,12 @@ async def import_library_files(
                 print(f"[FileLibrary] save step failed for filename={filename!r}: {type(e).__name__}: {e}")
                 results.append({"filename": filename, "ok": False, "error": "บันทึกข้อมูลไม่สำเร็จ: บันทึกข้อมูลไฟล์ลงฐานข้อมูลไม่ได้"})
                 continue
+
+            # ข้อมูลประกอบเป็นค่าว่างได้ถ้า Claude เรียกหรือ parse ไม่สำเร็จ (ดู _extract_library_file_summary_and_metadata)
+            # — import ยังถือว่าสำเร็จตามปกติเสมอ ไม่ว่าจะเขียนแถวนี้สำเร็จหรือไม่
+            upsert_library_file_meta(
+                file_id, meta["customer_name"], meta["project_name"], meta["reference_no"], source="ai",
+            )
 
             results.append({"filename": filename, "ok": True, "file_id": file_id, "summary": summary})
 
@@ -4085,12 +4284,78 @@ def list_library_files_endpoint(category_id: Optional[str] = None, _: bool = Dep
 
     # ไม่ส่ง label_map/storage_key กลับไปหน้าเว็บ (ไม่จำเป็นต่อการแสดงรายการ ตัดออกลด payload) แต่เพิ่ม
     # has_macros เข้าไปแทน (derive จากนามสกุลของ storage_key ก่อนตัดทิ้ง — ดู _library_file_has_macros)
+    # และข้อมูลประกอบจาก library_file_meta (ไฟล์ที่ยังไม่มีข้อมูลประกอบเลย ได้ค่าเป็น null ทั้งหมด)
+    meta_map = get_all_library_file_meta()
     response_files = []
     for f in files:
         item = {k: v for k, v in f.items() if k not in ("label_map", "storage_key")}
         item["has_macros"] = _library_file_has_macros(f)
+        meta = meta_map.get(f["id"], {})
+        item["customer_name"] = meta.get("customer_name")
+        item["project_name"] = meta.get("project_name")
+        item["reference_no"] = meta.get("reference_no")
+        item["meta_source"] = meta.get("source")
         response_files.append(item)
     return {"files": response_files}
+
+
+@app.put("/admin/api/file-library/files/{file_id}/meta")
+def update_library_file_meta_endpoint(file_id: int, body: LibraryFileMetaUpdate, _: bool = Depends(require_login)):
+    """แอดมินแก้ข้อมูลประกอบ (ลูกค้า/โครงการ/เลขอ้างอิง) รายไฟล์ตรงๆ เสมอตั้ง source="admin" — ไฟล์ที่ source
+    เป็น "admin" แล้วจะไม่ถูกเขียนทับด้วยการสร้างอัตโนมัติผ่าน /meta/generate อีก (ดู upsert_library_file_meta
+    ใน db.py และ generate_library_file_meta_endpoint ด้านล่าง)"""
+    if get_library_file(file_id) is None:
+        raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
+
+    def _clean(value: Optional[str]) -> Optional[str]:
+        value = (value or "").strip()
+        return value or None
+
+    ok = upsert_library_file_meta(
+        file_id,
+        customer_name=_clean(body.customer_name),
+        project_name=_clean(body.project_name),
+        reference_no=_clean(body.reference_no),
+        source="admin",
+    )
+    if not ok:
+        raise HTTPException(status_code=400, detail="บันทึกข้อมูลประกอบไม่สำเร็จ")
+    return {"status": "updated"}
+
+
+@app.post("/admin/api/file-library/meta/generate")
+def generate_library_file_meta_endpoint(body: LibraryMetaGenerateRequest, _: bool = Depends(require_login)):
+    """สร้างข้อมูลประกอบ (ลูกค้า/โครงการ/เลขอ้างอิง) ให้ไฟล์ที่ import ไปแล้วแต่ยังไม่มีข้อมูลประกอบเลย — ระบุ
+    file_id มาสร้างเฉพาะไฟล์นั้น (ถ้ายังไม่มี) ไม่ระบุ = สร้างให้ทุกไฟล์ในคลังที่ยังไม่มี ไฟล์ที่มีข้อมูลประกอบ
+    อยู่แล้วไม่ว่า source ใด (ai หรือ admin) จะไม่ถูกแตะเลย กันเขียนทับข้อมูลที่แอดมินแก้ไว้เองโดยไม่ตั้งใจ"""
+    if body.file_id is not None:
+        if get_library_file(body.file_id) is None:
+            raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
+        if get_library_file_meta(body.file_id) is not None:
+            return {"results": []}
+        target_ids = [body.file_id]
+    else:
+        target_ids = get_library_file_ids_without_meta()
+
+    results = []
+    for file_id in target_ids:
+        file_row = get_library_file(file_id)
+        if file_row is None:
+            continue
+        try:
+            raw = storage_get(file_row["storage_key"])
+        except Exception as e:
+            print(f"[FileLibrary] meta generate: storage_get failed for file_id={file_id}: {type(e).__name__}")
+            results.append({"file_id": file_id, "filename": file_row["filename"], "ok": False})
+            continue
+
+        _, meta = _extract_library_file_summary_and_metadata(file_row["label_map"], raw, include_summary=False)
+        upsert_library_file_meta(
+            file_id, meta["customer_name"], meta["project_name"], meta["reference_no"], source="ai",
+        )
+        results.append({"file_id": file_id, "filename": file_row["filename"], "ok": True, **meta})
+
+    return {"results": results}
 
 
 @app.put("/admin/api/file-library/files/{file_id}")

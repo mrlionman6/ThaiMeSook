@@ -1554,8 +1554,17 @@ async function loadFileLibraryFiles() {
 
             const macroBadge = f.has_macros ? '<span class="file-library-macro-badge">มีมาโคร</span>' : "";
 
+            const metaParts = [];
+            if (f.customer_name) metaParts.push(`ลูกค้า: ${escapeHtml(f.customer_name)}`);
+            if (f.project_name) metaParts.push(`โครงการ: ${escapeHtml(f.project_name)}`);
+            if (f.reference_no) metaParts.push(`เลขอ้างอิง: ${escapeHtml(f.reference_no)}`);
+            const metaLine = metaParts.length
+                ? `<p class="ts-note">${metaParts.join(" | ")}</p>`
+                : `<p class="ts-note">(ไม่มีข้อมูลประกอบ)</p>`;
+
             row.innerHTML = `
                 <p><strong>${escapeHtml(f.filename)}</strong> ${macroBadge}</p>
+                ${metaLine}
                 <p class="ts-note">${f.summary ? escapeHtml(f.summary) : "(ไม่มี summary)"}</p>
                 <p class="ts-note">อัปโหลดเมื่อ ${escapeHtml(String(f.uploaded_at))}</p>
                 <div class="file-library-file-actions">
@@ -1566,6 +1575,7 @@ async function loadFileLibraryFiles() {
                     </select>
                     <button type="button" onclick="moveLibraryFile(${f.id})">ย้าย</button>
                     <button type="button" onclick="renameLibraryFilePrompt(${f.id})">✏️ เปลี่ยนชื่อ</button>
+                    <button type="button" onclick="editLibraryFileMetaPrompt(${f.id})">🏷️ แก้ข้อมูลประกอบ</button>
                     <button type="button" class="danger-btn" onclick="deleteLibraryFileConfirm(${f.id})">🗑️ ลบ</button>
                 </div>
             `;
@@ -1629,6 +1639,56 @@ async function renameLibraryFile(fileId, newFilename) {
         loadFileLibraryFiles();
     } catch (error) {
         alert("เปลี่ยนชื่อไม่สำเร็จ: " + error);
+    }
+}
+
+function editLibraryFileMetaPrompt(fileId) {
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+
+    const customerName = prompt("ชื่อลูกค้า:", file.customer_name || "");
+    if (customerName === null) return;
+    const projectName = prompt("ชื่อโครงการ:", file.project_name || "");
+    if (projectName === null) return;
+    const referenceNo = prompt("เลขที่อ้างอิง:", file.reference_no || "");
+    if (referenceNo === null) return;
+
+    updateLibraryFileMeta(fileId, customerName.trim(), projectName.trim(), referenceNo.trim());
+}
+
+async function updateLibraryFileMeta(fileId, customerName, projectName, referenceNo) {
+    try {
+        const res = await fetch(`/admin/api/file-library/files/${fileId}/meta`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ customer_name: customerName, project_name: projectName, reference_no: referenceNo }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        loadFileLibraryFiles();
+    } catch (error) {
+        alert("บันทึกข้อมูลประกอบไม่สำเร็จ: " + error);
+    }
+}
+
+async function generateMissingLibraryFileMeta() {
+    const statusEl = document.getElementById("fileLibraryGenerateMetaStatus");
+    statusEl.textContent = "กำลังสร้างข้อมูลประกอบให้ไฟล์ที่ยังไม่มี...";
+    statusEl.style.color = "#666";
+    try {
+        const res = await fetch("/admin/api/file-library/meta/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        statusEl.textContent = `✅ สร้างข้อมูลประกอบให้ ${data.results.length} ไฟล์แล้ว`;
+        statusEl.style.color = "green";
+        loadFileLibraryFiles();
+    } catch (error) {
+        statusEl.textContent = "❌ สร้างข้อมูลประกอบไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
     }
 }
 

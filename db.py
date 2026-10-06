@@ -238,6 +238,22 @@ class LibraryFile(Base):
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class LibraryFileMeta(Base):
+    """ข้อมูลประกอบของไฟล์ในคลัง (ลูกค้า/โครงการ/เลขอ้างอิง) — ใช้ขยายการค้นหาไฟล์เมื่อคลังสะสมเอกสารจากหลาย
+    บริษัท/โครงการ แทนการเดาจากชื่อไฟล์เพียงอย่างเดียว (ดู search_library_files ใน main.py) ตารางใหม่แยกจาก
+    library_files ทั้งหมด ไม่ ALTER ตารางเดิม หนึ่งไฟล์มีได้แค่ 1 แถว (file_id เป็น primary key ตรงๆ) ลบไฟล์
+    ในคลัง -> แถวนี้หายไปด้วยอัตโนมัติ (ON DELETE CASCADE) source="ai" = AI สร้างให้ตอน import/สร้างอัตโนมัติ
+    ทีหลัง, source="admin" = แอดมินแก้ไขเอง (ห้ามถูกเขียนทับด้วยการสร้างอัตโนมัติอีก — เช็คที่ main.py)"""
+    __tablename__ = "library_file_meta"
+
+    file_id = Column(Integer, ForeignKey("library_files.id", ondelete="CASCADE"), primary_key=True)
+    customer_name = Column(Text, nullable=True)
+    project_name = Column(Text, nullable=True)
+    reference_no = Column(Text, nullable=True)
+    source = Column(String, nullable=False, default="ai")
+    updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class ChatSession(Base):
     __tablename__ = "chat_sessions"
 
@@ -1498,6 +1514,65 @@ def delete_library_file(file_id: int) -> bool:
         print(f"[FileLibrary] warning: storage_delete failed for key={storage_key!r}: {e}")
 
     return True
+
+
+def _library_file_meta_to_dict(row) -> dict:
+    return {
+        "file_id": row.file_id,
+        "customer_name": row.customer_name,
+        "project_name": row.project_name,
+        "reference_no": row.reference_no,
+        "source": row.source,
+        "updated_at": row.updated_at,
+    }
+
+
+def get_library_file_meta(file_id: int) -> Optional[dict]:
+    with SessionLocal() as session:
+        row = session.get(LibraryFileMeta, file_id)
+        return _library_file_meta_to_dict(row) if row is not None else None
+
+
+def get_all_library_file_meta() -> dict[int, dict]:
+    """คืน {file_id: {...}} ของทุกไฟล์ที่มีข้อมูลประกอบอยู่แล้ว (ไฟล์ที่ไม่อยู่ใน dict นี้ = ยังไม่มีข้อมูล
+    ประกอบเลย) ใช้ join กับ get_library_files() ใน search_library_files() (main.py)"""
+    with SessionLocal() as session:
+        rows = session.query(LibraryFileMeta).all()
+        return {row.file_id: _library_file_meta_to_dict(row) for row in rows}
+
+
+def get_library_file_ids_without_meta() -> list[int]:
+    """คืน file_id ของไฟล์ในคลังที่ยังไม่มีข้อมูลประกอบเลย (ไม่มีแถวใน library_file_meta) — ใช้ตอน
+    'สร้างข้อมูลไฟล์ที่ยังไม่มี' กันสร้างซ้ำทับไฟล์ที่มีข้อมูลประกอบอยู่แล้วไม่ว่า source ใด"""
+    with SessionLocal() as session:
+        existing_ids = {row.file_id for row in session.query(LibraryFileMeta.file_id).all()}
+        all_ids = {row.id for row in session.query(LibraryFile.id).all()}
+        return sorted(all_ids - existing_ids)
+
+
+def upsert_library_file_meta(
+    file_id: int,
+    customer_name: Optional[str] = None,
+    project_name: Optional[str] = None,
+    reference_no: Optional[str] = None,
+    source: str = "ai",
+) -> bool:
+    """สร้างหรือแทนที่ข้อมูลประกอบของไฟล์นี้ทั้งแถว (ไม่ merge ทีละฟิลด์กับของเดิม) คืน False ถ้าไม่พบไฟล์นี้
+    ในคลังเลย (กัน insert ไปชน FK constraint ตรงๆ)"""
+    with SessionLocal() as session:
+        if session.get(LibraryFile, file_id) is None:
+            return False
+        row = session.get(LibraryFileMeta, file_id)
+        if row is None:
+            row = LibraryFileMeta(file_id=file_id)
+            session.add(row)
+        row.customer_name = customer_name
+        row.project_name = project_name
+        row.reference_no = reference_no
+        row.source = source
+        row.updated_at = datetime.datetime.utcnow()
+        session.commit()
+        return True
 
 
 # ---------- Chat sessions & messages ----------

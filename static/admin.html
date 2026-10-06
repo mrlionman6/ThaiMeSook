@@ -316,6 +316,10 @@
                 <div class="file-library-files">
                     <div class="file-library-files-header">
                         <strong id="fileLibraryCurrentCategoryLabel"></strong>
+                        <span>
+                            <button type="button" onclick="generateMissingLibraryFileMeta()">🏷️ สร้างข้อมูลไฟล์ที่ยังไม่มี</button>
+                            <span id="fileLibraryGenerateMetaStatus" class="kb-toolbar-status"></span>
+                        </span>
                     </div>
                     <div id="fileLibraryImportRow" class="file-library-import-row" hidden>
                         <input type="file" id="fileLibraryImportInput" accept=".xlsx,.xls,.xlsm" multiple>
