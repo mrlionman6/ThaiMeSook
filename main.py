@@ -1269,9 +1269,68 @@ def describe_image_for_retrieval(image_data: dict, query: str) -> tuple[bool, st
     print(f"[ImageGuard] kind={kind} relevant={is_relevant} detail={detail!r}")
     return is_relevant, detail
 
-def _prepare_rag_context(query, history, image_data):
+LIBRARY_LOGGED_IN_RULES = (
+    "\n- ถ้าผู้ใช้ขอไฟล์ในคลัง ให้เรียก list_library_files ก่อนเสมอเพื่อยืนยันข้อมูลล่าสุด (เช่น summary) "
+    "ห้ามเดาชื่อหรือ file_id เอง\n"
+    "- ถ้าคำขอของผู้ใช้ (เปิด ดู อ่าน เปรียบเทียบ หรือแก้ไข) ตรงกับชื่อหรือคำอธิบายไฟล์ในคลังด้านล่างเพียงไฟล์เดียวชัดเจน "
+    "ให้เรียก open_library_file ทันทีโดยไม่ต้องถามขออนุญาตก่อน ถามกลับผู้ใช้เฉพาะตอนตรงกับหลายไฟล์พร้อมกัน "
+    "หรือไม่ตรงกับไฟล์ไหนเลยเท่านั้น\n"
+    "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
+)
+
+LIBRARY_GUEST_RULES = (
+    "\n- ผู้ใช้คนนี้ยังไม่ได้เข้าสู่ระบบ ถ้าถามเรื่องคลังไฟล์ หรือขอเปิด ดู อ่าน แก้ไข หรือเปรียบเทียบไฟล์ใดๆ "
+    "ให้บอกว่าต้องเข้าสู่ระบบก่อนจึงจะใช้ฟีเจอร์นี้ได้ ห้ามบอกว่าคลังไฟล์ว่างเปล่าหรือไม่มีไฟล์ "
+    "และห้ามเดาหรือสมมติชื่อไฟล์ใดๆ เด็ดขาด\n"
+)
+
+
+def _build_library_file_listing_text(limit: int = 50) -> str:
+    """สร้างข้อความรายชื่อไฟล์ในคลังจัดตามโฟลเดอร์ (ชื่อโฟลเดอร์ + ชื่อไฟล์เท่านั้น ไม่ใส่ summary) ต่อท้าย
+    system prompt ให้ผู้ล็อกอิน สร้างใหม่จาก DB จริงทุกครั้งที่เรียก (ผ่าน execute_list_library_files()) ไม่แคช
+    ไว้ กันกรณีแอดมินเพิ่ม/ลบ/ย้ายไฟล์แล้วเห็นผลไม่ทันที จำกัดไว้ไม่เกิน limit ไฟล์ ถ้าเกินบอกจำนวนที่เหลือ
+    ถ้าดึงรายชื่อล้มเหลว (เช่น DB มีปัญหาชั่วคราว) คืนสตริงว่างเงียบๆ ไม่ทำให้ทั้งคำขอล้มเพราะเรื่องนี้"""
+    try:
+        files = execute_list_library_files({}).get("files", [])
+    except Exception:
+        return ""
+
+    if not files:
+        return ""
+
+    by_folder: dict[str, list[str]] = {}
+    for f in files:
+        folder = f.get("category") or "ไม่มีหมวดหมู่"
+        if folder == "None":  # ดู execute_list_library_files — categories.get(None, "None") คืนสตริงนี้ตรงๆ
+            folder = "ไม่มีหมวดหมู่"
+        by_folder.setdefault(folder, []).append(f["filename"])
+
+    total = len(files)
+    shown = 0
+    lines = ["รายชื่อไฟล์ในคลังเอกสาร (ข้อมูลล่าสุด ณ ตอนนี้):"]
+    for folder in sorted(by_folder.keys()):
+        if shown >= limit:
+            break
+        lines.append(f"- โฟลเดอร์ {folder}:")
+        for filename in by_folder[folder]:
+            if shown >= limit:
+                break
+            lines.append(f"  - {filename}")
+            shown += 1
+
+    if total > limit:
+        lines.append(f"(มีอีก {total - limit} ไฟล์ที่ไม่ได้แสดงในรายการนี้ ใช้ list_library_files ค้นหาเพิ่มเติมได้)")
+
+    return "\n".join(lines)
+
+
+def _prepare_rag_context(query, history, image_data, user_id=None):
     """ขั้นตอนเตรียมข้อมูลทั้งหมดก่อนเรียก Claude ตัวตอบจริง — ใช้ร่วมกันทั้งโหมด
     non-streaming (rag_answer) และ streaming (rag_answer_stream) กันโค้ดซ้ำซ้อน
+
+    user_id ใช้ตัดสินว่าจะต่อท้าย system prompt ด้วยรายชื่อไฟล์ในคลัง+กติกาเปิดไฟล์ทันที (ล็อกอินแล้ว)
+    หรือข้อความบอกให้เข้าสู่ระบบก่อน (guest) — ไม่ใช่ตัวตัดสินว่ามี tool คลังไฟล์จริงหรือไม่ (ตัดสินแยก
+    ใน run_agentic_tool_loop ตอนประกอบ tools list เหมือนเดิม) เป็น optional (None = guest)
 
     คืนค่า dict เสมอ:
     - ถ้าภาพไม่เกี่ยวข้อง: {"early_exit": True, "message": ...}
@@ -1311,6 +1370,7 @@ def _prepare_rag_context(query, history, image_data):
         "- ถ้าข้อมูลอ้างอิงไม่ครอบคลุมหรือไม่มีรายละเอียดพอ ให้ใช้ความรู้ทั่วไปของคุณตอบเสริมให้ครบถ้วนที่สุด "
         "โดยไม่ต้องบอกผู้ใช้ว่าข้อมูลอ้างอิงไม่พอ\n"
         "- ตอบด้วยโทนทางการ แม่นยำ เหมาะกับนักลงทุน/ผู้ประกอบการ ไม่ใช่โทนเป็นกันเองแบบพูดกับประชาชนทั่วไป\n"
+        "- ใช้คำลงท้ายประโยคว่า \"ครับ\" เท่านั้นเสมอ ห้ามใช้ \"ค่ะ\" หรือเขียน \"ครับ/ค่ะ\" คู่กันเด็ดขาด\n"
         "- ถ้าผู้ใช้พิมพ์คำถามเป็นภาษาอังกฤษ ให้ตอบเป็นภาษาอังกฤษ เพราะนักลงทุนต่างชาติจำนวนมากอ่านภาษาไทยไม่ออก\n"
         "- ห้ามใส่ข้อความ disclaimer หรือคำเตือนทางกฎหมายท้ายคำตอบเอง เพราะมีข้อความนี้แสดงอยู่ใต้กล่องแชทบนหน้าเว็บอยู่แล้ว\n"
         "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ ให้ใช้บริบทนั้นประกอบการตอบด้วย\n"
@@ -1323,17 +1383,21 @@ def _prepare_rag_context(query, history, image_data):
         "ให้เรียกเครื่องมือ estimate_investment_cost เสมอ ห้ามประมาณตัวเลขเองในหัวเด็ดขาด\n"
         "- ถ้าคำถามเกี่ยวกับตัวเลข/อัตรา/เกณฑ์ที่อาจเปลี่ยนแปลงบ่อย (เช่น ค่าธรรมเนียมราชการ, เกณฑ์ BOI ล่าสุด, อัตราภาษีปีปัจจุบัน) "
         "และไม่แน่ใจว่าข้อมูลที่มีเป็นข้อมูลล่าสุดหรือไม่ ให้ใช้เครื่องมือค้นเว็บ (web_search) เพื่อยืนยันจากเว็บราชการก่อนตอบ"
-        "\n- ถ้าผู้ใช้ขอไฟล์ในคลัง ให้เรียก list_library_files ก่อนเสมอ ห้ามเดาชื่อหรือ file_id\n"
-        "- ถ้าตรงหลายไฟล์ หรือไม่ตรงเลย หรือไม่แน่ใจว่าต้องการอ่าน เปรียบเทียบ หรือแก้ "
-        "ให้ถามผู้ใช้ก่อน โดยแสดงรายชื่อไฟล์ที่เป็นไปได้\n"
-        "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
-        "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
+        "\n- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
         "- ถ้าไฟล์ (จากคลังหรือที่แนบมาเอง) มีมาโคร (has_macros เป็น true) ให้บอกผู้ใช้ว่าไฟล์นี้มีมาโคร "
         "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์\n"
         "- ห้ามบอกว่าเปิด แก้ เปรียบเทียบ หรือส่งไฟล์แล้ว ถ้าไม่มีผลจาก tool ยืนยันในเทิร์นนี้\n"
         "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
-        "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว"
+        "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว\n"
+        "- ถ้าได้ผลเปรียบเทียบไฟล์จากเครื่องมือ compare_chat_documents กลับมาเป็นตาราง markdown สำเร็จรูป "
+        "ให้แสดงตารางทั้งหมดตามที่ได้รับทุกแถวเป๊ะๆ ห้ามย่อ ห้ามตัดแถว ห้ามแก้ตัวเลขหรือข้อความในตาราง "
+        "แล้วต่อท้ายด้วยข้อสังเกตสำคัญไม่เกิน 3 ข้อ"
     )
+
+    if user_id:
+        system_prompt += LIBRARY_LOGGED_IN_RULES + _build_library_file_listing_text()
+    else:
+        system_prompt += LIBRARY_GUEST_RULES
 
     current_turn_text = (
         "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n" + context + "\n\n"
@@ -1383,7 +1447,7 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None)
     (calculate_tax, web_search, และ list_library_files/open_library_file ถ้ามี user_id) ผ่าน
     run_agentic_tool_loop() — user_id/chat_id เป็น optional (None สำหรับ guest ที่ไม่ได้ล็อกอิน)"""
     history = history or []
-    ctx = _prepare_rag_context(query, history, image_data)
+    ctx = _prepare_rag_context(query, history, image_data, user_id=user_id)
 
     if ctx["early_exit"]:
         return ctx["message"], []
@@ -1403,7 +1467,7 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None)
     return answer, ctx["top_chunks"]
 
 
-def rag_answer_stream(query, history=None, image_data=None):
+def rag_answer_stream(query, history=None, image_data=None, user_id=None):
     """เวอร์ชัน streaming จริง — yield คำตอบออกมาทีละ chunk ตามที่ Claude generate จริง
     (ไม่ใช่ generate เสร็จแล้วค่อยแบ่งส่งทีหลัง) ใช้กับ /ask/stream
 
@@ -1416,7 +1480,7 @@ def rag_answer_stream(query, history=None, image_data=None):
     ยอมรับความเสี่ยงนี้เพื่อแลกกับการได้ streaming จริง — เป็น trade-off เดียวกับที่ระบบ
     production ส่วนใหญ่ที่ใช้ streaming ยอมรับกัน (เทียบ latency ที่ลดลงกับความเสี่ยงที่เพิ่มขึ้นเล็กน้อย)"""
     history = history or []
-    ctx = _prepare_rag_context(query, history, image_data)
+    ctx = _prepare_rag_context(query, history, image_data, user_id=user_id)
 
     if ctx["early_exit"]:
         yield {"type": "delta", "text": ctx["message"]}
@@ -1747,7 +1811,7 @@ async def ask_question_stream(
 
     def event_generator():
         nonlocal chat_id
-        for event in rag_answer_stream(query, history=history, image_data=image_data):
+        for event in rag_answer_stream(query, history=history, image_data=image_data, user_id=user_id):
             if event["type"] == "delta":
                 yield json.dumps({"type": "delta", "text": event["text"]}, ensure_ascii=False) + "\n"
             else:  # event["type"] == "done"
@@ -3385,41 +3449,122 @@ def _route_multi_file_instruction(
     }
 
 
+def _short_filename(filename: str, max_len: int = 25) -> str:
+    """ตัดชื่อไฟล์ (ไม่รวมนามสกุล) ให้สั้นลงสำหรับใช้เป็นหัวคอลัมน์ตารางเปรียบเทียบ"""
+    name, _ext = os.path.splitext(filename)
+    name = name.strip() or filename
+    if len(name) > max_len:
+        return name[: max_len - 1] + "…"
+    return name
+
+
+def _escape_table_cell(value, max_len: int = 120) -> str:
+    """เตรียมค่าก่อนใส่ในตาราง markdown: escape '|' และขึ้นบรรทัดใหม่ (กันโครงสร้างตารางพัง)
+    ตัดให้สั้นลงพร้อม … ถ้ายาวเกิน max_len ตัวอักษร"""
+    text = "" if value is None else str(value)
+    text = text.replace("|", "\\|").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if len(text) > max_len:
+        text = text[: max_len - 1] + "…"
+    return text
+
+
+_LABEL_HEADING_SUFFIX_RE = re.compile(r"^(.*) \[(.+)\]$")
+
+
+def _label_group_and_display(label: str) -> tuple[str, str]:
+    """แยกหัวข้อหมวด (ถ้ามี) ออกจาก label ตามรูปแบบที่ _extract_excel_labels ใส่ไว้ตอน label ซ้ำในชีตเดียวกัน
+    (ดู docstring ของ _extract_excel_labels — รูปแบบ 'label [หัวข้อหมวด]') คืน (กลุ่ม, label ที่ใช้แสดง)
+    ไม่มีหัวข้อหมวด -> กลุ่ม = '' (แถวเดี่ยว ไม่จัดกลุ่ม)"""
+    match = _LABEL_HEADING_SUFFIX_RE.match(label)
+    if match:
+        return match.group(2), match.group(1)
+    return "", label
+
+
+def _format_number_diff(value_a, value_b) -> str:
+    """คืนข้อความส่วนต่าง B-A พร้อมเปอร์เซ็นต์ (ปัดสองตำแหน่ง) ถ้าทั้งคู่เป็นตัวเลข (ไม่ใช่ bool) เท่านั้น
+    ไม่ใช่ตัวเลขทั้งคู่ -> คืนสตริงว่าง (ไม่มีส่วนต่อท้ายผลต่าง)"""
+    if isinstance(value_a, bool) or isinstance(value_b, bool):
+        return ""
+    if not isinstance(value_a, (int, float)) or not isinstance(value_b, (int, float)):
+        return ""
+    diff = value_b - value_a
+    diff_str = f"{diff:+,.2f}"
+    percent_str = "N/A" if value_a == 0 else f"{(diff / value_a) * 100:+.2f}%"
+    return f" (ส่วนต่าง B-A: {diff_str}, {percent_str})"
+
+
+def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: str, filename_b: str) -> str:
+    """สร้างตาราง markdown เปรียบเทียบด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย) ครบทุก label
+    ของทั้งสองไฟล์ — เรียงตามลำดับใน label_map_a ก่อน แล้วตามด้วย label ที่มีเฉพาะใน label_map_b
+    จัดกลุ่มตามหัวข้อหมวดของ label ถ้ามี (ดู _label_group_and_display) ผลลัพธ์นี้เป็นแหล่งเดียวที่ใช้ร่วมกัน
+    ทั้งเส้นทาง compare_chat_documents (tool) และเส้นทาง compare เดิมของ Excel editor (ผ่าน
+    _compare_editable_documents ด้านล่าง) — ไม่มีการเรียก Claude ในฟังก์ชันนี้เลย"""
+    normalized_a = {_normalize_label(label): (label, info) for label, info in label_map_a.items()}
+    normalized_b = {_normalize_label(label): (label, info) for label, info in label_map_b.items()}
+
+    ordered_keys = list(normalized_a.keys())
+    ordered_keys += [k for k in normalized_b.keys() if k not in normalized_a]
+
+    rows_by_group: dict[str, list[str]] = {}
+    group_order: list[str] = []
+
+    for norm_key in ordered_keys:
+        in_a = norm_key in normalized_a
+        in_b = norm_key in normalized_b
+
+        if in_a and in_b:
+            label, info_a = normalized_a[norm_key]
+            _, info_b = normalized_b[norm_key]
+            value_a = info_a["current_value"]
+            value_b = info_b["current_value"]
+            compare_a = value_a.strip() if isinstance(value_a, str) else value_a
+            compare_b = value_b.strip() if isinstance(value_b, str) else value_b
+            if compare_a == compare_b:
+                result_text = "เหมือนกัน"
+            else:
+                result_text = "ต่างกัน" + _format_number_diff(value_a, value_b)
+        elif in_a:
+            label, info_a = normalized_a[norm_key]
+            value_a = info_a["current_value"]
+            value_b = None
+            result_text = "มีแค่ไฟล์ A"
+        else:
+            label, info_b = normalized_b[norm_key]
+            value_a = None
+            value_b = info_b["current_value"]
+            result_text = "มีแค่ไฟล์ B"
+
+        group, display_label = _label_group_and_display(label)
+        if group not in rows_by_group:
+            rows_by_group[group] = []
+            group_order.append(group)
+
+        cell_label = _escape_table_cell(display_label)
+        cell_a = _escape_table_cell(value_a) if value_a is not None else ""
+        cell_b = _escape_table_cell(value_b) if value_b is not None else ""
+        cell_result = _escape_table_cell(result_text)
+
+        rows_by_group[group].append(f"| {cell_label} | {cell_a} | {cell_b} | {cell_result} |")
+
+    header = f"| หัวข้อ | {_escape_table_cell(_short_filename(filename_a))} | {_escape_table_cell(_short_filename(filename_b))} | ผล |"
+    separator = "| --- | --- | --- | --- |"
+    lines = [header, separator]
+    for group in group_order:
+        if group:
+            lines.append(f"| **{_escape_table_cell(group)}** | | | |")
+        lines.extend(rows_by_group[group])
+
+    return "\n".join(lines)
+
+
 def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
-    """หา label ที่ normalize แล้วตรงกันทั้ง 2 ไฟล์ด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย)
-    สร้าง diff list ตัวเลข/ค่าที่คำนวณเสร็จแล้ว แล้วให้ Claude แค่ 'เขียนอธิบายเป็นภาษาธรรมชาติ'
-    ห้าม Claude คำนวณหรือแก้ไขตัวเลขเอง — ใช้ตามที่ diff list ให้มาเป๊ะ"""
-    normalized_a = {_normalize_label(label): (label, info) for label, info in doc_a["label_map"].items()}
-    normalized_b = {_normalize_label(label): (label, info) for label, info in doc_b["label_map"].items()}
-    common_keys = set(normalized_a) & set(normalized_b)
-
-    if not common_keys:
-        return f"ไม่พบ label ที่ตรงกันระหว่าง '{doc_a['filename']}' กับ '{doc_b['filename']}' เลย ไม่สามารถเปรียบเทียบได้"
-
-    diffs = []
-    for norm_key in sorted(common_keys):
-        label, info_a = normalized_a[norm_key]
-        _, info_b = normalized_b[norm_key]
-        value_a = info_a["current_value"]
-        value_b = info_b["current_value"]
-        compare_a = value_a.strip() if isinstance(value_a, str) else value_a
-        compare_b = value_b.strip() if isinstance(value_b, str) else value_b
-        diffs.append({"label": label, "value_a": value_a, "value_b": value_b, "changed": compare_a != compare_b})
-
-    prompt = (
-        f"ไฟล์ A: {doc_a['filename']}\nไฟล์ B: {doc_b['filename']}\n\n"
-        f"ผลต่างที่คำนวณไว้แล้ว (JSON, ห้ามคำนวณหรือแก้ไขตัวเลขเอง ใช้ตามนี้เป๊ะ):\n"
-        f"{json.dumps(diffs, ensure_ascii=False)}\n\n"
-        "หน้าที่ของคุณ: เขียนอธิบายผลต่างข้างต้นเป็นภาษาไทยที่อ่านง่าย เน้นเฉพาะรายการที่ changed=true เป็นหลัก "
-        "สรุปรายการที่ไม่เปลี่ยนแปลง (changed=false) สั้นๆ รวมกันไม่ต้องแจกแจงทีละรายการ "
-        "ตอบเป็นข้อความธรรมดา ห้ามใช้ Markdown syntax เช่น #, **, |, อีโมจิ"
-    )
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return response.content[0].text.strip()
+    """สร้างตารางเปรียบเทียบ label ทั้งหมดระหว่างสองไฟล์ด้วยโค้ดล้วนๆ (ไม่เรียก Claude เลย — ดู
+    _build_comparison_table) ใช้ผลเดียวกันนี้ทั้งเส้นทาง compare_chat_documents (tool) และเส้นทาง
+    compare เดิมของ Excel editor ที่มี 2 ไฟล์ active พร้อมกันใน /ask"""
+    if not doc_a["label_map"] and not doc_b["label_map"]:
+        return f"ไม่พบ label ในไฟล์ '{doc_a['filename']}' และ '{doc_b['filename']}' เลย ไม่สามารถเปรียบเทียบได้"
+    return _build_comparison_table(doc_a["label_map"], doc_b["label_map"], doc_a["filename"], doc_b["filename"])
 
 
 EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT = (
