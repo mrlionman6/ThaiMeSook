@@ -519,7 +519,11 @@ LIBRARY_TOOLS = [
                 },
                 "name_query": {
                     "type": "string",
-                    "description": "ชื่อไฟล์หรือส่วนหนึ่งของชื่อไฟล์ที่ต้องการเปิด (ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด)",
+                    "description": (
+                        "ส่งข้อความที่ผู้ใช้ใช้อ้างถึงไฟล์นี้ทั้งวลี (เช่น \"ใบประเมินของป่าไม้เขียว\" หรือ "
+                        "\"ใบเสนอราคาห้างทองร่ำรวย\") ไม่ใช่แค่ชื่อลูกค้าคำเดียว — ระบบจะตัดคำแล้วให้คะแนนจับคู่เอง "
+                        "ยิ่งส่งวลีที่มีบริบทครบ (ประเภทเอกสาร + ชื่อลูกค้า) ยิ่งจับคู่แม่นขึ้น ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด"
+                    ),
                 },
             },
             "required": [],
@@ -555,13 +559,56 @@ def execute_list_library_files(tool_input: dict) -> dict:
     return {"files": results}
 
 
+# คำทั่วไปที่ไม่ช่วยระบุว่าผู้ใช้หมายถึงไฟล์ไหน — ตัดทิ้งก่อนให้คะแนนใน _score_library_files_by_name_query
+# (กันคำเหล่านี้ไปบวกคะแนนปลอมให้ทุกไฟล์เท่าๆ กัน ซึ่งไม่ช่วยแยกไฟล์เลย)
+_LIBRARY_QUERY_STOPWORDS = {
+    "เปิด", "ดู", "อ่าน", "ไฟล์", "ของ", "ด้วย", "และ", "ให้", "หน่อย", "ขอ", "แล้ว", "เปรียบเทียบ", "แก้",
+}
+
+
+def _tokenize_library_query(name_query: str) -> list[str]:
+    """ตัดคำ name_query ด้วย pythainlp (engine='newmm') แล้วกรองคำที่ไม่ช่วยระบุไฟล์ออก: ช่องว่างล้วน/สั้นกว่า
+    2 ตัวอักษร และคำทั่วไปใน _LIBRARY_QUERY_STOPWORDS — ใช้ให้คะแนนไฟล์ใน _score_library_files_by_name_query"""
+    tokens = word_tokenize(name_query, engine="newmm")
+    result = []
+    for tok in tokens:
+        tok = tok.strip().lower()
+        if len(tok) < 2 or tok in _LIBRARY_QUERY_STOPWORDS:
+            continue
+        result.append(tok)
+    return result
+
+
+def _score_library_files_by_name_query(name_query: str, files: list[dict], categories: dict) -> list[tuple[dict, int]]:
+    """ให้คะแนนไฟล์ในคลังจาก token ที่ตัดคำแล้วของ name_query (ดู _tokenize_library_query) คะแนนของแต่ละไฟล์
+    = จำนวน token ที่พบเป็นส่วนหนึ่งของชื่อไฟล์หรือชื่อโฟลเดอร์ (normalize ตัวพิมพ์เล็ก/ช่องว่างซ้ำแล้ว) คืน
+    list (ไฟล์, คะแนน) เฉพาะไฟล์ที่คะแนน > 0 เท่านั้น เรียงคะแนนมากไปน้อย — ไม่มี token เหลือเลยหรือไม่มีไฟล์
+    ไหนได้คะแนน คืน list ว่าง"""
+    tokens = _tokenize_library_query(name_query)
+    if not tokens:
+        return []
+
+    scored = []
+    for f in files:
+        folder_name = categories.get(f["category_id"], "") or ""
+        filename_haystack = re.sub(r"\s+", " ", f["filename"].lower())
+        folder_haystack = re.sub(r"\s+", " ", folder_name.lower())
+        score = sum(1 for tok in tokens if tok in filename_haystack or tok in folder_haystack)
+        if score > 0:
+            scored.append((f, score))
+
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored
+
+
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
     """คัดลอกไฟล์จากคลังมาสร้างเป็น EditableDocument ใหม่ผูกกับแชท/user ปัจจุบัน — ไม่เขียนอะไรกลับไปที่
     library_files เลยไม่ว่าทางไหน (ต้นฉบับในคลังไม่ถูกแก้เด็ดขาด) caller (run_agentic_tool_loop) รับประกัน
     แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง
 
-    รับ file_id ตรงๆ หรือ name_query (ให้โค้ดจับคู่ชื่อเอง) อย่างใดอย่างหนึ่ง — name_query ตรงหลายไฟล์
-    จะคืนรายชื่อโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้
+    รับ file_id ตรงๆ หรือ name_query (ให้โค้ดให้คะแนนจับคู่เอง — ดู _score_library_files_by_name_query)
+    อย่างใดอย่างหนึ่ง — ไฟล์คะแนนสูงสุดมีไฟล์เดียวและ > 0 เปิดไฟล์นั้นเลย คะแนนสูงสุดเสมอกันหลายไฟล์ คืนรายชื่อ
+    ไฟล์ที่เสมอกันโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้
     Claude เลือก file_id ผิด) ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน (normalize แล้ว) เปิดอยู่ใน
     แชทนี้แล้วหรือยัง ถ้ามีให้ใช้ตัวเดิมแทนที่จะสร้างซ้ำ (แก้ปัญหาที่เคยเจอ: เปิดไฟล์เดิมซ้ำสองครั้งในแชทเดียว)"""
     file_id = tool_input.get("file_id")
@@ -575,17 +622,19 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
         if file_row is None:
             return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
     else:
-        normalized_query = name_query.lower()
-        matches = [f for f in get_library_files() if normalized_query in f["filename"].lower()]
-        if len(matches) == 0:
-            return {"error": f"ไม่พบไฟล์ชื่อ '{name_query}' ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
-        if len(matches) > 1:
+        categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
+        scored = _score_library_files_by_name_query(name_query, get_library_files(), categories)
+        if not scored:
+            return {"error": f"ไม่พบไฟล์ที่ตรงกับ '{name_query}' ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
+        top_score = scored[0][1]
+        top_matches = [f for f, score in scored if score == top_score]
+        if len(top_matches) > 1:
             return {
                 "matched_multiple": True,
-                "files": [{"file_id": f["id"], "filename": f["filename"]} for f in matches],
-                "message": f"พบ {len(matches)} ไฟล์ที่ชื่อตรงกับ '{name_query}' กรุณาระบุให้ชัดเจนขึ้น หรือเรียกใหม่ด้วย file_id ที่ต้องการจากรายการนี้",
+                "files": [{"file_id": f["id"], "filename": f["filename"]} for f in top_matches],
+                "message": f"พบ {len(top_matches)} ไฟล์ที่ตรงกับ '{name_query}' พอๆ กัน กรุณาระบุให้ชัดเจนขึ้น หรือเรียกใหม่ด้วย file_id ที่ต้องการจากรายการนี้",
             }
-        file_row = matches[0]
+        file_row = top_matches[0]
 
     # กันเปิดไฟล์ชื่อเดียวกันซ้ำในแชทเดียวกัน — ถ้ามีอยู่แล้วให้ใช้ตัวเดิม ไม่สร้าง EditableDocument ใหม่
     target_normalized_name = _normalize_filename_for_matching(file_row["filename"])
@@ -1276,6 +1325,10 @@ LIBRARY_LOGGED_IN_RULES = (
     "ให้เรียก open_library_file ทันทีโดยไม่ต้องถามขออนุญาตก่อน ถามกลับผู้ใช้เฉพาะตอนตรงกับหลายไฟล์พร้อมกัน "
     "หรือไม่ตรงกับไฟล์ไหนเลยเท่านั้น\n"
     "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
+    "- ห้ามแสดง file_id หรือ document_id ให้ผู้ใช้เห็นเด็ดขาด ใช้ชื่อไฟล์เสมอเวลาพูดถึงไฟล์\n"
+    "- เมื่อคุณถามกลับว่าหมายถึงไฟล์ไหน แล้วผู้ใช้ตอบยืนยัน (เช่น \"ใช่\", \"ใช่ไฟล์นั้น\") ให้เรียก "
+    "open_library_file เปิดไฟล์ที่ถามไปทันที ห้ามถามยืนยันซ้ำอีก\n"
+    "- ถ้ายังไม่ได้เปิดไฟล์ (ไม่มีผลจาก tool ยืนยัน) ห้ามอธิบายว่าเอกสารประเภทนี้มักมีเนื้อหาอะไรจากความรู้ทั่วไป\n"
 )
 
 LIBRARY_GUEST_RULES = (
@@ -3485,6 +3538,25 @@ def _format_number_diff(value_a, value_b) -> str:
     return f" (ส่วนต่าง B-A: {diff_str}, {percent_str})"
 
 
+def _format_display_value(value, number_format: Optional[str]):
+    """แปลงค่าก่อนแสดงในตารางเปรียบเทียบเท่านั้น (ไม่แก้ label_map จริง) — ถ้าเซลล์เป็น format วันที่/เวลา
+    (เช็คด้วย openpyxl.styles.numbers.is_date_format เหมือน _coerce_value_for_cell) และค่าปัจจุบันเป็น
+    ISO string (มาจาก _json_safe_cell_value ตอน extract) ให้แปลงกลับเป็น วัน/เดือน/ปี ตามตัวเลขที่เก็บไว้เป๊ะ
+    (ไม่แปลงปฏิทิน เช่น 2560-03-05T00:00:00 -> 5/3/2560) ต่อท้ายเวลาถ้าไม่ใช่ 00:00:00 ค่าอื่นๆ หรือ parse
+    ไม่ได้ ปล่อยผ่านตรงๆ ไม่แตะ"""
+    if not (isinstance(value, str) and number_format and is_date_format(number_format)):
+        return value
+    parsed = _parse_iso_datetime_like(value)
+    if isinstance(parsed, datetime.datetime):
+        date_part = f"{parsed.day}/{parsed.month}/{parsed.year}"
+        if (parsed.hour, parsed.minute, parsed.second) != (0, 0, 0):
+            return f"{date_part} {parsed.hour:02d}:{parsed.minute:02d}"
+        return date_part
+    if isinstance(parsed, datetime.date):
+        return f"{parsed.day}/{parsed.month}/{parsed.year}"
+    return value
+
+
 def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: str, filename_b: str) -> str:
     """สร้างตาราง markdown เปรียบเทียบด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย) ครบทุก label
     ของทั้งสองไฟล์ — เรียงตามลำดับใน label_map_a ก่อน แล้วตามด้วย label ที่มีเฉพาะใน label_map_b
@@ -3509,6 +3581,8 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             _, info_b = normalized_b[norm_key]
             value_a = info_a["current_value"]
             value_b = info_b["current_value"]
+            format_a = info_a.get("number_format")
+            format_b = info_b.get("number_format")
             compare_a = value_a.strip() if isinstance(value_a, str) else value_a
             compare_b = value_b.strip() if isinstance(value_b, str) else value_b
             if compare_a == compare_b:
@@ -3519,11 +3593,15 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             label, info_a = normalized_a[norm_key]
             value_a = info_a["current_value"]
             value_b = None
+            format_a = info_a.get("number_format")
+            format_b = None
             result_text = "มีแค่ไฟล์ A"
         else:
             label, info_b = normalized_b[norm_key]
             value_a = None
             value_b = info_b["current_value"]
+            format_a = None
+            format_b = info_b.get("number_format")
             result_text = "มีแค่ไฟล์ B"
 
         group, display_label = _label_group_and_display(label)
@@ -3532,8 +3610,8 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             group_order.append(group)
 
         cell_label = _escape_table_cell(display_label)
-        cell_a = _escape_table_cell(value_a) if value_a is not None else ""
-        cell_b = _escape_table_cell(value_b) if value_b is not None else ""
+        cell_a = _escape_table_cell(_format_display_value(value_a, format_a)) if value_a is not None else ""
+        cell_b = _escape_table_cell(_format_display_value(value_b, format_b)) if value_b is not None else ""
         cell_result = _escape_table_cell(result_text)
 
         rows_by_group[group].append(f"| {cell_label} | {cell_a} | {cell_b} | {cell_result} |")
