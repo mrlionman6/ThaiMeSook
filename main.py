@@ -988,7 +988,10 @@ def execute_find_customers(tool_input: dict, chat_id: int) -> dict:
     matches = find_customers(query)
     _record_chat_customer_listing(chat_id, matches)
     formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{query}'", matches)
-    return {"customers": matches, "formatted": formatted}
+    # คืนแค่ formatted + count ให้ Claude พอ (ไม่ต้องคืน customer dict ดิบทุกฟิลด์ — Claude แค่ relay
+    # ข้อความ formatted ต่อ ไม่เคยต้องอ่านฟิลด์ในนั้นเอง ส่วนการเลือกรายการทำผ่าน select_list_item ด้วย index
+    # ซึ่งอ่านจาก chat_last_listing ที่บันทึกไว้แล้วข้างบน ไม่ใช่จากค่าที่คืนตรงนี้)
+    return {"count": len(matches), "formatted": formatted}
 
 
 def execute_list_customer_documents(tool_input: dict, chat_id: int) -> dict:
@@ -1009,7 +1012,7 @@ def execute_list_customer_documents(tool_input: dict, chat_id: int) -> dict:
         if len(matches) > 1:
             _record_chat_customer_listing(chat_id, matches)
             formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{customer}' กรุณาเลือกก่อน", matches)
-            return {"matched_multiple_customers": True, "customers": matches, "formatted": formatted}
+            return {"matched_multiple_customers": True, "count": len(matches), "formatted": formatted}
         customer_row = {"customer_code": matches[0]["customer_code"], "customer_name": matches[0]["customer_name"]}
 
     result = list_customer_documents(customer_row["customer_code"], folder=folder)
@@ -1017,7 +1020,7 @@ def execute_list_customer_documents(tool_input: dict, chat_id: int) -> dict:
     _record_chat_document_listing(chat_id, documents)
     title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
-    return {"documents": documents, "formatted": formatted}
+    return {"count": len(documents), "formatted": formatted}
 
 
 def execute_list_project_documents(tool_input: dict, chat_id: int) -> dict:
@@ -1030,7 +1033,7 @@ def execute_list_project_documents(tool_input: dict, chat_id: int) -> dict:
     project_name = next((d["project_name"] for d in documents if d.get("project_name")), None)
     title = f"**{project_name or project_code}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
-    return {"documents": documents, "formatted": formatted}
+    return {"count": len(documents), "formatted": formatted}
 
 
 def execute_list_templates(tool_input: dict, chat_id: int) -> dict:
@@ -1040,7 +1043,7 @@ def execute_list_templates(tool_input: dict, chat_id: int) -> dict:
     _record_chat_document_listing(chat_id, documents)
     title = f"**ไฟล์แม่แบบ** มี {len(documents)} รายการ"
     formatted = _format_library_document_list(title, documents)
-    return {"documents": documents, "formatted": formatted}
+    return {"count": len(documents), "formatted": formatted}
 
 
 def execute_select_list_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
@@ -1076,7 +1079,7 @@ def execute_select_list_item(tool_input: dict, user_id: int, chat_id: int) -> di
     _record_chat_document_listing(chat_id, documents)
     title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
-    return {"documents": documents, "formatted": formatted}
+    return {"count": len(documents), "formatted": formatted}
 
 
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
@@ -1465,6 +1468,18 @@ def execute_estimate_investment_cost(tool_input: dict) -> dict:
     return result
 
 
+def _safe_execute_tool(tool_name: str, fn, *args) -> dict:
+    """เรียก executor ของ tool หนึ่งตัวแบบปลอดภัย — ถ้า fn ล้ม (exception ใดๆ ก็ตาม เช่น Claude ส่ง input
+    แปลกๆ มา หรือบั๊กที่ยังไม่เจอในโค้ด tool เอง) log ชื่อ tool กับชนิด exception เป็น ASCII ล้วน (กัน log
+    เพี้ยนถ้ามีข้อความภาษาไทยปนมาใน exception message) แล้วคืน {"error": ...} ให้ Claude แทน ไม่ปล่อยให้
+    exception ลอยขึ้นไปทำให้ทั้ง request ล้มเป็น 500 — ต้องครอบทุก custom tool ใน run_agentic_tool_loop เสมอ"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        print(f"[ToolExecError] tool={tool_name} exception_type={type(e).__name__}")
+        return {"error": "เครื่องมือทำงานไม่สำเร็จ ลองใหม่อีกครั้ง"}
+
+
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None
 ) -> str:
@@ -1503,88 +1518,88 @@ def run_agentic_tool_loop(
         tool_results = []
         for block in response.content:
             if block.type == "tool_use" and block.name == "calculate_tax":
-                result = execute_calculate_tax(block.input)
+                result = _safe_execute_tool("calculate_tax", execute_calculate_tax, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "estimate_investment_cost":
-                result = execute_estimate_investment_cost(block.input)
+                result = _safe_execute_tool("estimate_investment_cost", execute_estimate_investment_cost, block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "find_customers" and user_id and chat_id:
-                result = execute_find_customers(block.input, chat_id)
+                result = _safe_execute_tool("find_customers", execute_find_customers, block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "list_customer_documents" and user_id and chat_id:
-                result = execute_list_customer_documents(block.input, chat_id)
+                result = _safe_execute_tool("list_customer_documents", execute_list_customer_documents, block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "list_project_documents" and user_id and chat_id:
-                result = execute_list_project_documents(block.input, chat_id)
+                result = _safe_execute_tool("list_project_documents", execute_list_project_documents, block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "list_templates" and user_id and chat_id:
-                result = execute_list_templates(block.input, chat_id)
+                result = _safe_execute_tool("list_templates", execute_list_templates, block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "open_library_file" and user_id and chat_id:
-                result = execute_open_library_file(block.input, user_id, chat_id)
+                result = _safe_execute_tool("open_library_file", execute_open_library_file, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "select_list_item" and user_id and chat_id:
-                result = execute_select_list_item(block.input, user_id, chat_id)
+                result = _safe_execute_tool("select_list_item", execute_select_list_item, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "list_chat_documents" and user_id and chat_id:
-                result = execute_list_chat_documents(user_id, chat_id)
+                result = _safe_execute_tool("list_chat_documents", execute_list_chat_documents, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "compare_chat_documents" and user_id and chat_id:
-                result = execute_compare_chat_documents(block.input, user_id, chat_id)
+                result = _safe_execute_tool("compare_chat_documents", execute_compare_chat_documents, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "edit_chat_document" and user_id and chat_id:
-                result = execute_edit_chat_document(block.input, user_id, chat_id)
+                result = _safe_execute_tool("edit_chat_document", execute_edit_chat_document, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "get_document_download_link" and user_id and chat_id:
-                result = execute_get_document_download_link(block.input, user_id, chat_id)
+                result = _safe_execute_tool("get_document_download_link", execute_get_document_download_link, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": json.dumps(result, ensure_ascii=False),
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
 
         if not tool_results:
