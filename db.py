@@ -210,6 +210,22 @@ class ChatDocumentFocus(Base):
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class ChatLastListing(Base):
+    """รายการล่าสุดที่เครื่องมือค้นคลังไฟล์ (find_customers/list_customer_documents/list_project_documents/
+    list_templates) แสดงให้ผู้ใช้ดูในแชทนี้ — ใช้โดย select_list_item() (main.py) แปล "ข้อ 2"/"อันแรก"/ชื่อที่
+    พูดมาให้เป็น file_id/customer_code ที่แน่นอนด้วยโค้ด แทนที่จะให้ AI เดาเอง 1 แชทมีได้แค่รายการล่าสุดเดียว
+    (chat_id เป็น primary key ตรงๆ แทนที่แถวเดิมเสมอเมื่อมีรายการใหม่) ไม่ต้อง ALTER ตารางเดิมเลย
+
+    kind="documents": items = [{"n": int, "file_id": int}, ...]
+    kind="customers": items = [{"n": int, "customer_code": str}, ...]"""
+    __tablename__ = "chat_last_listing"
+
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    kind = Column(String, nullable=False)
+    items = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class FileCategory(Base):
     """หมวดหมู่ (โฟลเดอร์) ของคลังไฟล์ Excel ที่แอดมินจัดการ — "None" ไม่ใช่แถวในตารางนี้
     (แทนด้วย library_files.category_id = NULL) ชื่อ "none" (ไม่สนตัวพิมพ์เล็กใหญ่) ถูกสงวนไว้
@@ -1242,6 +1258,32 @@ def get_chat_document_focus(chat_id: int, user_id: int) -> Optional[dict]:
             return None
         document_id = row.document_id
     return get_editable_document(document_id, user_id)
+
+
+def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
+    """บันทึกทับรายการล่าสุดของแชทนี้เสมอ (upsert — 1 แชทมีรายการล่าสุดได้แค่ชุดเดียว) เรียกจาก
+    find_customers/list_customer_documents/list_project_documents/list_templates/select_list_item
+    (main.py) ทุกครั้งที่คืนรายการให้ผู้ใช้ดู"""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        row = session.get(ChatLastListing, chat_id)
+        if row is None:
+            row = ChatLastListing(chat_id=chat_id, kind=kind, items=items, created_at=now)
+            session.add(row)
+        else:
+            row.kind = kind
+            row.items = items
+            row.created_at = now
+        session.commit()
+
+
+def get_chat_last_listing(chat_id: int) -> Optional[dict]:
+    """คืน {"kind":, "items":, "created_at":} ของรายการล่าสุดในแชทนี้ หรือ None ถ้ายังไม่เคยมีรายการเลย"""
+    with SessionLocal() as session:
+        row = session.get(ChatLastListing, chat_id)
+        if row is None:
+            return None
+        return {"kind": row.kind, "items": row.items, "created_at": row.created_at}
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------
