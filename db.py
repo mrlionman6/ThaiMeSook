@@ -36,7 +36,7 @@ from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func,
-    LargeBinary,
+    LargeBinary, Boolean,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
@@ -238,18 +238,38 @@ class LibraryFile(Base):
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class Customer(Base):
+    """ทะเบียนลูกค้า — สร้าง/อัปเดตอัตโนมัติตอน import ไฟล์ที่มี customer_code (ดู _extract_identity_fields
+    ใน main.py) customer_code เก็บตามรูปแบบที่พบในเอกสารจริงตรงๆ (unique ระดับ DB บนค่าที่เก็บ) แต่การค้นหา/
+    ตรวจสอบว่ามีอยู่แล้วหรือยังทำแบบไม่สนตัวพิมพ์เล็กใหญ่เสมอ (ผ่าน func.lower() ใน upsert_customer/
+    get_customer_by_code ด้านล่าง ไม่ใช่ constraint ระดับ DB เพราะ Postgres unique ปกติสนตัวพิมพ์)"""
+    __tablename__ = "customers"
+
+    id = Column(Integer, primary_key=True)
+    customer_code = Column(String, nullable=False, unique=True)
+    customer_name = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class LibraryFileMeta(Base):
-    """ข้อมูลประกอบของไฟล์ในคลัง (ลูกค้า/โครงการ/เลขอ้างอิง) — ใช้ขยายการค้นหาไฟล์เมื่อคลังสะสมเอกสารจากหลาย
-    บริษัท/โครงการ แทนการเดาจากชื่อไฟล์เพียงอย่างเดียว (ดู search_library_files ใน main.py) ตารางใหม่แยกจาก
-    library_files ทั้งหมด ไม่ ALTER ตารางเดิม หนึ่งไฟล์มีได้แค่ 1 แถว (file_id เป็น primary key ตรงๆ) ลบไฟล์
-    ในคลัง -> แถวนี้หายไปด้วยอัตโนมัติ (ON DELETE CASCADE) source="ai" = AI สร้างให้ตอน import/สร้างอัตโนมัติ
-    ทีหลัง, source="admin" = แอดมินแก้ไขเอง (ห้ามถูกเขียนทับด้วยการสร้างอัตโนมัติอีก — เช็คที่ main.py)"""
+    """ข้อมูลระบุตัวตนของไฟล์ในคลัง (ลูกค้า/โครงการ/เอกสาร) — ใช้ขยายการค้นหาไฟล์เมื่อคลังสะสมเอกสารจากหลาย
+    บริษัท/โครงการ แทนการเดาจากชื่อไฟล์เพียงอย่างเดียว (ดู search_library_files/_extract_identity_fields ใน
+    main.py) ตารางใหม่แยกจาก library_files ทั้งหมด ไม่ ALTER ตารางเดิม หนึ่งไฟล์มีได้แค่ 1 แถว (file_id เป็น
+    primary key ตรงๆ) ลบไฟล์ในคลัง -> แถวนี้หายไปด้วยอัตโนมัติ (ON DELETE CASCADE)
+
+    source: "label" = ดึงได้จากป้ายในไฟล์ด้วยโค้ดล้วนๆ (แม่นยำที่สุด, ไม่ใช้ AI), "ai" = ไม่พบป้ายเลยเลยให้
+    Claude เดาจากเนื้อไฟล์แทน (ไม่มี customer_code/project_code/is_template — AI ไม่เดารหัส), "admin" =
+    แอดมินแก้ไขเอง (ห้ามถูกเขียนทับด้วยการสร้างอัตโนมัติอีก ไม่ว่าจะเป็นตอน import หรือตอนกด "สร้างข้อมูลย้อนหลัง"
+    — เช็คที่ main.py)"""
     __tablename__ = "library_file_meta"
 
     file_id = Column(Integer, ForeignKey("library_files.id", ondelete="CASCADE"), primary_key=True)
+    customer_code = Column(Text, nullable=True)
     customer_name = Column(Text, nullable=True)
+    project_code = Column(Text, nullable=True)
     project_name = Column(Text, nullable=True)
-    reference_no = Column(Text, nullable=True)
+    document_no = Column(Text, nullable=True)
+    is_template = Column(Boolean, nullable=False, default=False)
     source = Column(String, nullable=False, default="ai")
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
@@ -1519,9 +1539,12 @@ def delete_library_file(file_id: int) -> bool:
 def _library_file_meta_to_dict(row) -> dict:
     return {
         "file_id": row.file_id,
+        "customer_code": row.customer_code,
         "customer_name": row.customer_name,
+        "project_code": row.project_code,
         "project_name": row.project_name,
-        "reference_no": row.reference_no,
+        "document_no": row.document_no,
+        "is_template": row.is_template,
         "source": row.source,
         "updated_at": row.updated_at,
     }
@@ -1534,30 +1557,59 @@ def get_library_file_meta(file_id: int) -> Optional[dict]:
 
 
 def get_all_library_file_meta() -> dict[int, dict]:
-    """คืน {file_id: {...}} ของทุกไฟล์ที่มีข้อมูลประกอบอยู่แล้ว (ไฟล์ที่ไม่อยู่ใน dict นี้ = ยังไม่มีข้อมูล
-    ประกอบเลย) ใช้ join กับ get_library_files() ใน search_library_files() (main.py)"""
+    """คืน {file_id: {...}} ของทุกไฟล์ที่มีข้อมูลระบุตัวตนอยู่แล้ว (ไฟล์ที่ไม่อยู่ใน dict นี้ = ยังไม่มีข้อมูล
+    ระบุตัวตนเลย) ใช้ join กับ get_library_files() ใน search_library_files() (main.py)"""
     with SessionLocal() as session:
         rows = session.query(LibraryFileMeta).all()
         return {row.file_id: _library_file_meta_to_dict(row) for row in rows}
 
 
 def get_library_file_ids_without_meta() -> list[int]:
-    """คืน file_id ของไฟล์ในคลังที่ยังไม่มีข้อมูลประกอบเลย (ไม่มีแถวใน library_file_meta) — ใช้ตอน
-    'สร้างข้อมูลไฟล์ที่ยังไม่มี' กันสร้างซ้ำทับไฟล์ที่มีข้อมูลประกอบอยู่แล้วไม่ว่า source ใด"""
+    """คืน file_id ของไฟล์ในคลังที่ยังไม่มีข้อมูลระบุตัวตนเลย (ไม่มีแถวใน library_file_meta) — ใช้โดย
+    get_library_file_ids_for_regenerate(force_refresh=False) ตอนกด 'สร้างข้อมูลไฟล์ที่ยังไม่มี' กันสร้างซ้ำ
+    ทับไฟล์ที่มีข้อมูลอยู่แล้วไม่ว่า source ใด"""
     with SessionLocal() as session:
         existing_ids = {row.file_id for row in session.query(LibraryFileMeta.file_id).all()}
         all_ids = {row.id for row in session.query(LibraryFile.id).all()}
         return sorted(all_ids - existing_ids)
 
 
+def get_library_file_ids_for_regenerate(force_refresh: bool, after_file_id: Optional[int] = None) -> list[int]:
+    """force_refresh=False: เหมือน get_library_file_ids_without_meta() ทุกประการ (เฉพาะไฟล์ที่ยังไม่มีข้อมูล
+    ระบุตัวตนเลย) force_refresh=True ('ดึงใหม่ทั้งหมด'): ทุกไฟล์ที่ source ไม่ใช่ "admin" ไม่ว่าจะมีข้อมูลอยู่
+    แล้วหรือไม่ (รวมไฟล์ source="label"/"ai" เดิมด้วย — จำเป็นเพราะไฟล์อาจถูกแก้เพิ่มป้ายใหม่ทีหลัง) ไฟล์ที่
+    source="admin" ไม่ถูกแตะเลยไม่ว่ากรณีใด
+
+    after_file_id ใช้เป็น cursor ของ endpoint ที่ทำทีละ batch — ตัด id ที่ <= after_file_id ออก (เรียงจากน้อย
+    ไปมากเสมอ) จำเป็นสำหรับ force_refresh=True โดยเฉพาะ เพราะไฟล์ที่ทำไปแล้วใน batch ก่อนหน้ายังคงมี source
+    ไม่ใช่ "admin" เหมือนเดิม (กลายเป็น "label"/"ai") ถ้าไม่มี cursor นี้ batch ถัดไปจะวนกลับไปทำไฟล์ชุดเดิมซ้ำ
+    ไม่รู้จบ"""
+    if force_refresh:
+        with SessionLocal() as session:
+            all_ids = {row.id for row in session.query(LibraryFile.id).all()}
+            admin_ids = {
+                row.file_id for row in session.query(LibraryFileMeta.file_id).filter(LibraryFileMeta.source == "admin")
+            }
+            ids = all_ids - admin_ids
+    else:
+        ids = set(get_library_file_ids_without_meta())
+
+    if after_file_id is not None:
+        ids = {i for i in ids if i > after_file_id}
+    return sorted(ids)
+
+
 def upsert_library_file_meta(
     file_id: int,
+    customer_code: Optional[str] = None,
     customer_name: Optional[str] = None,
+    project_code: Optional[str] = None,
     project_name: Optional[str] = None,
-    reference_no: Optional[str] = None,
+    document_no: Optional[str] = None,
+    is_template: bool = False,
     source: str = "ai",
 ) -> bool:
-    """สร้างหรือแทนที่ข้อมูลประกอบของไฟล์นี้ทั้งแถว (ไม่ merge ทีละฟิลด์กับของเดิม) คืน False ถ้าไม่พบไฟล์นี้
+    """สร้างหรือแทนที่ข้อมูลระบุตัวตนของไฟล์นี้ทั้งแถว (ไม่ merge ทีละฟิลด์กับของเดิม) คืน False ถ้าไม่พบไฟล์นี้
     ในคลังเลย (กัน insert ไปชน FK constraint ตรงๆ)"""
     with SessionLocal() as session:
         if session.get(LibraryFile, file_id) is None:
@@ -1566,13 +1618,63 @@ def upsert_library_file_meta(
         if row is None:
             row = LibraryFileMeta(file_id=file_id)
             session.add(row)
+        row.customer_code = customer_code
         row.customer_name = customer_name
+        row.project_code = project_code
         row.project_name = project_name
-        row.reference_no = reference_no
+        row.document_no = document_no
+        row.is_template = is_template
         row.source = source
         row.updated_at = datetime.datetime.utcnow()
         session.commit()
         return True
+
+
+def _customer_to_dict(row) -> dict:
+    return {
+        "id": row.id,
+        "customer_code": row.customer_code,
+        "customer_name": row.customer_name,
+        "created_at": row.created_at,
+    }
+
+
+def get_all_customers() -> list[dict]:
+    with SessionLocal() as session:
+        rows = session.query(Customer).order_by(Customer.customer_code).all()
+        return [_customer_to_dict(r) for r in rows]
+
+
+def get_customer_by_code(customer_code: str) -> Optional[dict]:
+    """หาแบบไม่สนตัวพิมพ์เล็กใหญ่ (func.lower) เพราะ customer_code เก็บตามรูปแบบที่พบในเอกสารจริงตรงๆ
+    อาจพิมพ์คนละเคสกันระหว่างไฟล์"""
+    with SessionLocal() as session:
+        row = (
+            session.query(Customer)
+            .filter(func.lower(Customer.customer_code) == customer_code.strip().lower())
+            .first()
+        )
+        return _customer_to_dict(row) if row is not None else None
+
+
+def upsert_customer(customer_code: str, customer_name: Optional[str] = None) -> int:
+    """สร้างลูกค้าใหม่ถ้ายังไม่มี customer_code นี้ (เทียบไม่สนตัวพิมพ์เล็กใหญ่) หรืออัปเดตชื่อถ้ามีอยู่แล้ว —
+    ชื่อใหม่ทับชื่อเดิมเฉพาะตอนไม่ว่างเปล่าเท่านั้น (customer_name=None/"" จะไม่ลบชื่อเดิมที่เคยมี) คืน id"""
+    customer_code = customer_code.strip()
+    with SessionLocal() as session:
+        row = (
+            session.query(Customer)
+            .filter(func.lower(Customer.customer_code) == customer_code.lower())
+            .first()
+        )
+        if row is None:
+            row = Customer(customer_code=customer_code, customer_name=customer_name or None)
+            session.add(row)
+        elif customer_name:
+            row.customer_name = customer_name
+        session.commit()
+        session.refresh(row)
+        return row.id
 
 
 # ---------- Chat sessions & messages ----------

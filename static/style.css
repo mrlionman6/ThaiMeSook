@@ -1700,6 +1700,17 @@ button {
     vertical-align: middle;
 }
 
+.file-library-template-badge {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: bold;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--color-sky-pale);
+    color: var(--color-sky-pale-text);
+    vertical-align: middle;
+}
+
 .file-library-import-row {
     display: flex;
     align-items: center;

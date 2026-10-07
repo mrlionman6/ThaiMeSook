@@ -89,8 +89,11 @@ from db import (
     get_chat_document_focus,
     get_library_file_meta,
     get_all_library_file_meta,
-    get_library_file_ids_without_meta,
+    get_library_file_ids_for_regenerate,
     upsert_library_file_meta,
+    get_all_customers,
+    get_customer_by_code,
+    upsert_customer,
 )
 
 import os
@@ -484,28 +487,62 @@ AVAILABLE_TOOLS = [
 # (เช็คใน run_agentic_tool_loop() ตอนประกอบ tools list ที่จะส่งจริง ไม่ใช่แค่ปฏิเสธตอน dispatch)
 LIBRARY_TOOLS = [
     {
-        "name": "list_library_files",
+        "name": "find_customers",
         "description": (
-            "ค้นหาไฟล์ในคลังเอกสาร Excel ที่แอดมินเตรียมไว้ให้ผู้ใช้ ต้องเรียกเครื่องมือนี้ก่อนเสมอเมื่อผู้ใช้ขอเปิด "
-            "อ่าน เปรียบเทียบ หรือแก้ไฟล์ในคลัง ห้ามเดาชื่อไฟล์หรือ file_id เองเด็ดขาด เรียกโดยไม่ต้องระบุ parameter "
-            "ใดเลยได้ถ้าผู้ใช้แค่อยากดูว่ามีไฟล์อะไรบ้างทั้งหมด ถ้ารู้ทั้งชื่อลูกค้าและประเภทเอกสาร(โฟลเดอร์) "
-            "ให้แยกส่งเป็น customer และ folder เสมอ แม่นยำกว่าใส่รวมกันใน text อย่างเดียว"
+            "ค้นหาบริษัทลูกค้าในทะเบียนของคลังเอกสาร ใช้เมื่อผู้ใช้พูดถึงชื่อบริษัท/ลูกค้าแต่ยังไม่รู้รหัสลูกค้า "
+            "ที่แน่ชัด เรียกเครื่องมือนี้ก่อนเสมอเมื่อต้องการดูเอกสารของบริษัทใดบริษัทหนึ่ง ห้ามเดารหัสลูกค้าเอง"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "text": {
+                "query": {
                     "type": "string",
-                    "description": "คำค้นหาทั่วไป (ไม่บังคับ) จับคู่กับชื่อไฟล์ ชื่อโฟลเดอร์ ชื่อลูกค้า ชื่อโครงการ และเลขอ้างอิงของไฟล์",
+                    "description": "ชื่อบริษัท (เต็มหรือบางส่วน) หรือรหัสลูกค้าที่ผู้ใช้พิมพ์มา",
                 },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "list_customer_documents",
+        "description": (
+            "แสดงรายการเอกสารของบริษัทหนึ่ง (ไม่รวมไฟล์แม่แบบ) ระบุ customer เป็นรหัสลูกค้าที่แน่ชัด (จาก "
+            "find_customers) หรือชื่อบริษัทก็ได้ ถ้าชื่อที่ส่งมาตรงกับหลายบริษัท จะได้รายชื่อบริษัทกลับมาแทนให้ "
+            "เลือกก่อน ไม่แสดงเอกสาร"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
                 "customer": {
                     "type": "string",
-                    "description": "ชื่อลูกค้า/บริษัทที่เอกสารนี้เกี่ยวข้อง (ไม่บังคับ) ส่งแยกจาก text ถ้ารู้ชื่อลูกค้าชัดเจน แม่นยำกว่า",
+                    "description": "รหัสลูกค้าที่แน่ชัด หรือชื่อบริษัท (เต็มหรือบางส่วน)",
                 },
                 "folder": {
                     "type": "string",
-                    "description": "ชื่อโฟลเดอร์/ประเภทเอกสาร (ไม่บังคับ) ส่งแยกจาก text ถ้ารู้ประเภทเอกสารชัดเจน แม่นยำกว่า",
+                    "description": "ชื่อโฟลเดอร์/ประเภทเอกสารที่จะกรอง (ไม่บังคับ)",
                 },
+            },
+            "required": ["customer"],
+        },
+    },
+    {
+        "name": "list_project_documents",
+        "description": "แสดงรายการเอกสารทุกประเภทของโปรเจคหนึ่ง (ระบุด้วยรหัสโปรเจค) เรียกเมื่อผู้ใช้พูดถึงรหัส/ชื่อโปรเจคโดยตรง",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_code": {"type": "string", "description": "รหัสโปรเจคที่แน่ชัด"},
+            },
+            "required": ["project_code"],
+        },
+    },
+    {
+        "name": "list_templates",
+        "description": "แสดงรายการไฟล์แม่แบบ (เอกสารเปล่าไว้กรอกใหม่) ในคลัง เรียกเมื่อผู้ใช้ขอร่าง/สร้างเอกสารใหม่",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "description": "ชื่อโฟลเดอร์/ประเภทเอกสารที่จะกรอง (ไม่บังคับ)"},
             },
             "required": [],
         },
@@ -514,22 +551,27 @@ LIBRARY_TOOLS = [
         "name": "open_library_file",
         "description": (
             "เปิดไฟล์จากคลังเอกสารเข้ามาในแชทนี้เป็นสำเนาที่แก้ไข/เปรียบเทียบได้ ไม่แตะไฟล์ต้นฉบับในคลังเลย "
-            "ระบุได้ทั้ง file_id (ถ้ารู้แน่ชัดจาก list_library_files มาก่อนแล้ว) หรือ text/customer/folder (ให้ "
-            "ระบบค้นหาให้เอง) — ถ้ารู้ทั้งชื่อลูกค้าและประเภทเอกสาร(โฟลเดอร์) ให้แยกส่งเป็น customer และ folder "
-            "เสมอ แม่นยำกว่าใส่รวมกันใน text อย่างเดียว ถ้าผลลัพธ์มีมากกว่า 1 ไฟล์ จะได้รายชื่อกลับมาโดยไม่เปิด "
-            "ไฟล์ไหนเลย ให้ถามผู้ใช้หรือเรียกใหม่ด้วย file_id ที่ชัดเจน ถ้าไฟล์ชื่อเดียวกันเปิดอยู่ในแชทนี้แล้ว "
-            "จะใช้ตัวเดิม ไม่สร้างสำเนาซ้ำ หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
+            "ระบุ document_no (แนะนำที่สุด — เลขอ้างอิงเอกสารที่เห็นในรายการจาก find_customers/"
+            "list_customer_documents/list_project_documents/list_templates) หรือ file_id (ถ้ารู้แน่ชัด) หรือ "
+            "text/customer/folder (ทางเลือกสุดท้ายเมื่อไม่มีทั้งสองอย่าง ให้ระบบค้นหาคำทั่วไปให้เอง) อย่างใดอย่างหนึ่ง "
+            "— ถ้าผลลัพธ์มีมากกว่า 1 ไฟล์ จะได้รายชื่อกลับมาโดยไม่เปิดไฟล์ไหนเลย ให้ถามผู้ใช้หรือเรียกใหม่ด้วย "
+            "document_no/file_id ที่ชัดเจน ถ้าไฟล์ชื่อเดียวกันเปิดอยู่ในแชทนี้แล้ว จะใช้ตัวเดิม ไม่สร้างสำเนาซ้ำ "
+            "หลังเปิดแล้วผู้ใช้คุยแก้/เปรียบเทียบ/ขอดาวน์โหลดไฟล์นี้ได้เหมือนไฟล์ที่แนบเข้าแชทเองปกติทุกประการ"
         ),
         "input_schema": {
             "type": "object",
             "properties": {
+                "document_no": {
+                    "type": "string",
+                    "description": "เลขอ้างอิงเอกสาร (แนะนำ — เห็นได้จากรายการเอกสารที่เครื่องมือค้นอื่นคืนมา)",
+                },
                 "file_id": {
                     "type": "integer",
-                    "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของ list_library_files หรือ open_library_file ครั้งก่อน)",
+                    "description": "id ของไฟล์ที่ต้องการเปิด (ได้จากผลลัพธ์ของเครื่องมือค้นอื่นครั้งก่อน)",
                 },
                 "text": {
                     "type": "string",
-                    "description": "คำค้นหาทั่วไปที่ผู้ใช้ใช้อ้างถึงไฟล์นี้ ใช้แทน file_id ได้ถ้ายังไม่รู้ file_id ที่แน่ชัด",
+                    "description": "คำค้นหาทั่วไปที่ผู้ใช้ใช้อ้างถึงไฟล์นี้ (ทางเลือกสุดท้าย) ใช้แทน document_no/file_id ได้ถ้ายังไม่รู้ที่แน่ชัด",
                 },
                 "customer": {
                     "type": "string",
@@ -613,24 +655,10 @@ def _find_similar_library_files(query: str, files: list[dict], limit: int = 3) -
     return [item for item, _ in scored[:limit]]
 
 
-def search_library_files(
-    text: Optional[str] = None, customer: Optional[str] = None, folder: Optional[str] = None
-) -> dict:
-    """ฟังก์ชันค้นกลางตัวเดียวสำหรับคลังไฟล์ — ใช้ร่วมกันทั้ง execute_list_library_files และ
-    execute_open_library_file แทนการเดาจากชื่อไฟล์เพียงอย่างเดียว (จำเป็นเมื่อคลังสะสมเอกสารจากหลายบริษัท/
-    โครงการจนชื่อไฟล์ไม่พอแยกไฟล์ได้แม่นยำอีกต่อไป) รวม library_files กับข้อมูลประกอบใน library_file_meta
-    (ลูกค้า/โครงการ/เลขอ้างอิง) เข้าด้วยกันก่อนค้น
-
-    - customer: กรองไฟล์ที่ customer_name (หรือชื่อไฟล์ถ้าไม่มี customer_name) หลัง normalize ด้วย
-      _normalize_customer_name มี customer เป็นส่วนหนึ่ง หรือกลับกัน
-    - folder: กรองไฟล์ที่ชื่อโฟลเดอร์หลัง normalize มี folder เป็นส่วนหนึ่ง
-    - text: ตัดคำแล้วให้คะแนนแบบเดียวกับที่ _tokenize_library_query ใช้ เทียบกับชื่อไฟล์+ชื่อโฟลเดอร์+
-      customer_name+project_name+reference_no หลัง normalize รวมกัน เรียงคะแนนมากไปน้อย
-    - ไม่พบไฟล์เลยทั้งที่ระบุเงื่อนไขมาอย่างน้อยหนึ่งอย่าง: คืนชื่อไฟล์/ชื่อลูกค้าที่ใกล้เคียงที่สุด 3 รายการ
-      (ดู _find_similar_library_files) พร้อม not_found=True
-
-    คืน {"files": [...], "not_found": bool, "similar": [...]} — แต่ละไฟล์ใน files/similar คืน file_id,
-    filename, folder, customer_name, project_name, reference_no, summary, has_macros"""
+def _get_enriched_library_files() -> list[dict]:
+    """รวม library_files กับข้อมูลระบุตัวตนใน library_file_meta (ลูกค้า/โครงการ/เอกสาร) เข้าด้วยกัน —
+    ใช้ร่วมกันโดย search_library_files และฟังก์ชันค้นหาเฉพาะทางทั้งหมด (find_customers,
+    list_customer_documents, list_project_documents, list_templates, การหาด้วย document_no)"""
     categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
     meta_map = get_all_library_file_meta()
 
@@ -642,13 +670,39 @@ def search_library_files(
             "file_id": f["id"],
             "filename": f["filename"],
             "folder": folder_name,
+            "customer_code": meta.get("customer_code"),
             "customer_name": meta.get("customer_name"),
+            "project_code": meta.get("project_code"),
             "project_name": meta.get("project_name"),
-            "reference_no": meta.get("reference_no"),
+            "document_no": meta.get("document_no"),
+            "is_template": bool(meta.get("is_template")),
             "summary": f["summary"],
             "has_macros": _library_file_has_macros(f),
         })
+    return enriched
 
+
+def search_library_files(
+    text: Optional[str] = None, customer: Optional[str] = None, folder: Optional[str] = None
+) -> dict:
+    """ฟังก์ชันค้นด้วยคำทั่วไปสำหรับคลังไฟล์ — เก็บไว้เป็น "ทางสุดท้าย" เมื่อ find_customers/
+    list_customer_documents/list_project_documents/list_templates/การหาด้วย document_no (ซึ่งแม่นยำกว่า
+    เพราะอิงรหัสที่ดึงจากป้ายในไฟล์โดยตรง) ยังหาไม่เจอ หรือผู้ใช้พิมพ์มาเป็นคำค้นทั่วไปไม่ระบุรหัสชัดเจน
+
+    - customer: กรองไฟล์ที่ customer_name (หรือชื่อไฟล์ถ้าไม่มี customer_name) หลัง normalize ด้วย
+      _normalize_customer_name มี customer เป็นส่วนหนึ่ง หรือกลับกัน
+    - folder: กรองไฟล์ที่ชื่อโฟลเดอร์หลัง normalize มี folder เป็นส่วนหนึ่ง ถ้ากรองแล้วได้ศูนย์ไฟล์ ให้เอาคำใน
+      folder ไปรวมกับ text แล้วค้นแบบคำทั่วไปแทน (เผื่อผู้ใช้พิมพ์คำที่ไม่ตรงชื่อโฟลเดอร์จริงๆ)
+    - text: ตัดคำแล้วให้คะแนนเทียบกับชื่อไฟล์+ชื่อโฟลเดอร์+customer_name+project_name+document_no หลัง
+      normalize รวมกัน เก็บเฉพาะไฟล์ที่ได้คะแนนสูงสุดเท่านั้น (ไม่ใช่ทุกไฟล์ที่คะแนน > 0) เปิดได้ทันทีถ้าคะแนน
+      สูงสุดมีไฟล์เดียว
+    - ไม่พบไฟล์เลยทั้งที่ระบุเงื่อนไขมาอย่างน้อยหนึ่งอย่าง: คืนชื่อไฟล์/ชื่อลูกค้าที่ใกล้เคียงที่สุด 3 รายการ
+      (ดู _find_similar_library_files) พร้อม not_found=True
+
+    คืน {"files": [...], "not_found": bool, "similar": [...]} — แต่ละไฟล์ใน files/similar คืน file_id,
+    filename, folder, customer_code, customer_name, project_code, project_name, document_no, is_template,
+    summary, has_macros"""
+    enriched = _get_enriched_library_files()
     candidates = enriched
 
     if customer:
@@ -662,10 +716,16 @@ def search_library_files(
 
     if folder:
         normalized_folder = _normalize_library_search_text(folder)
-        candidates = [
+        folder_filtered = [
             item for item in candidates
             if normalized_folder in _normalize_library_search_text(item["folder"])
         ]
+        if folder_filtered:
+            candidates = folder_filtered
+        else:
+            # กรองด้วย folder แล้วได้ศูนย์ -> folder อาจจริงๆ แล้วเป็นคำค้นทั่วไป ไม่ใช่ชื่อโฟลเดอร์จริง
+            # เอาไปรวมกับ text แล้วค้นแบบคำทั่วไปแทน ไม่ปล่อยให้ไม่พบอะไรเลยเงียบๆ
+            text = f"{text} {folder}".strip() if text else folder
 
     if text:
         tokens = _tokenize_library_query(text)
@@ -676,13 +736,17 @@ def search_library_files(
             for item in candidates:
                 haystack = _normalize_library_search_text(" ".join([
                     item["filename"], item["folder"], item["customer_name"] or "",
-                    item["project_name"] or "", item["reference_no"] or "",
+                    item["project_name"] or "", item["document_no"] or "",
                 ]))
                 score = sum(1 for tok in tokens if tok in haystack)
                 if score > 0:
                     scored.append((item, score))
-            scored.sort(key=lambda pair: pair[1], reverse=True)
-            candidates = [item for item, _ in scored]
+            if scored:
+                scored.sort(key=lambda pair: pair[1], reverse=True)
+                top_score = scored[0][1]
+                candidates = [item for item, score in scored if score == top_score]
+            else:
+                candidates = []
 
     if candidates or not (text or customer or folder):
         return {"files": candidates, "not_found": False, "similar": []}
@@ -691,12 +755,202 @@ def search_library_files(
     return {"files": [], "not_found": True, "similar": similar}
 
 
-def execute_list_library_files(tool_input: dict) -> dict:
-    """ค้นหาไฟล์ในคลัง — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ library_files/library_file_meta เลย
-    เป็น wrapper บาง ๆ ของ search_library_files() (ดูด้านบน)"""
-    return search_library_files(
-        text=tool_input.get("text"), customer=tool_input.get("customer"), folder=tool_input.get("folder"),
-    )
+def _escape_markdown_text(text) -> str:
+    """escape อักขระ markdown ที่ทำให้รูปแบบรายการที่สร้างด้วยโค้ดเพี้ยน (*, _, [, ], \\, `) ก่อนแทรกใน
+    รายการเอกสาร/บริษัทที่จัดรูปแบบด้วย _format_library_document_list/_format_customer_list"""
+    text = "" if text is None else str(text)
+    for ch in ("\\", "*", "_", "[", "]", "`"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def _format_document_line(n: int, doc: dict) -> str:
+    """สร้างบรรทัดเดียวของรายการเอกสาร: "N. <document_no> · <project_name> (โปรเจค <project_code>)"
+    ข้ามส่วนที่ไม่มีข้อมูล ถ้าไม่มี document_no ใช้ชื่อไฟล์แทน ต่อท้าย " · มีมาโคร" ถ้ามีมาโคร"""
+    label = doc.get("document_no") or doc["filename"]
+    parts = [_escape_markdown_text(label)]
+
+    if doc.get("project_name") and doc.get("project_code"):
+        parts.append(f"{_escape_markdown_text(doc['project_name'])} (โปรเจค {_escape_markdown_text(doc['project_code'])})")
+    elif doc.get("project_name"):
+        parts.append(_escape_markdown_text(doc["project_name"]))
+    elif doc.get("project_code"):
+        parts.append(f"โปรเจค {_escape_markdown_text(doc['project_code'])}")
+
+    line = f"{n}. " + " · ".join(parts)
+    if doc.get("has_macros"):
+        line += " · มีมาโคร"
+    return line
+
+
+def _format_library_document_list(title: str, documents: list[dict]) -> str:
+    """สร้างรายการเอกสารแบบ markdown ด้วยโค้ดล้วนๆ จัดกลุ่มตามโฟลเดอร์ ลำดับเลขต่อเนื่องกันทั้งรายการ (ไม่รีเซ็ต
+    ทุกโฟลเดอร์) ใช้รูปแบบเดียวกันทั้ง list_customer_documents, list_project_documents, list_templates
+    (title ต่างกันไปตามบริบท) ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู LIBRARY_LOGGED_IN_RULES)"""
+    if not documents:
+        return f"{title}\n\n(ไม่มีเอกสาร)"
+
+    by_folder: dict[str, list[dict]] = {}
+    for doc in documents:
+        by_folder.setdefault(doc.get("folder") or "ไม่มีหมวดหมู่", []).append(doc)
+
+    lines = [title, ""]
+    n = 0
+    for folder in sorted(by_folder.keys()):
+        lines.append(f"โฟลเดอร์ {_escape_markdown_text(folder)}:")
+        for doc in by_folder[folder]:
+            n += 1
+            lines.append(_format_document_line(n, doc))
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def _format_customer_list(title: str, customers: list[dict]) -> str:
+    """สร้างรายการบริษัทแบบ markdown ด้วยโค้ดล้วนๆ: "N. ชื่อลูกค้า (รหัส) · X เอกสาร" ใช้ตอน find_customers
+    คืนหลายบริษัท หรือ list_customer_documents หาบริษัทจาก customer ที่เป็นชื่อแล้วกำกวม"""
+    if not customers:
+        return f"{title}\n\n(ไม่พบบริษัท)"
+    lines = [title, ""]
+    for i, cust in enumerate(customers, start=1):
+        name = _escape_markdown_text(cust.get("customer_name") or "(ไม่มีชื่อ)")
+        code = _escape_markdown_text(cust["customer_code"])
+        lines.append(f"{i}. {name} ({code}) · {cust['document_count']} เอกสาร")
+    return "\n".join(lines)
+
+
+def find_customers(query: str) -> list[dict]:
+    """หาบริษัทในทะเบียนลูกค้า (customers table) ที่ตรงกับ query ด้วยโค้ดล้วนๆ — เทียบกับ customer_code
+    ตรงตัวแบบไม่สนตัวพิมพ์เล็กใหญ่ก่อน (ต้องตรงเป๊ะ) และ customer_name หลัง normalize ด้วย
+    _normalize_customer_name (ตัดวรรณยุกต์/บริษัท/จำกัด/บจก./หจก.) เป็นส่วนหนึ่งกันและกัน
+
+    คืน list [{"customer_code", "customer_name", "document_count"}] — document_count นับเฉพาะเอกสารที่ไม่ใช่
+    แม่แบบ (is_template=False) ของลูกค้านั้น"""
+    query = (query or "").strip()
+    query_code = query.lower()
+    query_name = _normalize_customer_name(query)
+
+    doc_counts: dict[str, int] = {}
+    for item in _get_enriched_library_files():
+        if item["is_template"] or not item["customer_code"]:
+            continue
+        key = item["customer_code"].strip().lower()
+        doc_counts[key] = doc_counts.get(key, 0) + 1
+
+    matches = []
+    for cust in get_all_customers():
+        code_match = bool(query_code) and cust["customer_code"].strip().lower() == query_code
+        normalized_name = _normalize_customer_name(cust.get("customer_name") or "")
+        name_match = bool(query_name) and bool(normalized_name) and (
+            query_name in normalized_name or normalized_name in query_name
+        )
+        if code_match or name_match:
+            matches.append({
+                "customer_code": cust["customer_code"],
+                "customer_name": cust.get("customer_name"),
+                "document_count": doc_counts.get(cust["customer_code"].strip().lower(), 0),
+            })
+    return matches
+
+
+def list_customer_documents(customer_code: str, folder: Optional[str] = None) -> dict:
+    """เอกสารทั้งหมดของลูกค้าคนเดียว (ระบุด้วย customer_code ที่แน่ชัด เทียบไม่สนตัวพิมพ์เล็กใหญ่) ไม่รวมไฟล์
+    แม่แบบ (is_template=True) กรองด้วย folder เพิ่มได้ (ไม่บังคับ) คืน {"documents": [...]}"""
+    normalized_code = customer_code.strip().lower()
+    documents = [
+        item for item in _get_enriched_library_files()
+        if not item["is_template"] and item["customer_code"] and item["customer_code"].strip().lower() == normalized_code
+    ]
+    if folder:
+        normalized_folder = _normalize_library_search_text(folder)
+        documents = [d for d in documents if normalized_folder in _normalize_library_search_text(d["folder"])]
+    return {"documents": documents}
+
+
+def list_project_documents(project_code: str) -> dict:
+    """เอกสารทุกประเภทของโปรเจคเดียว (ระบุด้วย project_code ที่แน่ชัด เทียบไม่สนตัวพิมพ์เล็กใหญ่) รวมแม่แบบด้วย
+    ถ้ามี (ในทางปฏิบัติแทบไม่เกิดเพราะแม่แบบมักไม่มี project_code) คืน {"documents": [...]}"""
+    normalized_code = project_code.strip().lower()
+    documents = [
+        item for item in _get_enriched_library_files()
+        if item["project_code"] and item["project_code"].strip().lower() == normalized_code
+    ]
+    return {"documents": documents}
+
+
+def list_templates(folder: Optional[str] = None) -> dict:
+    """ไฟล์แม่แบบทั้งหมดในคลัง (is_template=True) กรองด้วย folder เพิ่มได้ (ไม่บังคับ) คืน {"documents": [...]}"""
+    documents = [item for item in _get_enriched_library_files() if item["is_template"]]
+    if folder:
+        normalized_folder = _normalize_library_search_text(folder)
+        documents = [d for d in documents if normalized_folder in _normalize_library_search_text(d["folder"])]
+    return {"documents": documents}
+
+
+def _find_library_file_by_document_no(document_no: str) -> Optional[dict]:
+    """หาไฟล์ในคลังด้วย document_no ตรงตัว (ไม่สนตัวพิมพ์เล็กใหญ่) คืน None ถ้าไม่พบ"""
+    normalized = document_no.strip().lower()
+    for item in _get_enriched_library_files():
+        if item["document_no"] and item["document_no"].strip().lower() == normalized:
+            return item
+    return None
+
+
+def execute_find_customers(tool_input: dict) -> dict:
+    """ค้นบริษัทในทะเบียนลูกค้า — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ customers/library_file_meta เลย"""
+    query = (tool_input.get("query") or "").strip()
+    if not query:
+        return {"error": "ต้องระบุ query"}
+    matches = find_customers(query)
+    formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{query}'", matches)
+    return {"customers": matches, "formatted": formatted}
+
+
+def execute_list_customer_documents(tool_input: dict) -> dict:
+    """แสดงเอกสารของลูกค้าหนึ่งคน — รับทั้งรหัสลูกค้าที่แน่ชัดหรือชื่อบริษัท (เต็ม/บางส่วน) ถ้าสิ่งที่ส่งมาไม่ตรง
+    กับ customer_code ไหนเป๊ะ จะลอง find_customers แทน — ตรงหลายบริษัทคืนรายชื่อบริษัทให้เลือกก่อน ไม่แสดงเอกสาร"""
+    customer = (tool_input.get("customer") or "").strip()
+    folder = tool_input.get("folder")
+    if not customer:
+        return {"error": "ต้องระบุ customer"}
+
+    customer_row = get_customer_by_code(customer)
+    if customer_row is None:
+        matches = find_customers(customer)
+        if len(matches) == 0:
+            return {"error": f"ไม่พบบริษัทที่ตรงกับ '{customer}' ในทะเบียนลูกค้า ลองเรียก find_customers เพื่อดูชื่อที่ใกล้เคียง"}
+        if len(matches) > 1:
+            formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{customer}' กรุณาเลือกก่อน", matches)
+            return {"matched_multiple_customers": True, "customers": matches, "formatted": formatted}
+        customer_row = {"customer_code": matches[0]["customer_code"], "customer_name": matches[0]["customer_name"]}
+
+    result = list_customer_documents(customer_row["customer_code"], folder=folder)
+    documents = result["documents"]
+    title = f"**{customer_row.get('customer_name') or customer_row['customer_code']} ({customer_row['customer_code']})** {len(documents)} เอกสาร"
+    formatted = _format_library_document_list(title, documents)
+    return {"documents": documents, "formatted": formatted}
+
+
+def execute_list_project_documents(tool_input: dict) -> dict:
+    project_code = (tool_input.get("project_code") or "").strip()
+    if not project_code:
+        return {"error": "ต้องระบุ project_code"}
+    result = list_project_documents(project_code)
+    documents = result["documents"]
+    project_name = next((d["project_name"] for d in documents if d.get("project_name")), None)
+    title_name = f"{project_name} ({project_code})" if project_name else project_code
+    title = f"**โปรเจค {title_name}** {len(documents)} เอกสาร"
+    formatted = _format_library_document_list(title, documents)
+    return {"documents": documents, "formatted": formatted}
+
+
+def execute_list_templates(tool_input: dict) -> dict:
+    folder = tool_input.get("folder")
+    result = list_templates(folder=folder)
+    documents = result["documents"]
+    title = f"**ไฟล์แม่แบบ** {len(documents)} รายการ"
+    formatted = _format_library_document_list(title, documents)
+    return {"documents": documents, "formatted": formatted}
 
 
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
@@ -704,23 +958,30 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
     library_files เลยไม่ว่าทางไหน (ต้นฉบับในคลังไม่ถูกแก้เด็ดขาด) caller (run_agentic_tool_loop) รับประกัน
     แล้วว่า user_id/chat_id เป็นของจริงจาก session ที่ล็อกอินอยู่ ไม่ใช่ค่าที่ Claude ส่งมาเอง
 
-    รับ file_id ตรงๆ หรือ text/customer/folder (ให้ search_library_files() ค้นให้เอง) อย่างใดอย่างหนึ่ง —
-    ผลค้นเหลือไฟล์เดียวเปิดไฟล์นั้นเลย เหลือหลายไฟล์คืนรายชื่อที่เจอโดยไม่เปิดไฟล์ไหนเลย กันเดาผิดไฟล์เงียบๆ
-    (แก้ปัญหาที่เคยเจอ: ไฟล์ชื่อขึ้นต้นเหมือนกันทำให้ Claude เลือก file_id ผิด) ไม่เจอเลยคืนชื่อไฟล์ใกล้เคียง
-    ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน (normalize แล้ว) เปิดอยู่ในแชทนี้แล้วหรือยัง ถ้ามีให้ใช้
-    ตัวเดิมแทนที่จะสร้างซ้ำ (แก้ปัญหาที่เคยเจอ: เปิดไฟล์เดิมซ้ำสองครั้งในแชทเดียว)"""
+    ลำดับความแม่นยำ: document_no ตรงตัว (แนะนำที่สุด) -> file_id ตรงๆ -> text/customer/folder (ทางสุดท้าย
+    ผ่าน search_library_files) ผลค้นเหลือไฟล์เดียวเปิดไฟล์นั้นเลย เหลือหลายไฟล์คืนรายชื่อที่เจอโดยไม่เปิดไฟล์
+    ไหนเลย กันเดาผิดไฟล์เงียบๆ ไม่เจอเลยคืนชื่อไฟล์ใกล้เคียง ก่อนสร้างสำเนาใหม่ เช็คก่อนว่ามีไฟล์ชื่อเดียวกัน
+    (normalize แล้ว) เปิดอยู่ในแชทนี้แล้วหรือยัง ถ้ามีให้ใช้ตัวเดิมแทนที่จะสร้างซ้ำ"""
+    document_no = tool_input.get("document_no")
     file_id = tool_input.get("file_id")
     text = tool_input.get("text")
     customer = tool_input.get("customer")
     folder = tool_input.get("folder")
 
-    if file_id is None and not (text or customer or folder):
-        return {"error": "ต้องระบุ file_id หรือ text/customer/folder อย่างน้อยหนึ่งอย่าง"}
+    if document_no is None and file_id is None and not (text or customer or folder):
+        return {"error": "ต้องระบุ document_no, file_id, หรือ text/customer/folder อย่างน้อยหนึ่งอย่าง"}
 
-    if file_id is not None:
+    if document_no:
+        item = _find_library_file_by_document_no(document_no)
+        if item is None:
+            return {"error": f"ไม่พบเอกสารเลขอ้างอิง '{document_no}' ในคลัง"}
+        file_row = get_library_file(item["file_id"])
+        if file_row is None:
+            return {"error": "ไม่พบไฟล์นี้ในคลัง"}
+    elif file_id is not None:
         file_row = get_library_file(file_id)
         if file_row is None:
-            return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
+            return {"error": "ไม่พบไฟล์นี้ในคลัง — ลองค้นใหม่อีกครั้งเพื่อยืนยัน file_id"}
     else:
         result = search_library_files(text=text, customer=customer, folder=folder)
         files = result["files"]
@@ -728,7 +989,7 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
             if result["similar"]:
                 names = ", ".join(f"'{f['filename']}'" for f in result["similar"])
                 return {"error": f"ไม่พบไฟล์ที่ตรงกับเงื่อนไขนี้ในคลัง ไฟล์ที่ชื่อใกล้เคียงที่สุด: {names}"}
-            return {"error": "ไม่พบไฟล์ที่ตรงกับเงื่อนไขนี้ในคลัง ลองเรียก list_library_files เพื่อดูรายชื่อทั้งหมด"}
+            return {"error": "ไม่พบไฟล์ที่ตรงกับเงื่อนไขนี้ในคลัง"}
         if len(files) > 1:
             return {
                 "matched_multiple": True,
@@ -737,7 +998,7 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
             }
         file_row = get_library_file(files[0]["file_id"])
         if file_row is None:
-            return {"error": "ไม่พบไฟล์นี้ในคลัง — เรียก list_library_files ใหม่อีกครั้งเพื่อยืนยัน file_id"}
+            return {"error": "ไม่พบไฟล์นี้ในคลัง — ลองค้นใหม่อีกครั้งเพื่อยืนยัน file_id"}
 
     # กันเปิดไฟล์ชื่อเดียวกันซ้ำในแชทเดียวกัน — ถ้ามีอยู่แล้วให้ใช้ตัวเดิม ไม่สร้าง EditableDocument ใหม่
     target_normalized_name = _normalize_filename_for_matching(file_row["filename"])
@@ -1084,7 +1345,8 @@ def run_agentic_tool_loop(
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
-    - list_library_files/open_library_file/list_chat_documents/compare_chat_documents/edit_chat_document/
+    - find_customers/list_customer_documents/list_project_documents/list_templates/open_library_file/
+      list_chat_documents/compare_chat_documents/edit_chat_document/
       get_document_download_link: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่) และ
       chat_id (อยู่ในแชทจริง) เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request
       เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
@@ -1128,8 +1390,29 @@ def run_agentic_tool_loop(
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
-            elif block.type == "tool_use" and block.name == "list_library_files" and user_id:
-                result = execute_list_library_files(block.input)
+            elif block.type == "tool_use" and block.name == "find_customers" and user_id and chat_id:
+                result = execute_find_customers(block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "list_customer_documents" and user_id and chat_id:
+                result = execute_list_customer_documents(block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "list_project_documents" and user_id and chat_id:
+                result = execute_list_project_documents(block.input)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "list_templates" and user_id and chat_id:
+                result = execute_list_templates(block.input)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1422,21 +1705,19 @@ def describe_image_for_retrieval(image_data: dict, query: str) -> tuple[bool, st
     return is_relevant, detail
 
 LIBRARY_LOGGED_IN_RULES = (
-    "\n- ถ้าผู้ใช้ขอไฟล์ในคลัง ให้เรียก list_library_files ก่อนเสมอเพื่อยืนยันข้อมูลล่าสุด (เช่น summary) "
-    "ห้ามเดาชื่อหรือ file_id เอง\n"
-    "- ถ้าคำขอของผู้ใช้ (เปิด ดู อ่าน เปรียบเทียบ หรือแก้ไข) ตรงกับชื่อหรือคำอธิบายไฟล์ในคลังด้านล่างเพียงไฟล์เดียวชัดเจน "
-    "ให้เรียก open_library_file ทันทีโดยไม่ต้องถามขออนุญาตก่อน ถามกลับผู้ใช้เฉพาะตอนตรงกับหลายไฟล์พร้อมกัน "
-    "หรือไม่ตรงกับไฟล์ไหนเลยเท่านั้น\n"
-    "- ขอดูรายการไฟล์ทั้งหมด ให้แสดงจัดตามโฟลเดอร์ พร้อม summary ที่เก็บไว้ ไม่ต้องเปิดไฟล์\n"
-    "- ห้ามแสดง file_id หรือ document_id ให้ผู้ใช้เห็นเด็ดขาด ใช้ชื่อไฟล์เสมอเวลาพูดถึงไฟล์\n"
+    # ตัดออก 4 ข้อเดิมที่อ้างอิง list_library_files (เครื่องมือที่เลิกใช้แล้ว) และ "รายชื่อไฟล์ในคลังด้านล่าง"
+    # (ด้านล่างตอนนี้เป็นรายชื่อบริษัทแทน ไม่ใช่รายชื่อไฟล์) — ดูรายละเอียดเหตุผลใน PR description
+    "\n- ห้ามแสดง file_id หรือ document_id ให้ผู้ใช้เห็นเด็ดขาด ใช้ชื่อไฟล์เสมอเวลาพูดถึงไฟล์\n"
     "- เมื่อคุณถามกลับว่าหมายถึงไฟล์ไหน แล้วผู้ใช้ตอบยืนยัน (เช่น \"ใช่\", \"ใช่ไฟล์นั้น\") ให้เรียก "
     "open_library_file เปิดไฟล์ที่ถามไปทันที ห้ามถามยืนยันซ้ำอีก\n"
     "- ถ้ายังไม่ได้เปิดไฟล์ (ไม่มีผลจาก tool ยืนยัน) ห้ามอธิบายว่าเอกสารประเภทนี้มักมีเนื้อหาอะไรจากความรู้ทั่วไป\n"
-    "- รายชื่อไฟล์ในคลังที่ให้ไว้ด้านล่างเป็นข้อมูลจริง ห้ามบอกว่าไม่มีไฟล์ใดถ้าไฟล์นั้นอยู่ในรายชื่อนี้ "
-    "ถ้าเครื่องมือค้น (list_library_files/open_library_file) ไม่เจอ ให้ลองค้นใหม่โดยแยกส่ง customer "
-    "และ folder ออกจากกันก่อนสรุปว่าไม่พบ\n"
     "- เมื่อเครื่องมือค้นคืนผลมาหลายไฟล์ ห้ามเลือกไฟล์เองเด็ดขาด ต้องถามผู้ใช้ก่อนทุกครั้ง\n"
     "- ก่อนบอกผู้ใช้ว่าไฟล์ไหนเปิดอยู่ในแชทนี้ ต้องเรียก list_chat_documents ก่อนเสมอ ห้ามเดาจากความจำ\n"
+    "- ถ้าผู้ใช้พูดถึงบริษัท ให้หาบริษัทก่อน (find_customers) แล้วแสดงรายการเอกสารของบริษัทนั้น "
+    "(list_customer_documents) ถ้าคำขอระบุประเภทเอกสารชัดเจนและตรงเอกสารเดียว ให้เปิดเลย\n"
+    "- รายการเอกสาร/บริษัทที่ได้จากเครื่องมือ ให้แสดงตามที่ได้รับทั้งหมด ห้ามจัดรูปแบบใหม่เอง ห้ามตัดรายการ\n"
+    "- เมื่อผู้ใช้เลือกจากรายการด้วยเลขข้อหรือเลขเอกสาร ให้เปิดด้วย document_no ที่อยู่ในรายการนั้น\n"
+    "- ถ้าผู้ใช้ขอร่างเอกสารใหม่ ให้แสดงรายการแม่แบบ (list_templates)\n"
 )
 
 LIBRARY_GUEST_RULES = (
@@ -1446,45 +1727,41 @@ LIBRARY_GUEST_RULES = (
 )
 
 
-def _build_library_file_listing_text(limit: int = 50) -> str:
-    """สร้างข้อความรายชื่อไฟล์ในคลังจัดตามโฟลเดอร์ต่อท้าย system prompt ให้ผู้ล็อกอิน แต่ละไฟล์แสดงเป็น
-    "ชื่อไฟล์ | ลูกค้า: ... | เลขอ้างอิง: ..." (ข้ามส่วนที่ไม่มีข้อมูล) สร้างใหม่จาก DB จริงทุกครั้งที่เรียก
-    (ผ่าน execute_list_library_files()) ไม่แคชไว้ กันกรณีแอดมินเพิ่ม/ลบ/ย้ายไฟล์แล้วเห็นผลไม่ทันที จำกัดไว้
-    ไม่เกิน limit ไฟล์ ถ้าเกินบอกจำนวนที่เหลือ ถ้าดึงรายชื่อล้มเหลว (เช่น DB มีปัญหาชั่วคราว) คืนสตริงว่างเงียบๆ
-    ไม่ทำให้ทั้งคำขอล้มเพราะเรื่องนี้"""
+def _build_library_file_listing_text(limit: int = 100) -> str:
+    """สร้างข้อความรายชื่อบริษัทในทะเบียนลูกค้าต่อท้าย system prompt ให้ผู้ล็อกอิน แต่ละบริษัทแสดงเป็น
+    "ชื่อ (รหัส) · X เอกสาร" สูงสุด limit บริษัท พร้อมบรรทัดบอกจำนวนไฟล์แม่แบบทั้งหมดท้ายรายการ สร้างใหม่จาก
+    DB จริงทุกครั้งที่เรียก ไม่แคชไว้ กันกรณีแอดมินเพิ่ม/ลบไฟล์แล้วเห็นผลไม่ทันที ถ้าดึงข้อมูลล้มเหลว (เช่น DB
+    มีปัญหาชั่วคราว) คืนสตริงว่างเงียบๆ ไม่ทำให้ทั้งคำขอล้มเพราะเรื่องนี้"""
     try:
-        files = execute_list_library_files({}).get("files", [])
+        enriched = _get_enriched_library_files()
+        customers = get_all_customers()
     except Exception:
         return ""
 
-    if not files:
+    if not customers and not enriched:
         return ""
 
-    by_folder: dict[str, list[str]] = {}
-    for f in files:
-        folder = f.get("folder") or "ไม่มีหมวดหมู่"
-        parts = [f["filename"]]
-        if f.get("customer_name"):
-            parts.append(f"ลูกค้า: {f['customer_name']}")
-        if f.get("reference_no"):
-            parts.append(f"เลขอ้างอิง: {f['reference_no']}")
-        by_folder.setdefault(folder, []).append(" | ".join(parts))
+    doc_counts: dict[str, int] = {}
+    template_count = 0
+    for item in enriched:
+        if item["is_template"]:
+            template_count += 1
+            continue
+        if item["customer_code"]:
+            key = item["customer_code"].strip().lower()
+            doc_counts[key] = doc_counts.get(key, 0) + 1
 
-    total = len(files)
-    shown = 0
-    lines = ["รายชื่อไฟล์ในคลังเอกสาร (ข้อมูลล่าสุด ณ ตอนนี้):"]
-    for folder in sorted(by_folder.keys()):
-        if shown >= limit:
-            break
-        lines.append(f"- โฟลเดอร์ {folder}:")
-        for line in by_folder[folder]:
-            if shown >= limit:
-                break
-            lines.append(f"  - {line}")
-            shown += 1
+    total = len(customers)
+    lines = ["รายชื่อบริษัทลูกค้าในคลังเอกสาร (ข้อมูลล่าสุด ณ ตอนนี้):"]
+    for cust in customers[:limit]:
+        count = doc_counts.get(cust["customer_code"].strip().lower(), 0)
+        name = cust.get("customer_name") or "(ไม่มีชื่อ)"
+        lines.append(f"- {name} ({cust['customer_code']}) · {count} เอกสาร")
 
     if total > limit:
-        lines.append(f"(มีอีก {total - limit} ไฟล์ที่ไม่ได้แสดงในรายการนี้ ใช้ list_library_files ค้นหาเพิ่มเติมได้)")
+        lines.append(f"(มีอีก {total - limit} บริษัทที่ไม่ได้แสดงในรายการนี้ ใช้ find_customers ค้นหาเพิ่มเติมได้)")
+
+    lines.append(f"มีไฟล์แม่แบบทั้งหมด {template_count} ไฟล์ (เรียก list_templates เพื่อดูรายชื่อ)")
 
     return "\n".join(lines)
 
@@ -1609,8 +1886,9 @@ def _log_if_low_confidence(query, answer, top_chunks, scores):
 
 def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None):
     """เวอร์ชันไม่ stream — รอคำตอบเต็มก่อนคืนค่าทีเดียว มี LanguageGuard retry + agentic tool use
-    (calculate_tax, web_search, และ list_library_files/open_library_file ถ้ามี user_id) ผ่าน
-    run_agentic_tool_loop() — user_id/chat_id เป็น optional (None สำหรับ guest ที่ไม่ได้ล็อกอิน)"""
+    (calculate_tax, web_search, และ find_customers/list_customer_documents/list_project_documents/
+    list_templates/open_library_file ถ้ามี user_id) ผ่าน run_agentic_tool_loop() — user_id/chat_id เป็น
+    optional (None สำหรับ guest ที่ไม่ได้ล็อกอิน)"""
     history = history or []
     ctx = _prepare_rag_context(query, history, image_data, user_id=user_id)
 
@@ -1706,12 +1984,17 @@ class LibraryFileUpdate(BaseModel):
     category_id: Optional[int] = None
 
 class LibraryFileMetaUpdate(BaseModel):
+    customer_code: Optional[str] = None
     customer_name: Optional[str] = None
+    project_code: Optional[str] = None
     project_name: Optional[str] = None
-    reference_no: Optional[str] = None
+    document_no: Optional[str] = None
+    is_template: bool = False
 
 class LibraryMetaGenerateRequest(BaseModel):
     file_id: Optional[int] = None
+    force_refresh: bool = False
+    after_file_id: Optional[int] = None
 
 class AgentJobStart(BaseModel):
     action_type: str  # "suggest_tags" | "merge_chunks"
@@ -4051,6 +4334,106 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
 # ทุก endpoint ใต้นี้ใช้ require_login (แอดมิน) เหมือนแท็บอื่นๆ ในหน้า admin ไม่ใช่ require_user) ----------
 FILE_LIBRARY_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB ต่อไฟล์
 
+# ป้ายที่รู้จัก (หลัง normalize ด้วย _normalize_identity_label แล้ว) -> ชื่อฟิลด์ข้อมูลระบุตัวตน
+_IDENTITY_LABEL_MAP = {
+    "ชื่อลูกค้า": "customer_name",
+    "เลขอ้างอิงลูกค้า": "customer_code",
+    "ชื่อโปรเจค": "project_name",
+    "เลขอ้างอิงโปรเจค": "project_code",
+    "เลขอ้างอิงเอกสาร": "document_no",
+}
+
+# ค่าที่มี {{ }} ถือเป็นตัวแปรของแม่แบบ (เช่น "{{ชื่อลูกค้า}}") ไม่ใช่ข้อมูลจริง
+_TEMPLATE_VARIABLE_RE = re.compile(r"\{\{.*?\}\}")
+
+
+def _normalize_identity_label(text: str) -> str:
+    """normalize ข้อความป้ายก่อนเทียบกับ _IDENTITY_LABEL_MAP — ตัดช่องว่างทุกชนิดออกทั้งหมด (รวมช่องว่างที่
+    เกิดจากขึ้นบรรทัดใหม่กลางคำในเซลล์เดียวกัน เช่น 'เลขอ้างอิง\\nโปรเจค:' -> 'เลขอ้างอิงโปรเจค:') แล้วตัด ':'
+    หรือ '：' ท้ายออก"""
+    text = re.sub(r"\s+", "", text)
+    if text.endswith(":") or text.endswith("："):
+        text = text[:-1]
+    return text
+
+
+def _extract_identity_fields(raw_bytes: bytes) -> dict:
+    """ดึงข้อมูลระบุตัวตนของไฟล์ (ลูกค้า/โครงการ/เอกสาร) จากป้ายในไฟล์ด้วยโค้ดล้วนๆ (ไม่ใช้ AI เลย — แม่นยำ
+    กว่าเสมอเมื่อมีป้าย) เปิดด้วย openpyxl data_only=True อ่านอย่างเดียว (ไม่เคยเขียนกลับ ไม่ต้องใช้ตัวเปิดที่
+    รักษามาโคร) ไล่ทุกแถวทุกชีต ยกเว้นชีตที่ชื่อขึ้นต้นด้วย "_" (ชีตช่วยเหลือ ไม่ใช่เนื้อหาเอกสารจริง)
+
+    พบเซลล์ที่ normalize แล้วตรงกับป้ายใน _IDENTITY_LABEL_MAP ใช้ค่าจากเซลล์ไม่ว่างตัวถัดไปทางขวาในแถว
+    เดียวกัน (ข้ามเซลล์ว่าง แต่หยุดทันทีถ้าเจอเซลล์ที่เป็นป้ายอื่นที่รู้จักก่อนเจอค่า — แปลว่าป้ายนี้ไม่มีค่าจริง)
+    ป้ายที่เจอซ้ำ (หลายชีต/หลายแถว) ใช้ค่าที่เจอก่อนสุด ไม่เขียนทับ
+
+    ค่าที่มี {{ }} ถือเป็นตัวแปรของแม่แบบ ไม่บันทึกเป็นค่าจริง ถ้าป้ายที่มีค่า (ไม่ว่าจริงหรือตัวแปร) ส่วนใหญ่
+    (มากกว่าครึ่ง) เป็นตัวแปร ให้ is_template=True
+
+    คืน dict: {"customer_name", "customer_code", "project_name", "project_code", "document_no",
+    "is_template", "source": "label"} — ไม่พบป้ายที่รู้จักเลยสักอัน (ไม่ว่าจะมีค่าหรือไม่) คืน {"source": None}
+    ให้ caller fallback ไปใช้ _extract_library_file_summary_and_metadata (Claude) แทน"""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+    except Exception:
+        return {"source": None}
+
+    found_fields: dict[str, str] = {}
+    found_label_count = 0
+    labels_with_value = 0
+    template_var_count = 0
+
+    for sheet_name in wb.sheetnames:
+        if sheet_name.startswith("_"):
+            continue
+        for row in wb[sheet_name].iter_rows():
+            cells = list(row)
+            for idx, cell in enumerate(cells):
+                if cell.value is None:
+                    continue
+                field_name = _IDENTITY_LABEL_MAP.get(_normalize_identity_label(str(cell.value)))
+                if field_name is None:
+                    continue
+
+                found_label_count += 1
+                if field_name in found_fields:
+                    continue
+
+                value_text = None
+                for next_cell in cells[idx + 1:]:
+                    if next_cell.value is None:
+                        continue
+                    next_text = str(next_cell.value).strip()
+                    if not next_text:
+                        continue
+                    if _IDENTITY_LABEL_MAP.get(_normalize_identity_label(next_text)) is not None:
+                        break  # เจอป้ายอื่นก่อนเจอค่า แปลว่าป้ายนี้ไม่มีค่าจริง
+                    value_text = next_text
+                    break
+
+                if value_text is None:
+                    continue
+
+                labels_with_value += 1
+                if _TEMPLATE_VARIABLE_RE.search(value_text):
+                    template_var_count += 1
+                else:
+                    found_fields[field_name] = value_text
+
+    if found_label_count == 0:
+        return {"source": None}
+
+    is_template = labels_with_value > 0 and template_var_count > (labels_with_value / 2)
+
+    return {
+        "customer_name": found_fields.get("customer_name"),
+        "customer_code": found_fields.get("customer_code"),
+        "project_name": found_fields.get("project_name"),
+        "project_code": found_fields.get("project_code"),
+        "document_no": found_fields.get("document_no"),
+        "is_template": is_template,
+        "source": "label",
+    }
+
 
 def _extract_library_file_cell_text(raw_bytes: bytes, max_chars: int = 6000) -> str:
     """อ่านข้อความทุกเซลล์ที่ไม่ว่างของไฟล์ Excel ทุกชีต (openpyxl data_only=True) — ครอบคลุมกว่า label_map
@@ -4096,15 +4479,17 @@ def _clean_library_meta_field(value) -> Optional[str]:
 def _extract_library_file_summary_and_metadata(
     label_map: dict, raw_bytes: bytes, include_summary: bool = True
 ) -> tuple[Optional[str], dict]:
-    """เรียก Claude Haiku ครั้งเดียวขอทั้ง summary (ถ้า include_summary) และข้อมูลประกอบ (customer_name,
-    project_name, reference_no) จาก label_map + ข้อความทุกเซลล์ของไฟล์ (ดู _extract_library_file_cell_text
-    — ครอบคลุมกว่า label_map เพียงอย่างเดียว) ใช้ตอน import ไฟล์ใหม่ (include_summary=True — รวมเป็นเรียก
-    Claude ครั้งเดียวกับการสร้าง summary กันเรียกซ้ำสองรอบต่อไฟล์) และตอนสร้างข้อมูลประกอบย้อนหลังให้ไฟล์ที่
-    import ไปแล้ว (include_summary=False — มี summary อยู่แล้ว ไม่ต้องขอซ้ำ)
+    """เรียก Claude Haiku ครั้งเดียวขอทั้ง summary (ถ้า include_summary) และข้อมูลระบุตัวตนแบบเดา (customer_name,
+    project_name, document_no — ไม่มี customer_code/project_code/is_template เพราะ AI ไม่เดารหัส) จาก
+    label_map + ข้อความทุกเซลล์ของไฟล์ (ดู _extract_library_file_cell_text — ครอบคลุมกว่า label_map เพียง
+    อย่างเดียว) ใช้เป็น fallback เมื่อ _extract_identity_fields() หาป้ายที่รู้จักในไฟล์ไม่เจอเลยเท่านั้น
+    (source="label" แม่นยำกว่าเสมอเมื่อมี) include_summary=True ใช้ตอน import ไฟล์ใหม่ (รวมเป็นเรียก Claude
+    ครั้งเดียวกับการขอข้อมูลระบุตัวตน กันเรียกซ้ำสองรอบต่อไฟล์) include_summary=False ใช้ตอนสร้างข้อมูลระบุ
+    ตัวตนย้อนหลังให้ไฟล์ที่ import ไปแล้ว (มี summary อยู่แล้ว ไม่ต้องขอซ้ำ)
 
     ค่าไหนไม่พบในเอกสารจริงเป็น null ห้ามเดา คืน (summary, meta) — summary เป็น None ถ้า include_summary=False
     เสมอ เรียกหรือ parse ไม่สำเร็จ คืน (None, {ทุกฟิลด์เป็น None}) ไม่ raise ออกไป (import ต้องสำเร็จตามปกติ)"""
-    empty_meta = {"customer_name": None, "project_name": None, "reference_no": None}
+    empty_meta = {"customer_name": None, "project_name": None, "document_no": None}
     try:
         cell_text = _extract_library_file_cell_text(raw_bytes)
         summary_field = (
@@ -4118,7 +4503,7 @@ def _extract_library_file_summary_and_metadata(
             "{" + summary_field +
             '"customer_name": "ชื่อลูกค้า/บริษัทที่เอกสารนี้ทำขึ้นให้ หรือ null ถ้าไม่พบในเอกสาร", '
             '"project_name": "ชื่อโครงการ/งานที่เอกสารนี้เกี่ยวข้อง หรือ null ถ้าไม่พบ", '
-            '"reference_no": "เลขที่เอกสาร/เลขอ้างอิงของเอกสารนี้ หรือ null ถ้าไม่พบ"}\n'
+            '"document_no": "เลขที่เอกสาร/เลขอ้างอิงของเอกสารนี้ หรือ null ถ้าไม่พบ"}\n'
             "ห้ามเดาค่าที่ไม่มีอยู่จริงในเอกสารเด็ดขาด ไม่พบให้ใส่ null เท่านั้น"
         )
         response = client.messages.create(
@@ -4138,11 +4523,38 @@ def _extract_library_file_summary_and_metadata(
         meta = {
             "customer_name": _clean_library_meta_field(parsed.get("customer_name")),
             "project_name": _clean_library_meta_field(parsed.get("project_name")),
-            "reference_no": _clean_library_meta_field(parsed.get("reference_no")),
+            "document_no": _clean_library_meta_field(parsed.get("document_no")),
         }
         return summary, meta
     except Exception:
         return None, empty_meta
+
+
+def _resolve_library_file_identity(label_map: dict, raw_bytes: bytes, include_summary: bool) -> tuple[Optional[str], dict]:
+    """หาข้อมูลระบุตัวตนของไฟล์ — ลองดึงจากป้ายในไฟล์ด้วยโค้ดก่อนเสมอ (_extract_identity_fields แม่นยำกว่า
+    เพราะไม่ใช่การเดา) ไม่พบป้ายเลยสักอัน ค่อย fallback ไปให้ Claude เดาแทน (source="ai" — ไม่มี customer_code/
+    project_code/is_template เพราะ AI ไม่เดารหัส) ใช้ร่วมกันทั้งตอน import ไฟล์ใหม่และตอนกด "สร้างข้อมูล
+    ย้อนหลัง"/"ดึงใหม่ทั้งหมด" ในหน้า admin คืน (summary, identity) — identity มีฟิลด์ครบตามที่
+    upsert_library_file_meta ต้องการเสมอ"""
+    identity = _extract_identity_fields(raw_bytes)
+
+    if identity.get("source") == "label":
+        summary = None
+        if include_summary:
+            summary, _ = _extract_library_file_summary_and_metadata(label_map, raw_bytes, include_summary=True)
+        return summary, identity
+
+    summary, ai_meta = _extract_library_file_summary_and_metadata(label_map, raw_bytes, include_summary=include_summary)
+    identity = {
+        "customer_code": None,
+        "customer_name": ai_meta["customer_name"],
+        "project_code": None,
+        "project_name": ai_meta["project_name"],
+        "document_no": ai_meta["document_no"],
+        "is_template": False,
+        "source": "ai",
+    }
+    return summary, identity
 
 
 # ---------- File Library: หมวดหมู่ (โฟลเดอร์) ----------
@@ -4238,7 +4650,7 @@ async def import_library_files(
                 results.append({"filename": filename, "ok": False, "error": "อ่านไฟล์ไม่สำเร็จ: ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้"})
                 continue
 
-            summary, meta = _extract_library_file_summary_and_metadata(label_map, raw, include_summary=True)
+            summary, identity = _resolve_library_file_identity(label_map, raw, include_summary=True)
             try:
                 file_id = add_library_file(
                     filename=filename, category_id=category_id, raw_bytes=raw, label_map=label_map, summary=summary,
@@ -4252,11 +4664,20 @@ async def import_library_files(
                 results.append({"filename": filename, "ok": False, "error": "บันทึกข้อมูลไม่สำเร็จ: บันทึกข้อมูลไฟล์ลงฐานข้อมูลไม่ได้"})
                 continue
 
-            # ข้อมูลประกอบเป็นค่าว่างได้ถ้า Claude เรียกหรือ parse ไม่สำเร็จ (ดู _extract_library_file_summary_and_metadata)
-            # — import ยังถือว่าสำเร็จตามปกติเสมอ ไม่ว่าจะเขียนแถวนี้สำเร็จหรือไม่
+            # ข้อมูลระบุตัวตนเป็นค่าว่างได้ถ้าไม่พบป้ายและ Claude เรียก/parse ไม่สำเร็จ (ดู _resolve_library_
+            # file_identity) — import ยังถือว่าสำเร็จตามปกติเสมอ ไม่ว่าจะเขียนแถวนี้สำเร็จหรือไม่
             upsert_library_file_meta(
-                file_id, meta["customer_name"], meta["project_name"], meta["reference_no"], source="ai",
+                file_id,
+                customer_code=identity["customer_code"],
+                customer_name=identity["customer_name"],
+                project_code=identity["project_code"],
+                project_name=identity["project_name"],
+                document_no=identity["document_no"],
+                is_template=identity["is_template"],
+                source=identity["source"],
             )
+            if identity["customer_code"]:
+                upsert_customer(identity["customer_code"], identity["customer_name"])
 
             results.append({"filename": filename, "ok": True, "file_id": file_id, "summary": summary})
 
@@ -4284,16 +4705,19 @@ def list_library_files_endpoint(category_id: Optional[str] = None, _: bool = Dep
 
     # ไม่ส่ง label_map/storage_key กลับไปหน้าเว็บ (ไม่จำเป็นต่อการแสดงรายการ ตัดออกลด payload) แต่เพิ่ม
     # has_macros เข้าไปแทน (derive จากนามสกุลของ storage_key ก่อนตัดทิ้ง — ดู _library_file_has_macros)
-    # และข้อมูลประกอบจาก library_file_meta (ไฟล์ที่ยังไม่มีข้อมูลประกอบเลย ได้ค่าเป็น null ทั้งหมด)
+    # และข้อมูลระบุตัวตนจาก library_file_meta (ไฟล์ที่ยังไม่มีข้อมูลเลย ได้ค่าเป็น null/False ทั้งหมด)
     meta_map = get_all_library_file_meta()
     response_files = []
     for f in files:
         item = {k: v for k, v in f.items() if k not in ("label_map", "storage_key")}
         item["has_macros"] = _library_file_has_macros(f)
         meta = meta_map.get(f["id"], {})
+        item["customer_code"] = meta.get("customer_code")
         item["customer_name"] = meta.get("customer_name")
+        item["project_code"] = meta.get("project_code")
         item["project_name"] = meta.get("project_name")
-        item["reference_no"] = meta.get("reference_no")
+        item["document_no"] = meta.get("document_no")
+        item["is_template"] = bool(meta.get("is_template"))
         item["meta_source"] = meta.get("source")
         response_files.append(item)
     return {"files": response_files}
@@ -4301,9 +4725,10 @@ def list_library_files_endpoint(category_id: Optional[str] = None, _: bool = Dep
 
 @app.put("/admin/api/file-library/files/{file_id}/meta")
 def update_library_file_meta_endpoint(file_id: int, body: LibraryFileMetaUpdate, _: bool = Depends(require_login)):
-    """แอดมินแก้ข้อมูลประกอบ (ลูกค้า/โครงการ/เลขอ้างอิง) รายไฟล์ตรงๆ เสมอตั้ง source="admin" — ไฟล์ที่ source
-    เป็น "admin" แล้วจะไม่ถูกเขียนทับด้วยการสร้างอัตโนมัติผ่าน /meta/generate อีก (ดู upsert_library_file_meta
-    ใน db.py และ generate_library_file_meta_endpoint ด้านล่าง)"""
+    """แอดมินแก้ข้อมูลระบุตัวตน (ลูกค้า/โครงการ/เอกสาร/แม่แบบ) รายไฟล์ตรงๆ เสมอตั้ง source="admin" — ไฟล์ที่
+    source เป็น "admin" แล้วจะไม่ถูกเขียนทับด้วยการสร้างอัตโนมัติผ่าน /meta/generate อีก (ดู
+    upsert_library_file_meta ใน db.py และ generate_library_file_meta_endpoint ด้านล่าง) ถ้าระบุ
+    customer_code มาด้วย จะ upsert ลงทะเบียนลูกค้า (customers) ให้ด้วย"""
     if get_library_file(file_id) is None:
         raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
 
@@ -4311,31 +4736,55 @@ def update_library_file_meta_endpoint(file_id: int, body: LibraryFileMetaUpdate,
         value = (value or "").strip()
         return value or None
 
+    customer_code = _clean(body.customer_code)
+    customer_name = _clean(body.customer_name)
+
     ok = upsert_library_file_meta(
         file_id,
-        customer_name=_clean(body.customer_name),
+        customer_code=customer_code,
+        customer_name=customer_name,
+        project_code=_clean(body.project_code),
         project_name=_clean(body.project_name),
-        reference_no=_clean(body.reference_no),
+        document_no=_clean(body.document_no),
+        is_template=bool(body.is_template),
         source="admin",
     )
     if not ok:
-        raise HTTPException(status_code=400, detail="บันทึกข้อมูลประกอบไม่สำเร็จ")
+        raise HTTPException(status_code=400, detail="บันทึกข้อมูลไม่สำเร็จ")
+
+    if customer_code:
+        upsert_customer(customer_code, customer_name)
+
     return {"status": "updated"}
+
+
+LIBRARY_META_GENERATE_BATCH_SIZE = 20  # ทำทีละไม่เกิน 20 ไฟล์ต่อคำขอ กันคำขอเดียวช้าเกินไปถ้าไฟล์เยอะ
 
 
 @app.post("/admin/api/file-library/meta/generate")
 def generate_library_file_meta_endpoint(body: LibraryMetaGenerateRequest, _: bool = Depends(require_login)):
-    """สร้างข้อมูลประกอบ (ลูกค้า/โครงการ/เลขอ้างอิง) ให้ไฟล์ที่ import ไปแล้วแต่ยังไม่มีข้อมูลประกอบเลย — ระบุ
-    file_id มาสร้างเฉพาะไฟล์นั้น (ถ้ายังไม่มี) ไม่ระบุ = สร้างให้ทุกไฟล์ในคลังที่ยังไม่มี ไฟล์ที่มีข้อมูลประกอบ
-    อยู่แล้วไม่ว่า source ใด (ai หรือ admin) จะไม่ถูกแตะเลย กันเขียนทับข้อมูลที่แอดมินแก้ไว้เองโดยไม่ตั้งใจ"""
+    """สร้างข้อมูลระบุตัวตนให้ไฟล์ที่ import ไปแล้ว ด้วย _resolve_library_file_identity (ลองดึงจากป้ายในไฟล์
+    ก่อนเสมอ ไม่พบป้ายเลยค่อย fallback ไปให้ Claude เดา) ระบุ file_id มาสร้างเฉพาะไฟล์นั้น (ถ้ายังไม่มี) ไม่ระบุ
+    = ทำทีละไม่เกิน LIBRARY_META_GENERATE_BATCH_SIZE ไฟล์ต่อคำขอ เรียงจาก file_id น้อยไปมาก คืน remaining
+    (จำนวนที่เหลือ) และ next_after_file_id (ส่งกลับเป็น after_file_id ในคำขอถัดไปเพื่อทำต่อจากจุดเดิม — จำเป็น
+    สำหรับ force_refresh=True โดยเฉพาะ เพราะไฟล์ที่ทำไปแล้วไม่ได้ถูกตัดออกจากเงื่อนไข "source ไม่ใช่ admin"
+    เหมือนเดิม ถ้าไม่มี cursor นี้คำขอถัดไปจะวนกลับไปทำ batch แรกซ้ำไม่รู้จบ) force_refresh=True ("ดึงใหม่
+    ทั้งหมด") ประมวลผลไฟล์ทุกไฟล์ที่ source ไม่ใช่ "admin" ใหม่ทั้งหมด (จำเป็นเพราะไฟล์อาจถูกแก้เพิ่มป้ายใหม่
+    ทีหลัง) ไฟล์ที่ source="admin" ไม่ถูกแตะเลยไม่ว่ากรณีใด"""
     if body.file_id is not None:
         if get_library_file(body.file_id) is None:
             raise HTTPException(status_code=404, detail="ไม่พบไฟล์นี้")
-        if get_library_file_meta(body.file_id) is not None:
-            return {"results": []}
+        existing = get_library_file_meta(body.file_id)
+        if existing is not None and (existing.get("source") == "admin" or not body.force_refresh):
+            return {"results": [], "remaining": 0, "next_after_file_id": None}
         target_ids = [body.file_id]
+        remaining_after = 0
+        next_after_file_id = None
     else:
-        target_ids = get_library_file_ids_without_meta()
+        all_target_ids = get_library_file_ids_for_regenerate(body.force_refresh, after_file_id=body.after_file_id)
+        target_ids = all_target_ids[:LIBRARY_META_GENERATE_BATCH_SIZE]
+        remaining_after = max(0, len(all_target_ids) - len(target_ids))
+        next_after_file_id = target_ids[-1] if target_ids else body.after_file_id
 
     results = []
     for file_id in target_ids:
@@ -4349,13 +4798,23 @@ def generate_library_file_meta_endpoint(body: LibraryMetaGenerateRequest, _: boo
             results.append({"file_id": file_id, "filename": file_row["filename"], "ok": False})
             continue
 
-        _, meta = _extract_library_file_summary_and_metadata(file_row["label_map"], raw, include_summary=False)
+        _, identity = _resolve_library_file_identity(file_row["label_map"], raw, include_summary=False)
         upsert_library_file_meta(
-            file_id, meta["customer_name"], meta["project_name"], meta["reference_no"], source="ai",
+            file_id,
+            customer_code=identity["customer_code"],
+            customer_name=identity["customer_name"],
+            project_code=identity["project_code"],
+            project_name=identity["project_name"],
+            document_no=identity["document_no"],
+            is_template=identity["is_template"],
+            source=identity["source"],
         )
-        results.append({"file_id": file_id, "filename": file_row["filename"], "ok": True, **meta})
+        if identity["customer_code"]:
+            upsert_customer(identity["customer_code"], identity["customer_name"])
 
-    return {"results": results}
+        results.append({"file_id": file_id, "filename": file_row["filename"], "ok": True, **identity})
+
+    return {"results": results, "remaining": remaining_after, "next_after_file_id": next_after_file_id}
 
 
 @app.put("/admin/api/file-library/files/{file_id}")

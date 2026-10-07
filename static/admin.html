@@ -317,7 +317,8 @@
                     <div class="file-library-files-header">
                         <strong id="fileLibraryCurrentCategoryLabel"></strong>
                         <span>
-                            <button type="button" onclick="generateMissingLibraryFileMeta()">🏷️ สร้างข้อมูลไฟล์ที่ยังไม่มี</button>
+                            <label><input type="checkbox" id="fileLibraryForceRefreshMeta"> ดึงใหม่ทั้งหมด</label>
+                            <button type="button" onclick="generateMissingLibraryFileMeta()">🏷️ สร้างข้อมูลระบุตัวตน</button>
                             <span id="fileLibraryGenerateMetaStatus" class="kb-toolbar-status"></span>
                         </span>
                     </div>
