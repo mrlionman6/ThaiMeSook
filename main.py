@@ -94,6 +94,8 @@ from db import (
     get_all_customers,
     get_customer_by_code,
     upsert_customer,
+    set_chat_last_listing,
+    get_chat_last_listing,
 )
 
 import os
@@ -585,6 +587,26 @@ LIBRARY_TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "select_list_item",
+        "description": (
+            "เลือกรายการจากรายการล่าสุดที่เครื่องมือค้นคลังไฟล์ (find_customers, list_customer_documents, "
+            "list_project_documents, list_templates) เพิ่งแสดงให้ผู้ใช้ดูในแชทนี้ ใช้ทันทีเมื่อผู้ใช้อ้างถึง"
+            "รายการนั้นด้วยเลขข้อ อันดับ (อันแรก/อันที่สอง/อันสุดท้าย) หรือพูดชื่อที่ตรงกับบรรทัดในรายการ — "
+            "ถือเป็นคำสั่งที่ยืนยันแล้ว ไม่ต้องถามซ้ำ ถ้ารายการล่าสุดเป็นเอกสาร จะเปิดไฟล์ข้อนั้นทันที ถ้าเป็น"
+            "รายชื่อบริษัท จะแสดงรายการเอกสารของบริษัทข้อนั้นแทน"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "index": {
+                    "type": "integer",
+                    "description": "เลขข้อที่ผู้ใช้เลือก นับจาก 1 (แปลจาก อันแรก=1, อันที่สอง=2, อันสุดท้าย=เลขข้อสุดท้ายในรายการ)",
+                },
+            },
+            "required": ["index"],
+        },
+    },
 ]
 
 
@@ -678,6 +700,7 @@ def _get_enriched_library_files() -> list[dict]:
             "is_template": bool(meta.get("is_template")),
             "summary": f["summary"],
             "has_macros": _library_file_has_macros(f),
+            "uploaded_at": f["uploaded_at"],
         })
     return enriched
 
@@ -764,58 +787,102 @@ def _escape_markdown_text(text) -> str:
     return text
 
 
-def _format_document_line(n: int, doc: dict) -> str:
-    """สร้างบรรทัดเดียวของรายการเอกสาร: "N. <document_no> · <project_name> (โปรเจค <project_code>)"
-    ข้ามส่วนที่ไม่มีข้อมูล ถ้าไม่มี document_no ใช้ชื่อไฟล์แทน ต่อท้าย " · มีมาโคร" ถ้ามีมาโคร"""
-    label = doc.get("document_no") or doc["filename"]
-    parts = [_escape_markdown_text(label)]
+def _strip_file_extension(filename: str) -> str:
+    return os.path.splitext(filename)[0]
 
-    if doc.get("project_name") and doc.get("project_code"):
-        parts.append(f"{_escape_markdown_text(doc['project_name'])} (โปรเจค {_escape_markdown_text(doc['project_code'])})")
-    elif doc.get("project_name"):
-        parts.append(_escape_markdown_text(doc["project_name"]))
-    elif doc.get("project_code"):
-        parts.append(f"โปรเจค {_escape_markdown_text(doc['project_code'])}")
 
-    line = f"{n}. " + " · ".join(parts)
-    if doc.get("has_macros"):
-        line += " · มีมาโคร"
-    return line
+def _format_thai_buddhist_date(uploaded_at) -> Optional[str]:
+    """แปลง uploaded_at (datetime) เป็น "วัน/เดือน/ปี พ.ศ." (เช่น 5/3/2567) คืน None ถ้าไม่มีค่า — ใช้แยก
+    ชื่อไฟล์ที่ซ้ำกันในรายการเดียวกัน (ดู _dedupe_document_labels) ไม่เกี่ยวกับการแสดงวันที่ในตารางเปรียบเทียบ
+    (ซึ่งแสดงตามตัวเลขที่เก็บในเซลล์เป๊ะ ไม่แปลงปฏิทิน — ที่นี่ uploaded_at เป็น timestamp จริงของระบบ (UTC/
+    Gregorian) จึงแปลงเป็น พ.ศ. ตามปกติที่คนไทยใช้แสดงวันที่)"""
+    if not isinstance(uploaded_at, datetime.datetime):
+        return None
+    return f"{uploaded_at.day}/{uploaded_at.month}/{uploaded_at.year + 543}"
+
+
+def _order_library_documents_by_folder(documents: list[dict]) -> list[dict]:
+    """เรียงเอกสารตามลำดับเดียวกับที่ _format_library_document_list ใช้ขึ้นบรรทัด (จัดกลุ่มตามโฟลเดอร์ เรียงชื่อ
+    โฟลเดอร์ ก-ฮ/A-Z ภายในกลุ่มคงลำดับเดิมจาก input) ใช้ร่วมกันทั้งตอนสร้างข้อความและตอนบันทึกลง
+    chat_last_listing กันเลขข้อที่บันทึกไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
+    by_folder: dict[str, list[dict]] = {}
+    for doc in documents:
+        by_folder.setdefault(doc.get("folder") or "ไม่มีหมวดหมู่", []).append(doc)
+    ordered = []
+    for folder in sorted(by_folder.keys()):
+        ordered.extend(by_folder[folder])
+    return ordered
+
+
+def _dedupe_document_labels(group_docs: list[dict]) -> list[str]:
+    """คืน label (ไม่รวมเลขข้อ/ส่วนมาโคร) ของแต่ละไฟล์ในกลุ่มเดียวกัน (โฟลเดอร์เดียวกัน) เรียงตำแหน่งตรงกับ
+    group_docs แก้ปัญหาชื่อซ้ำกันเป็นขั้นบันได: 1) project_name (หรือชื่อไฟล์ตัดนามสกุลถ้าไม่มี project_name)
+    2) label ที่ซ้ำกับตัวอื่นในกลุ่ม (เฉพาะตัวที่ซ้ำ ไม่แตะ label ที่ไม่ซ้ำ) ต่อท้ายวันที่อัปโหลด
+    3) ถ้ายังซ้ำอีก (เช่น project_name เดียวกัน + อัปโหลดวันเดียวกัน) ใช้ชื่อไฟล์ตัดนามสกุลแทนทั้งหมด"""
+    base_labels = [doc.get("project_name") or _strip_file_extension(doc["filename"]) for doc in group_docs]
+    labels = list(base_labels)
+
+    counts: dict[str, int] = {}
+    for label in labels:
+        counts[label] = counts.get(label, 0) + 1
+    for i, doc in enumerate(group_docs):
+        if counts[labels[i]] > 1:
+            date_str = _format_thai_buddhist_date(doc.get("uploaded_at"))
+            if date_str:
+                labels[i] = f"{base_labels[i]} · อัปโหลด {date_str}"
+
+    counts2: dict[str, int] = {}
+    for label in labels:
+        counts2[label] = counts2.get(label, 0) + 1
+    for i, doc in enumerate(group_docs):
+        if counts2[labels[i]] > 1:
+            labels[i] = _strip_file_extension(doc["filename"])
+
+    return labels
 
 
 def _format_library_document_list(title: str, documents: list[dict]) -> str:
     """สร้างรายการเอกสารแบบ markdown ด้วยโค้ดล้วนๆ จัดกลุ่มตามโฟลเดอร์ ลำดับเลขต่อเนื่องกันทั้งรายการ (ไม่รีเซ็ต
-    ทุกโฟลเดอร์) ใช้รูปแบบเดียวกันทั้ง list_customer_documents, list_project_documents, list_templates
-    (title ต่างกันไปตามบริบท) ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู LIBRARY_LOGGED_IN_RULES)"""
+    ทุกโฟลเดอร์ — ดู _order_library_documents_by_folder) ใช้รูปแบบเดียวกันทั้ง list_customer_documents,
+    list_project_documents, list_templates (title ต่างกันไปตามบริบท) ห้ามแสดง customer_code/project_code/
+    document_no เลย (ใช้ project_name หรือชื่อไฟล์แทน) ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู
+    LIBRARY_LOGGED_IN_RULES) หัวกลุ่มมีบรรทัดว่างคั่นทั้งก่อนและหลังเสมอ กัน Markdown ไม่เริ่มเลขรายการใหม่
+    ถ้าบรรทัดก่อนหน้าเป็นข้อความธรรมดาไม่ใช่บรรทัดว่าง/รายการ"""
     if not documents:
         return f"{title}\n\n(ไม่มีเอกสาร)"
 
+    ordered = _order_library_documents_by_folder(documents)
     by_folder: dict[str, list[dict]] = {}
-    for doc in documents:
+    for doc in ordered:
         by_folder.setdefault(doc.get("folder") or "ไม่มีหมวดหมู่", []).append(doc)
 
     lines = [title, ""]
     n = 0
     for folder in sorted(by_folder.keys()):
-        lines.append(f"โฟลเดอร์ {_escape_markdown_text(folder)}:")
-        for doc in by_folder[folder]:
+        group_docs = by_folder[folder]
+        labels = _dedupe_document_labels(group_docs)
+        lines.append(f"**{_escape_markdown_text(folder)}**")
+        lines.append("")
+        for doc, label in zip(group_docs, labels):
             n += 1
-            lines.append(_format_document_line(n, doc))
+            line = f"{n}. {_escape_markdown_text(label)}"
+            if doc.get("has_macros"):
+                line += " · มีมาโคร"
+            lines.append(line)
         lines.append("")
 
     return "\n".join(lines).rstrip()
 
 
 def _format_customer_list(title: str, customers: list[dict]) -> str:
-    """สร้างรายการบริษัทแบบ markdown ด้วยโค้ดล้วนๆ: "N. ชื่อลูกค้า (รหัส) · X เอกสาร" ใช้ตอน find_customers
-    คืนหลายบริษัท หรือ list_customer_documents หาบริษัทจาก customer ที่เป็นชื่อแล้วกำกวม"""
+    """สร้างรายการบริษัทแบบ markdown ด้วยโค้ดล้วนๆ: "N. ชื่อลูกค้า · X เอกสาร" (ไม่มีรหัส) ใช้ตอน
+    find_customers คืนหลายบริษัท หรือ list_customer_documents หาบริษัทจาก customer ที่เป็นชื่อแล้วกำกวม"""
     if not customers:
         return f"{title}\n\n(ไม่พบบริษัท)"
     lines = [title, ""]
     for i, cust in enumerate(customers, start=1):
         name = _escape_markdown_text(cust.get("customer_name") or "(ไม่มีชื่อ)")
-        code = _escape_markdown_text(cust["customer_code"])
-        lines.append(f"{i}. {name} ({code}) · {cust['document_count']} เอกสาร")
+        lines.append(f"{i}. {name} · {cust['document_count']} เอกสาร")
     return "\n".join(lines)
 
 
@@ -896,19 +963,39 @@ def _find_library_file_by_document_no(document_no: str) -> Optional[dict]:
     return None
 
 
-def execute_find_customers(tool_input: dict) -> dict:
-    """ค้นบริษัทในทะเบียนลูกค้า — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ customers/library_file_meta เลย"""
+def _record_chat_document_listing(chat_id: int, documents: list[dict]) -> None:
+    """บันทึกทับรายการล่าสุดของแชทนี้เป็น kind="documents" — เลขข้อ (n) ต้องคำนวณด้วย
+    _order_library_documents_by_folder เส้นทางเดียวกับที่ _format_library_document_list ใช้ขึ้นบรรทัดเป๊ะ
+    ไม่งั้นเลขข้อที่บันทึกจะไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
+    ordered = _order_library_documents_by_folder(documents)
+    items = [{"n": i, "file_id": doc["file_id"]} for i, doc in enumerate(ordered, start=1)]
+    set_chat_last_listing(chat_id, "documents", items)
+
+
+def _record_chat_customer_listing(chat_id: int, customers: list[dict]) -> None:
+    """บันทึกทับรายการล่าสุดของแชทนี้เป็น kind="customers" — ลำดับตรงกับ _format_customer_list เป๊ะ (ไม่จัด
+    กลุ่มใดๆ ใช้ลำดับ input ตรงๆ)"""
+    items = [{"n": i, "customer_code": c["customer_code"]} for i, c in enumerate(customers, start=1)]
+    set_chat_last_listing(chat_id, "customers", items)
+
+
+def execute_find_customers(tool_input: dict, chat_id: int) -> dict:
+    """ค้นบริษัทในทะเบียนลูกค้า — อ่านอย่างเดียว ไม่เขียนอะไรกลับไปที่ customers/library_file_meta เลย
+    (แต่บันทึกรายการล่าสุดของแชทลง chat_last_listing เสมอ ให้ select_list_item ใช้ต่อได้)"""
     query = (tool_input.get("query") or "").strip()
     if not query:
         return {"error": "ต้องระบุ query"}
     matches = find_customers(query)
+    _record_chat_customer_listing(chat_id, matches)
     formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{query}'", matches)
     return {"customers": matches, "formatted": formatted}
 
 
-def execute_list_customer_documents(tool_input: dict) -> dict:
+def execute_list_customer_documents(tool_input: dict, chat_id: int) -> dict:
     """แสดงเอกสารของลูกค้าหนึ่งคน — รับทั้งรหัสลูกค้าที่แน่ชัดหรือชื่อบริษัท (เต็ม/บางส่วน) ถ้าสิ่งที่ส่งมาไม่ตรง
-    กับ customer_code ไหนเป๊ะ จะลอง find_customers แทน — ตรงหลายบริษัทคืนรายชื่อบริษัทให้เลือกก่อน ไม่แสดงเอกสาร"""
+    กับ customer_code ไหนเป๊ะ จะลอง find_customers แทน — ตรงหลายบริษัทคืนรายชื่อบริษัทให้เลือกก่อน ไม่แสดงเอกสาร
+    (บันทึกเป็นรายการล่าสุด kind="customers" แทน) บันทึกรายการล่าสุดของแชทเสมอไม่ว่าจะได้รายชื่อบริษัทหรือ
+    รายการเอกสารจริง"""
     customer = (tool_input.get("customer") or "").strip()
     folder = tool_input.get("folder")
     if not customer:
@@ -920,35 +1007,74 @@ def execute_list_customer_documents(tool_input: dict) -> dict:
         if len(matches) == 0:
             return {"error": f"ไม่พบบริษัทที่ตรงกับ '{customer}' ในทะเบียนลูกค้า ลองเรียก find_customers เพื่อดูชื่อที่ใกล้เคียง"}
         if len(matches) > 1:
+            _record_chat_customer_listing(chat_id, matches)
             formatted = _format_customer_list(f"พบ {len(matches)} บริษัทที่ตรงกับ '{customer}' กรุณาเลือกก่อน", matches)
             return {"matched_multiple_customers": True, "customers": matches, "formatted": formatted}
         customer_row = {"customer_code": matches[0]["customer_code"], "customer_name": matches[0]["customer_name"]}
 
     result = list_customer_documents(customer_row["customer_code"], folder=folder)
     documents = result["documents"]
-    title = f"**{customer_row.get('customer_name') or customer_row['customer_code']} ({customer_row['customer_code']})** {len(documents)} เอกสาร"
+    _record_chat_document_listing(chat_id, documents)
+    title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
     return {"documents": documents, "formatted": formatted}
 
 
-def execute_list_project_documents(tool_input: dict) -> dict:
+def execute_list_project_documents(tool_input: dict, chat_id: int) -> dict:
     project_code = (tool_input.get("project_code") or "").strip()
     if not project_code:
         return {"error": "ต้องระบุ project_code"}
     result = list_project_documents(project_code)
     documents = result["documents"]
+    _record_chat_document_listing(chat_id, documents)
     project_name = next((d["project_name"] for d in documents if d.get("project_name")), None)
-    title_name = f"{project_name} ({project_code})" if project_name else project_code
-    title = f"**โปรเจค {title_name}** {len(documents)} เอกสาร"
+    title = f"**{project_name or project_code}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
     return {"documents": documents, "formatted": formatted}
 
 
-def execute_list_templates(tool_input: dict) -> dict:
+def execute_list_templates(tool_input: dict, chat_id: int) -> dict:
     folder = tool_input.get("folder")
     result = list_templates(folder=folder)
     documents = result["documents"]
-    title = f"**ไฟล์แม่แบบ** {len(documents)} รายการ"
+    _record_chat_document_listing(chat_id, documents)
+    title = f"**ไฟล์แม่แบบ** มี {len(documents)} รายการ"
+    formatted = _format_library_document_list(title, documents)
+    return {"documents": documents, "formatted": formatted}
+
+
+def execute_select_list_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """เลือกรายการจากรายการล่าสุดที่บันทึกไว้ด้วย set_chat_last_listing (เขียนโดย find_customers/
+    list_customer_documents/list_project_documents/list_templates) ด้วยเลขข้อ — แปลเลขข้อเป็น file_id/
+    customer_code ที่แน่นอนด้วยโค้ด ไม่ให้ AI เดาเอง
+
+    kind="documents": เปิดไฟล์ข้อนั้นผ่าน execute_open_library_file() เส้นทางเดียวกับการเปิดไฟล์ปกติทุกประการ
+    (กันเปิดซ้ำ ตั้งโฟกัส) kind="customers": คืนรายการเอกสารของบริษัทข้อนั้น (เหมือนเรียก list_customer_documents
+    ด้วย customer_code ของบริษัทนั้น) แล้วบันทึกทับเป็นรายการล่าสุดใหม่ (kind="documents")"""
+    index = tool_input.get("index")
+    if not isinstance(index, int):
+        return {"error": "ต้องระบุ index เป็นตัวเลข"}
+
+    listing = get_chat_last_listing(chat_id)
+    if listing is None or not listing.get("items"):
+        return {"error": "ยังไม่มีรายการล่าสุดในแชทนี้ ลองเรียกเครื่องมือค้นหาก่อน (find_customers/list_customer_documents/list_project_documents/list_templates)"}
+
+    items = listing["items"]
+    match = next((item for item in items if item.get("n") == index), None)
+    if match is None:
+        return {"error": f"ไม่พบข้อ {index} ในรายการล่าสุด (มีทั้งหมด {len(items)} ข้อ)"}
+
+    if listing["kind"] == "documents":
+        return execute_open_library_file({"file_id": match["file_id"]}, user_id, chat_id)
+
+    # kind == "customers"
+    customer_row = get_customer_by_code(match["customer_code"])
+    if customer_row is None:
+        return {"error": "ไม่พบบริษัทนี้ในทะเบียนแล้ว อาจมีการแก้ไขข้อมูลไปแล้ว ลองค้นหาใหม่อีกครั้ง"}
+    result = list_customer_documents(customer_row["customer_code"])
+    documents = result["documents"]
+    _record_chat_document_listing(chat_id, documents)
+    title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
     return {"documents": documents, "formatted": formatted}
 
@@ -1391,28 +1517,28 @@ def run_agentic_tool_loop(
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             elif block.type == "tool_use" and block.name == "find_customers" and user_id and chat_id:
-                result = execute_find_customers(block.input)
+                result = execute_find_customers(block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             elif block.type == "tool_use" and block.name == "list_customer_documents" and user_id and chat_id:
-                result = execute_list_customer_documents(block.input)
+                result = execute_list_customer_documents(block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             elif block.type == "tool_use" and block.name == "list_project_documents" and user_id and chat_id:
-                result = execute_list_project_documents(block.input)
+                result = execute_list_project_documents(block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False),
                 })
             elif block.type == "tool_use" and block.name == "list_templates" and user_id and chat_id:
-                result = execute_list_templates(block.input)
+                result = execute_list_templates(block.input, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1420,6 +1546,13 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "open_library_file" and user_id and chat_id:
                 result = execute_open_library_file(block.input, user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False),
+                })
+            elif block.type == "tool_use" and block.name == "select_list_item" and user_id and chat_id:
+                result = execute_select_list_item(block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1712,12 +1845,21 @@ LIBRARY_LOGGED_IN_RULES = (
     "open_library_file เปิดไฟล์ที่ถามไปทันที ห้ามถามยืนยันซ้ำอีก\n"
     "- ถ้ายังไม่ได้เปิดไฟล์ (ไม่มีผลจาก tool ยืนยัน) ห้ามอธิบายว่าเอกสารประเภทนี้มักมีเนื้อหาอะไรจากความรู้ทั่วไป\n"
     "- เมื่อเครื่องมือค้นคืนผลมาหลายไฟล์ ห้ามเลือกไฟล์เองเด็ดขาด ต้องถามผู้ใช้ก่อนทุกครั้ง\n"
-    "- ก่อนบอกผู้ใช้ว่าไฟล์ไหนเปิดอยู่ในแชทนี้ ต้องเรียก list_chat_documents ก่อนเสมอ ห้ามเดาจากความจำ\n"
+    # เดิม: "ก่อนบอกผู้ใช้ว่าไฟล์ไหนเปิดอยู่ในแชทนี้ ต้องเรียก list_chat_documents ก่อนเสมอ ห้ามเดาจากความจำ"
+    # แก้เป็นข้อนี้แทน — กันกรณีเงียบๆ พูดถึงไฟล์ที่เปิดอยู่เองโดยผู้ใช้ไม่ได้ถาม (เช่น "ไฟล์ X เปิดอยู่นะครับ")
+    "- ห้ามรายงานว่ามีหรือไม่มีไฟล์เปิดอยู่ในแชทถ้าผู้ใช้ไม่ได้ถาม ถ้าต้องพูดถึงจริงๆ ให้เรียก "
+    "list_chat_documents ก่อนเสมอ ห้ามเดาจากความจำ\n"
     "- ถ้าผู้ใช้พูดถึงบริษัท ให้หาบริษัทก่อน (find_customers) แล้วแสดงรายการเอกสารของบริษัทนั้น "
     "(list_customer_documents) ถ้าคำขอระบุประเภทเอกสารชัดเจนและตรงเอกสารเดียว ให้เปิดเลย\n"
     "- รายการเอกสาร/บริษัทที่ได้จากเครื่องมือ ให้แสดงตามที่ได้รับทั้งหมด ห้ามจัดรูปแบบใหม่เอง ห้ามตัดรายการ\n"
-    "- เมื่อผู้ใช้เลือกจากรายการด้วยเลขข้อหรือเลขเอกสาร ให้เปิดด้วย document_no ที่อยู่ในรายการนั้น\n"
+    # เดิม: "เมื่อผู้ใช้เลือกจากรายการด้วยเลขข้อหรือเลขเอกสาร ให้เปิดด้วย document_no ที่อยู่ในรายการนั้น"
+    # แก้เป็นข้อนี้แทน — ใช้ select_list_item() ที่แปลเลขข้อเป็น document_id/customer_code ด้วยโค้ดเสมอ
+    # แทนที่จะให้ Claude หา document_no เองจากข้อความรายการ (เสี่ยงเลือกผิดถ้าชื่อซ้ำกัน)
+    "- ผู้ใช้เลือกจากรายการล่าสุด (เช่น ข้อ N, อันแรก, อันที่สอง, อันสุดท้าย หรือพูดชื่อที่ตรงกับบรรทัดในรายการ) "
+    "ถือเป็นคำสั่งที่ยืนยันแล้ว ให้เรียก select_list_item ทันที ห้ามถามยืนยันซ้ำ\n"
     "- ถ้าผู้ใช้ขอร่างเอกสารใหม่ ให้แสดงรายการแม่แบบ (list_templates)\n"
+    "- ห้ามแสดงรหัสลูกค้า รหัสโปรเจค หรือเลขเอกสารในคำตอบเด็ดขาด เว้นแต่ผู้ใช้ถามหรือพิมพ์รหัสนั้นมาเอง "
+    "ใช้ชื่อบริษัทและชื่อโปรเจคแทนเสมอ\n"
 )
 
 LIBRARY_GUEST_RULES = (
