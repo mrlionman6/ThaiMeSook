@@ -316,6 +316,11 @@
                 <div class="file-library-files">
                     <div class="file-library-files-header">
                         <strong id="fileLibraryCurrentCategoryLabel"></strong>
+                        <span>
+                            <label><input type="checkbox" id="fileLibraryForceRefreshMeta"> ดึงใหม่ทั้งหมด</label>
+                            <button type="button" onclick="generateMissingLibraryFileMeta()">🏷️ สร้างข้อมูลระบุตัวตน</button>
+                            <span id="fileLibraryGenerateMetaStatus" class="kb-toolbar-status"></span>
+                        </span>
                     </div>
                     <div id="fileLibraryImportRow" class="file-library-import-row" hidden>
                         <input type="file" id="fileLibraryImportInput" accept=".xlsx,.xls,.xlsm" multiple>

@@ -1554,8 +1554,20 @@ async function loadFileLibraryFiles() {
 
             const macroBadge = f.has_macros ? '<span class="file-library-macro-badge">มีมาโคร</span>' : "";
 
+            const metaParts = [];
+            if (f.customer_code || f.customer_name) {
+                metaParts.push(`ลูกค้า: ${escapeHtml(f.customer_name || "")} (${escapeHtml(f.customer_code || "-")})`);
+            }
+            if (f.project_code) metaParts.push(`โครงการ: ${escapeHtml(f.project_name || "")} (${escapeHtml(f.project_code)})`);
+            if (f.document_no) metaParts.push(`เลขเอกสาร: ${escapeHtml(f.document_no)}`);
+            const templateBadge = f.is_template ? '<span class="file-library-template-badge">แม่แบบ</span>' : "";
+            const metaLine = metaParts.length
+                ? `<p class="ts-note">${metaParts.join(" | ")}</p>`
+                : `<p class="ts-note">(ไม่มีข้อมูลระบุตัวตน)</p>`;
+
             row.innerHTML = `
-                <p><strong>${escapeHtml(f.filename)}</strong> ${macroBadge}</p>
+                <p><strong>${escapeHtml(f.filename)}</strong> ${macroBadge} ${templateBadge}</p>
+                ${metaLine}
                 <p class="ts-note">${f.summary ? escapeHtml(f.summary) : "(ไม่มี summary)"}</p>
                 <p class="ts-note">อัปโหลดเมื่อ ${escapeHtml(String(f.uploaded_at))}</p>
                 <div class="file-library-file-actions">
@@ -1566,6 +1578,7 @@ async function loadFileLibraryFiles() {
                     </select>
                     <button type="button" onclick="moveLibraryFile(${f.id})">ย้าย</button>
                     <button type="button" onclick="renameLibraryFilePrompt(${f.id})">✏️ เปลี่ยนชื่อ</button>
+                    <button type="button" onclick="editLibraryFileMetaPrompt(${f.id})">🏷️ แก้ข้อมูลระบุตัวตน</button>
                     <button type="button" class="danger-btn" onclick="deleteLibraryFileConfirm(${f.id})">🗑️ ลบ</button>
                 </div>
             `;
@@ -1629,6 +1642,76 @@ async function renameLibraryFile(fileId, newFilename) {
         loadFileLibraryFiles();
     } catch (error) {
         alert("เปลี่ยนชื่อไม่สำเร็จ: " + error);
+    }
+}
+
+function editLibraryFileMetaPrompt(fileId) {
+    const file = fileLibraryFiles.find(f => f.id === fileId);
+    if (!file) return;
+
+    const customerCode = prompt("รหัสลูกค้า:", file.customer_code || "");
+    if (customerCode === null) return;
+    const customerName = prompt("ชื่อลูกค้า:", file.customer_name || "");
+    if (customerName === null) return;
+    const projectCode = prompt("รหัสโครงการ:", file.project_code || "");
+    if (projectCode === null) return;
+    const projectName = prompt("ชื่อโครงการ:", file.project_name || "");
+    if (projectName === null) return;
+    const documentNo = prompt("เลขอ้างอิงเอกสาร:", file.document_no || "");
+    if (documentNo === null) return;
+    const isTemplate = confirm("ไฟล์นี้เป็นแม่แบบ (เอกสารเปล่าไว้กรอกใหม่) ใช่หรือไม่?\n\nกด OK = ใช่ (แม่แบบ), ยกเลิก = ไม่ใช่");
+
+    updateLibraryFileMeta(fileId, {
+        customer_code: customerCode.trim(),
+        customer_name: customerName.trim(),
+        project_code: projectCode.trim(),
+        project_name: projectName.trim(),
+        document_no: documentNo.trim(),
+        is_template: isTemplate,
+    });
+}
+
+async function updateLibraryFileMeta(fileId, meta) {
+    try {
+        const res = await fetch(`/admin/api/file-library/files/${fileId}/meta`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(meta),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        loadFileLibraryFiles();
+    } catch (error) {
+        alert("บันทึกข้อมูลไม่สำเร็จ: " + error);
+    }
+}
+
+async function generateMissingLibraryFileMeta() {
+    const statusEl = document.getElementById("fileLibraryGenerateMetaStatus");
+    const forceRefresh = document.getElementById("fileLibraryForceRefreshMeta").checked;
+    let totalDone = 0;
+    let afterFileId = null; // cursor ของ batch — ส่งค่าที่ server คืนกลับมาในคำขอถัดไปเสมอ กันวนทำ batch แรกซ้ำ
+    statusEl.style.color = "#666";
+    try {
+        while (true) {
+            statusEl.textContent = `กำลังสร้างข้อมูลระบุตัวตน... (${totalDone} ไฟล์แล้ว)`;
+            const res = await fetch("/admin/api/file-library/meta/generate", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ force_refresh: forceRefresh, after_file_id: afterFileId }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+            totalDone += data.results.length;
+            afterFileId = data.next_after_file_id;
+            if (data.results.length === 0 || data.remaining === 0) break;
+        }
+        statusEl.textContent = `✅ สร้างข้อมูลระบุตัวตนให้ ${totalDone} ไฟล์แล้ว`;
+        statusEl.style.color = "green";
+        loadFileLibraryFiles();
+    } catch (error) {
+        statusEl.textContent = "❌ สร้างข้อมูลไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
     }
 }
 
