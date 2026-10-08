@@ -19,6 +19,27 @@
     <!-- พื้นหลังมืดตอน sidebar เปิด (กดเพื่อปิด) -->
     <div id="sidebarBackdrop" hidden></div>
 
+    <!-- ปุ่มเปิด/ปิดแผงไฟล์ในแชท (มุมขวาบน ลอยอยู่เสมอ ซ่อนถ้าไม่ได้ login — ดู loadChatFilesPanel ใน script.js) -->
+    <button id="filesPanelToggle" aria-label="ไฟล์ในแชทนี้" aria-expanded="false" aria-controls="filesPanel" hidden>
+        📄<span id="filesPanelBadge" class="files-panel-badge" hidden>0</span>
+    </button>
+
+    <!-- พื้นหลังมืดตอนแผงไฟล์เปิด (เฉพาะจอแคบกว่า 768px — ดู style.css) -->
+    <div id="filesPanelBackdrop" hidden></div>
+
+    <!-- แผงไฟล์ในแชทนี้ (ขวา) -->
+    <aside id="filesPanel" aria-hidden="true">
+        <div class="files-panel-header">
+            <h3>ไฟล์ในแชทนี้</h3>
+            <button id="filesPanelCloseBtn" aria-label="ปิดแผง">✕</button>
+        </div>
+        <div id="filesPanelMessage" class="files-panel-message" hidden></div>
+        <div class="files-panel-body" id="filesPanelBody"></div>
+        <div class="files-panel-footer">
+            <button type="button" id="filesPanelNewDocBtn" class="files-panel-new-btn button_base_1">สร้างเอกสารใหม่จากแม่แบบ</button>
+        </div>
+    </aside>
+
     <!-- Sidebar -->
     <nav id="sideMenu" aria-hidden="true">
         <div class="side-top">
