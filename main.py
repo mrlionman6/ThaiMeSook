@@ -4665,6 +4665,16 @@ def _format_display_value(value, number_format: Optional[str]):
     return value
 
 
+def _cell_values_equal(value_a, value_b) -> bool:
+    """เทียบค่าสองค่าว่า 'เหมือนกัน' ไหม: strip สตริงก่อนเทียบ (กันช่องว่างหัวท้ายที่ไม่มีความหมาย) ส่วน int
+    กับ float ที่ค่าเท่ากัน (เช่น 5 กับ 5.0) ถือว่าเป็นค่าเดียวกันอยู่แล้วโดยธรรมชาติของ Python (5 == 5.0 -> True)
+    ไม่ต้องแปลงเพิ่ม ใช้ร่วมกันทั้ง _build_comparison_table (ตารางเปรียบเทียบไฟล์) และ
+    _filter_labels_actually_edited (ตัดสินใจว่า label ไหน "ถูกแก้จริง" ต้องเขียนทับเซลล์ต้นฉบับตอนสร้างไฟล์)"""
+    compare_a = value_a.strip() if isinstance(value_a, str) else value_a
+    compare_b = value_b.strip() if isinstance(value_b, str) else value_b
+    return compare_a == compare_b
+
+
 def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: str, filename_b: str) -> str:
     """สร้างตาราง markdown เปรียบเทียบด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย) ครบทุก label
     ของทั้งสองไฟล์ — เรียงตามลำดับใน label_map_a ก่อน แล้วตามด้วย label ที่มีเฉพาะใน label_map_b
@@ -4691,9 +4701,7 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             value_b = info_b["current_value"]
             format_a = info_a.get("number_format")
             format_b = info_b.get("number_format")
-            compare_a = value_a.strip() if isinstance(value_a, str) else value_a
-            compare_b = value_b.strip() if isinstance(value_b, str) else value_b
-            if compare_a == compare_b:
+            if _cell_values_equal(value_a, value_b):
                 result_text = "เหมือนกัน"
             else:
                 result_text = "ต่างกัน" + _format_number_diff(value_a, value_b)
@@ -5020,11 +5028,36 @@ async def upload_excel_editor_document(
     return {"summary_text": response_text, "chat_id": final_chat_id}
 
 
+def _filter_labels_actually_edited(original_bytes: bytes, label_map: dict) -> dict:
+    """คืน label_map เฉพาะ label ที่ current_value 'ต่างจริง' จากค่าต้นฉบับ (สกัดสดจาก original_bytes ด้วย
+    _extract_excel_labels ทุกครั้ง — ไม่แคชไว้ เพราะ original_bytes ไม่เคยเปลี่ยนอยู่แล้ว) เทียบด้วย
+    _cell_values_equal เดียวกับตารางเปรียบเทียบไฟล์ — ใช้ก่อนเขียนไฟล์ทุกจุดที่สร้างไฟล์จริงจาก label_map
+    (ตอนนี้มีจุดเดียวคือ download_excel_editor_document ด้านล่าง)
+
+    ป้องกันบั๊กที่เคยเกิดจริง: เดิมเขียนทับทุกเซลล์ของทุก label เสมอไม่ว่าจะถูกแก้หรือไม่ ทำให้เซลล์ที่เดิมเป็น
+    สูตร (เช่น 'รวมเงิน'/'ภาษีมูลค่าเพิ่ม 7%' ในไฟล์ใบเสนอราคาจริง) กลายเป็นค่าคงที่ถาวรทุกครั้งที่ดาวน์โหลด
+    ทั้งที่ไม่เคยถูกแก้เลย และทำให้ undo คืนสูตรกลับไม่ได้ (ดาวน์โหลดรอบถัดไปเขียนค่าคงที่ทับสูตรซ้ำอีก)
+
+    label ที่หาไม่เจอในค่าต้นฉบับ (ไม่ควรเกิดในทางปฏิบัติ — label_map มาจาก _extract_excel_labels ของไฟล์
+    เดียวกันนี้ตั้งแต่ตอนอัปโหลด) ถือว่า "ต่าง" เสมอ (fail-safe เขียนไปก่อน ดีกว่าข้ามแล้วข้อมูลหาย)"""
+    original_label_map = _extract_excel_labels(original_bytes)
+    changed = {}
+    for label, info in label_map.items():
+        original_info = original_label_map.get(label)
+        if original_info is None or not _cell_values_equal(info["current_value"], original_info["current_value"]):
+            changed[label] = info
+    return changed
+
+
 @app.get("/api/excel-editor/{document_id}/download")
 def download_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
     """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้) ไม่แก้ไฟล์/
     label_map เลย จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ (side effect เดียว
-    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)"""
+    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)
+
+    เขียนทับเซลล์เฉพาะ label ที่ถูกแก้จริง (ดู _filter_labels_actually_edited) — label ที่ไม่ถูกแก้เลย
+    (รวมถึง label ที่เซลล์เดิมเป็นสูตรคำนวณ) ไม่ถูกแตะเลย ไฟล์ผลลัพธ์จึงยังมีสูตรเดิมอยู่ครบสำหรับ label
+    ที่ไม่เคยแก้ ไม่ว่าจะดาวน์โหลดซ้ำกี่ครั้งก็ตาม"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
@@ -5032,9 +5065,11 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
-    # ตรวจสอบให้ผ่านทุก label ก่อน ค่อยเริ่มเขียนไฟล์จริง — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
+    labels_to_write = _filter_labels_actually_edited(doc["original_bytes"], doc["label_map"])
+
+    # ตรวจสอบให้ผ่านทุก label ที่ "จะเขียนจริง" ก่อน ค่อยเริ่มเขียนไฟล์ — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
     resolved = {}
-    for label, info in doc["label_map"].items():
+    for label, info in labels_to_write.items():
         ok, value, error = _coerce_value_for_cell(info["current_value"], info.get("number_format"))
         if not ok:
             raise HTTPException(
@@ -5046,7 +5081,7 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว — ผ่าน helper นี้แทน load_workbook ตรงๆ
     # เพื่อส่ง keep_vba=True อัตโนมัติถ้าไฟล์มีมาโคร กันมาโครหายตอน wb.save() ด้านล่าง
     wb = _load_workbook_preserving_macros(doc["original_bytes"])
-    for label, info in doc["label_map"].items():
+    for label, info in labels_to_write.items():
         ws = wb[info["sheet"]]
         ws.cell(row=info["row"], column=info["col"], value=resolved[label])
 
