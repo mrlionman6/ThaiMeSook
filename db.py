@@ -1263,27 +1263,44 @@ def get_chat_document_focus(chat_id: int, user_id: int) -> Optional[dict]:
 def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
     """บันทึกทับรายการล่าสุดของแชทนี้เสมอ (upsert — 1 แชทมีรายการล่าสุดได้แค่ชุดเดียว) เรียกจาก
     find_customers/list_customer_documents/list_project_documents/list_templates/select_list_item
-    (main.py) ทุกครั้งที่คืนรายการให้ผู้ใช้ดู"""
+    (main.py) ทุกครั้งที่คืนรายการให้ผู้ใช้ดู
+
+    เก็บจำนวนข้อความทั้งหมดในแชท ณ ตอนบันทึกไว้ในคอลัมน์ items เอง (ห้าม ALTER ตารางเพิ่มคอลัมน์ใหม่) ภายใต้คีย์
+    "message_count_at_creation" คู่กับ "entries" (รายการจริง) — ใช้โดย is_listing_fresh() (main.py) ตัดสินว่า
+    รายการนี้ถูกสร้างในเทิร์นผู้ช่วยที่เพิ่งจบจริงไหม (ยังไม่มีข้อความผู้ใช้อื่นแทรกมาหลังจากนั้น)"""
     now = datetime.datetime.utcnow()
     with SessionLocal() as session:
+        message_count = session.query(ChatMessage).filter(ChatMessage.session_id == chat_id).count()
+        stored = {"entries": items, "message_count_at_creation": message_count}
         row = session.get(ChatLastListing, chat_id)
         if row is None:
-            row = ChatLastListing(chat_id=chat_id, kind=kind, items=items, created_at=now)
+            row = ChatLastListing(chat_id=chat_id, kind=kind, items=stored, created_at=now)
             session.add(row)
         else:
             row.kind = kind
-            row.items = items
+            row.items = stored
             row.created_at = now
         session.commit()
 
 
 def get_chat_last_listing(chat_id: int) -> Optional[dict]:
-    """คืน {"kind":, "items":, "created_at":} ของรายการล่าสุดในแชทนี้ หรือ None ถ้ายังไม่เคยมีรายการเลย"""
+    """คืน {"kind":, "items":, "message_count_at_creation":, "created_at":} ของรายการล่าสุดในแชทนี้ หรือ None
+    ถ้ายังไม่เคยมีรายการเลย รองรับ backward-compat กับแถวเก่าก่อนมีการเก็บ message_count_at_creation ที่ items
+    เป็น list ตรงๆ (ไม่ใช่ dict ที่มี "entries") — กรณีนั้นคืน message_count_at_creation=None ให้ is_listing_fresh()
+    ถือว่าไม่สดแทน (ปลอดภัยกว่าเดาว่าสด)"""
     with SessionLocal() as session:
         row = session.get(ChatLastListing, chat_id)
         if row is None:
             return None
-        return {"kind": row.kind, "items": row.items, "created_at": row.created_at}
+        stored = row.items
+        if isinstance(stored, list):  # แถวเก่าก่อนมี message_count_at_creation
+            return {"kind": row.kind, "items": stored, "message_count_at_creation": None, "created_at": row.created_at}
+        return {
+            "kind": row.kind,
+            "items": stored.get("entries", []),
+            "message_count_at_creation": stored.get("message_count_at_creation"),
+            "created_at": row.created_at,
+        }
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------

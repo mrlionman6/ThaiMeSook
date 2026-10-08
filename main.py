@@ -886,6 +886,18 @@ def _format_customer_list(title: str, customers: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _count_non_template_documents_by_customer_code() -> dict[str, int]:
+    """นับจำนวนเอกสาร (ไม่รวมแม่แบบ) ของแต่ละ customer_code (คีย์ normalize ตัวพิมพ์เล็กแล้ว) — ใช้ร่วมกันทั้ง
+    find_customers และการสร้างข้อความรายการบริษัทใหม่จาก chat_last_listing (ดู _rebuild_formatted_listing_text)"""
+    doc_counts: dict[str, int] = {}
+    for item in _get_enriched_library_files():
+        if item["is_template"] or not item["customer_code"]:
+            continue
+        key = item["customer_code"].strip().lower()
+        doc_counts[key] = doc_counts.get(key, 0) + 1
+    return doc_counts
+
+
 def find_customers(query: str) -> list[dict]:
     """หาบริษัทในทะเบียนลูกค้า (customers table) ที่ตรงกับ query ด้วยโค้ดล้วนๆ — เทียบกับ customer_code
     ตรงตัวแบบไม่สนตัวพิมพ์เล็กใหญ่ก่อน (ต้องตรงเป๊ะ) และ customer_name หลัง normalize ด้วย
@@ -897,12 +909,7 @@ def find_customers(query: str) -> list[dict]:
     query_code = query.lower()
     query_name = _normalize_customer_name(query)
 
-    doc_counts: dict[str, int] = {}
-    for item in _get_enriched_library_files():
-        if item["is_template"] or not item["customer_code"]:
-            continue
-        key = item["customer_code"].strip().lower()
-        doc_counts[key] = doc_counts.get(key, 0) + 1
+    doc_counts = _count_non_template_documents_by_customer_code()
 
     matches = []
     for cust in get_all_customers():
@@ -977,6 +984,40 @@ def _record_chat_customer_listing(chat_id: int, customers: list[dict]) -> None:
     กลุ่มใดๆ ใช้ลำดับ input ตรงๆ)"""
     items = [{"n": i, "customer_code": c["customer_code"]} for i, c in enumerate(customers, start=1)]
     set_chat_last_listing(chat_id, "customers", items)
+
+
+def _rebuild_formatted_listing_text(listing: dict) -> Optional[str]:
+    """สร้างข้อความ formatted ของรายการล่าสุดใหม่จาก items ที่เก็บไว้ใน chat_last_listing (ไม่ได้เก็บ formatted
+    text ไว้ตรงๆ ตอนบันทึก เก็บแค่ file_id/customer_code) ใช้ต่อท้าย system prompt เตือน Claude ว่ามีรายการ
+    ค้างอยู่ (ดู LIBRARY_LOGGED_IN_RULES ส่วนรายการค้าง) คืน None ถ้าสร้างไม่ได้ (เช่นไฟล์/บริษัททั้งหมดในรายการ
+    ถูกลบไปแล้ว) ชื่อหัวข้อเป็นข้อความทั่วไป (ไม่ใช่ชื่อเดิมตอนแสดงครั้งแรก เพราะไม่ได้เก็บไว้) — ไม่กระทบการใช้งาน
+    เพราะจุดประสงค์คือให้ Claude เห็นเนื้อหา/เลขข้อตรงกับที่ผู้ใช้เห็นจริง ไม่ใช่โชว์ซ้ำให้ผู้ใช้อ่าน"""
+    items = listing.get("items") or []
+    if not items:
+        return None
+
+    if listing["kind"] == "documents":
+        file_ids = {item["file_id"] for item in items}
+        documents = [doc for doc in _get_enriched_library_files() if doc["file_id"] in file_ids]
+        if not documents:
+            return None
+        return _format_library_document_list("**รายการที่แสดงไปก่อนหน้านี้**", documents)
+
+    # kind == "customers"
+    doc_counts = _count_non_template_documents_by_customer_code()
+    customers = []
+    for item in items:
+        row = get_customer_by_code(item["customer_code"])
+        if row is None:
+            continue
+        customers.append({
+            "customer_code": row["customer_code"],
+            "customer_name": row.get("customer_name"),
+            "document_count": doc_counts.get(row["customer_code"].strip().lower(), 0),
+        })
+    if not customers:
+        return None
+    return _format_customer_list("**รายชื่อบริษัทที่แสดงไปก่อนหน้านี้**", customers)
 
 
 def execute_find_customers(tool_input: dict, chat_id: int) -> dict:
@@ -1080,6 +1121,82 @@ def execute_select_list_item(tool_input: dict, user_id: int, chat_id: int) -> di
     title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
     formatted = _format_library_document_list(title, documents)
     return {"count": len(documents), "formatted": formatted}
+
+
+def _answer_from_select_list_item_result(result: dict) -> str:
+    """แปลงผลจาก execute_select_list_item() เป็นข้อความคำตอบที่โค้ดสร้างเอง (ไม่ผ่าน AI เลย) — ใช้ตอน
+    ask_question() ลัดเรียก select_list_item ตรงๆ (ดู is_listing_fresh/parse_list_selection) ไม่มีรูปแบบคำตอบ
+    ใหม่ ใช้ฟิลด์ที่ executor นั้นๆ สร้างไว้แล้วตรงๆ: เปิดไฟล์สำเร็จ/เปิดอยู่แล้ว/ตรงหลายไฟล์ -> "message"
+    (จาก execute_open_library_file รวมเรื่องมาโครอยู่แล้ว) รายการบริษัท -> "formatted" ผิดพลาด/เลขข้อเกินช่วง ->
+    "error" """
+    if "error" in result:
+        return result["error"]
+    if "message" in result:
+        return result["message"]
+    if "formatted" in result:
+        return result["formatted"]
+    return "เลือกรายการไม่สำเร็จ ลองใหม่อีกครั้งครับ"
+
+
+_LIST_SELECTION_STOPWORDS = ("เปิด", "ดู", "ขอ", "เอา", "เลือก", "ครับ", "ค่ะ", "หน่อย")
+_THAI_DIGIT_TRANSLATION = str.maketrans("๐๑๒๓๔๕๖๗๘๙", "0123456789")
+_THAI_ORDINAL_WORD_VALUES = {
+    "หนึ่ง": 1, "สอง": 2, "สาม": 3, "สี่": 4, "ห้า": 5,
+    "หก": 6, "เจ็ด": 7, "แปด": 8, "เก้า": 9, "สิบ": 10,
+}
+_LIST_SELECTION_PREFIX = r"(?:ข้อที่|ข้อ|อันที่|อัน)?"
+_LIST_SELECTION_NUMBER_RE = re.compile(_LIST_SELECTION_PREFIX + r"(\d+)")
+_LIST_SELECTION_WORD_RE = re.compile(_LIST_SELECTION_PREFIX + r"(" + "|".join(_THAI_ORDINAL_WORD_VALUES) + r")")
+
+
+def parse_list_selection(text: str, item_count: int) -> Optional[int]:
+    """แปลข้อความผู้ใช้เป็นเลขข้อที่เลือกด้วยโค้ดล้วนๆ (ไม่ใช้ AI เลย) — คืน None ถ้าข้อความไม่ใช่การเลือกรายการ
+    ล้วนๆ (มีเนื้อหาอื่นปนมาด้วย เช่น "ข้อ 2 กับข้อ 1 ต่างกันยังไง" หรือเป็นคำถาม/ปฏิเสธอื่นที่ไม่เกี่ยวกับการเลือก
+    เลย) ต้องให้ AI จัดการต่อในกรณีเหล่านั้น
+
+    ตัดคำทั่วไปที่ไม่กระทบความหมายการเลือก (_LIST_SELECTION_STOPWORDS) และช่องว่างทั้งหมดออกก่อนเทียบรูปแบบเสมอ
+    — หลังตัดต้องเหลือแค่ส่วนที่ระบุข้อพอดี ไม่มีอะไรเหลือเกิน ถึงจะถือว่าเป็นการเลือก รองรับ: "ข้อ/ข้อที่/อันที่/
+    อัน N" (เลขอารบิกหรือเลขไทย ๐-๙), เลขล้วนๆ, "อันแรก"/"ข้อแรก"=1, "อันที่<เลขไทยคำ>"/"ข้อ<เลขไทยคำ>"
+    (หนึ่ง-สิบ), "อันสุดท้าย"/"ข้อสุดท้าย"=item_count"""
+    normalized = text.translate(_THAI_DIGIT_TRANSLATION).strip()
+    normalized = re.sub(r"\s+", "", normalized)
+    for word in _LIST_SELECTION_STOPWORDS:
+        normalized = normalized.replace(word, "")
+
+    if not normalized:
+        return None
+
+    if normalized in ("อันสุดท้าย", "ข้อสุดท้าย", "สุดท้าย"):
+        return item_count if item_count > 0 else None
+
+    if normalized in ("อันแรก", "ข้อแรก", "แรก"):
+        return 1
+
+    match = _LIST_SELECTION_NUMBER_RE.fullmatch(normalized)
+    if match:
+        return int(match.group(1))
+
+    match = _LIST_SELECTION_WORD_RE.fullmatch(normalized)
+    if match:
+        return _THAI_ORDINAL_WORD_VALUES[match.group(1)]
+
+    return None
+
+
+def is_listing_fresh(chat_id: int) -> bool:
+    """True เมื่อรายการล่าสุดของแชทนี้ถูกสร้างในเทิร์นผู้ช่วยที่เพิ่งจบจริงๆ (ไม่มีข้อความผู้ใช้อื่นแทรกมาหลังจาก
+    คำตอบที่แสดงรายการนั้น นอกจากข้อความปัจจุบันที่กำลังประมวลผลอยู่ ซึ่งยังไม่ถูกบันทึกลงแชทตอนเรียกฟังก์ชันนี้)
+
+    เทียบจำนวนข้อความทั้งหมดในแชทตอนนี้กับตอนบันทึกรายการ (message_count_at_creation เก็บไว้ใน items เอง —
+    ดู set_chat_last_listing) ต้องมากกว่าพอดี 2 (คู่ข้อความผู้ใช้+ผู้ช่วยของเทิร์นที่แสดงรายการนั้นเอง ซึ่งถูก
+    บันทึกลงแชทหลังจากนั้น) ถ้ามากกว่านั้น แปลว่ามีอย่างน้อยอีกหนึ่งเทิร์นคั่นอยู่ ไม่ถือว่าสดแล้ว ไม่มีรายการเลย
+    หรือรายการมาจากแถวเก่าก่อนมีการเก็บ message_count_at_creation (ไม่รู้ว่าสร้างเทิร์นไหน) ถือว่าไม่สดเสมอ
+    (ปลอดภัยกว่าเดาว่าสด)"""
+    listing = get_chat_last_listing(chat_id)
+    if listing is None or listing.get("message_count_at_creation") is None:
+        return False
+    current_count = len(get_chat_messages(chat_id))
+    return current_count == listing["message_count_at_creation"] + 2
 
 
 def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> dict:
@@ -1923,13 +2040,19 @@ def _build_library_file_listing_text(limit: int = 100) -> str:
     return "\n".join(lines)
 
 
-def _prepare_rag_context(query, history, image_data, user_id=None):
+def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None):
     """ขั้นตอนเตรียมข้อมูลทั้งหมดก่อนเรียก Claude ตัวตอบจริง — ใช้ร่วมกันทั้งโหมด
     non-streaming (rag_answer) และ streaming (rag_answer_stream) กันโค้ดซ้ำซ้อน
 
     user_id ใช้ตัดสินว่าจะต่อท้าย system prompt ด้วยรายชื่อไฟล์ในคลัง+กติกาเปิดไฟล์ทันที (ล็อกอินแล้ว)
     หรือข้อความบอกให้เข้าสู่ระบบก่อน (guest) — ไม่ใช่ตัวตัดสินว่ามี tool คลังไฟล์จริงหรือไม่ (ตัดสินแยก
     ใน run_agentic_tool_loop ตอนประกอบ tools list เหมือนเดิม) เป็น optional (None = guest)
+
+    chat_id (ถ้ามีทั้ง user_id และ chat_id) ใช้เช็คว่ามีรายการค้างอยู่ใน chat_last_listing ไหม (ดู
+    ask_question — จุดนี้ทำงานเฉพาะกรณีที่ไม่เข้าทางลัด select_list_item โดยตรงอยู่แล้ว เช่น ข้อความผู้ใช้ไม่ใช่
+    การเลือกล้วนๆ หรือรายการไม่สดพอ) ถ้ามี ต่อท้าย system prompt ด้วยเนื้อหารายการ + กติกาให้ใช้ select_list_item
+    และเปลี่ยนหัวข้อบริบทเป็น "ข้อมูลอ้างอิงจากฐานความรู้..." แทน "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง..."
+    กันสับสนกับเลขข้อในรายการ (เช่น "ข้อ 2" ในผลค้น KB ปนกับ "ข้อ 2" ในรายการไฟล์)
 
     คืนค่า dict เสมอ:
     - ถ้าภาพไม่เกี่ยวข้อง: {"early_exit": True, "message": ...}
@@ -1998,8 +2121,29 @@ def _prepare_rag_context(query, history, image_data, user_id=None):
     else:
         system_prompt += LIBRARY_GUEST_RULES
 
+    # มีรายการค้างอยู่ (ไม่ว่าจะสดพอให้ ask_question ลัดเรียก select_list_item เองหรือไม่ — จุดนี้ทำงานเฉพาะ
+    # ตอนไม่เข้าทางลัดอยู่แล้ว) เตือน Claude ไว้กันตีความเลขข้อผิดเป็นข้อมูลอ้างอิงจากฐานความรู้แทน
+    pending_listing_text = None
+    if user_id and chat_id:
+        listing = get_chat_last_listing(chat_id)
+        if listing is not None:
+            pending_listing_text = _rebuild_formatted_listing_text(listing)
+
+    if pending_listing_text:
+        system_prompt += (
+            "\n\nรายการล่าสุดที่แสดงให้ผู้ใช้ (ยังเลือกได้):\n" + pending_listing_text + "\n\n"
+            "- ถ้าข้อความผู้ใช้อ้างถึงรายการนี้ (เช่น เลขข้อ อันดับ หรือชื่อที่ตรงกับบรรทัดในรายการ) "
+            "ให้เรียก select_list_item ห้ามตีความเลขข้อเป็นข้อมูลอ้างอิงจากฐานความรู้เด็ดขาด\n"
+            "- ถ้าผู้ใช้ปฏิเสธหรือเปลี่ยนเรื่อง ให้ตอบเรื่องใหม่ตามปกติโดยไม่ต้องพูดถึงรายการนี้อีก\n"
+        )
+
+    context_header = (
+        "ข้อมูลอ้างอิงจากฐานความรู้ด้านกฎหมาย/การลงทุน (อาจไม่เกี่ยวกับคำถามนี้):\n"
+        if pending_listing_text else
+        "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n"
+    )
     current_turn_text = (
-        "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n" + context + "\n\n"
+        context_header + context + "\n\n"
         "คำถาม: " + (query if query else "(ผู้ใช้แนบภาพมาโดยไม่ได้พิมพ์คำถามเพิ่ม กรุณาดูภาพแล้วช่วยอธิบาย/ให้ความรู้ที่เกี่ยวข้อง)")
     )
 
@@ -2047,7 +2191,7 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None)
     list_templates/open_library_file ถ้ามี user_id) ผ่าน run_agentic_tool_loop() — user_id/chat_id เป็น
     optional (None สำหรับ guest ที่ไม่ได้ล็อกอิน)"""
     history = history or []
-    ctx = _prepare_rag_context(query, history, image_data, user_id=user_id)
+    ctx = _prepare_rag_context(query, history, image_data, user_id=user_id, chat_id=chat_id)
 
     if ctx["early_exit"]:
         return ctx["message"], []
@@ -2269,6 +2413,23 @@ async def ask_question(
     image: Optional[UploadFile] = File(None),
 ):
     user_id = get_active_user_id(request)
+
+    # ทางลัดการเลือกจากรายการค้างอยู่ด้วยโค้ดล้วนๆ (ก่อน branch Excel editor ด้านล่าง และก่อนเรียก AI เสมอ) —
+    # ถ้ารายการล่าสุดถูกแสดงไปในเทิร์นผู้ช่วยที่เพิ่งจบพอดี (is_listing_fresh) และข้อความผู้ใช้เป็นการเลือก
+    # ล้วนๆ (parse_list_selection ไม่ใช่ None) ให้เรียก select_list_item ตรงๆ ไม่ต้องเรียก AI ไม่ต้องค้นฐาน
+    # ความรู้เลย กันปัญหาที่เคยเจอ: AI สับสนเลขข้อของรายการไฟล์กับเลขข้อของผลค้น KB ที่แนบมาด้วยในเทิร์นเดียวกัน
+    if user_id and chat_id and query.strip() and image is None and is_listing_fresh(chat_id):
+        listing = get_chat_last_listing(chat_id)
+        item_count = len(listing["items"]) if listing else 0
+        if item_count > 0:
+            selection_index = parse_list_selection(query, item_count)
+            if selection_index is not None:
+                result = _safe_execute_tool("select_list_item", execute_select_list_item, {"index": selection_index}, user_id, chat_id)
+                answer = _answer_from_select_list_item_result(result)
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
     # ถ้าแชทนี้มี EditableDocument (Excel Editor) ที่ยังไม่หมดอายุผูกอยู่ และข้อความนี้ไม่มีไฟล์แนบมาด้วย
     # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize/compare) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
