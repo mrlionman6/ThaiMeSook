@@ -198,6 +198,20 @@ class EditableDocument(Base):
     expires_at = Column(DateTime(timezone=True), nullable=False)  # เขียนตอน insert = created_at + EDITABLE_DOCUMENT_EXPIRY_DAYS
 
 
+class DocumentEditLog(Base):
+    """ประวัติการแก้ไขแต่ละครั้งของ EditableDocument ที่สำเร็จ — บันทึกจาก _match_and_apply_excel_edit()
+    (main.py) ทุกครั้งที่แก้สำเร็จ ใช้ให้ undo_last_edit() (main.py) ย้อนค่าล่าสุดกลับ ไม่ ALTER ตารางเดิม
+    ลบไฟล์ในแชท (EditableDocument) -> ประวัติหายไปด้วยอัตโนมัติ (ON DELETE CASCADE)"""
+    __tablename__ = "document_edit_log"
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("editable_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    label = Column(Text, nullable=False)
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class ChatDocumentFocus(Base):
     """ไฟล์ Excel ที่ 'กำลังโฟกัส' อยู่ในแชทหนึ่งๆ ตอนนี้ — ใช้เป็นค่า default เวลาคำสั่งผู้ใช้ไม่ได้ระบุไฟล์
     ชัดเจน (เช่น "ไฟล์ที่แก้ไปเมื่อกี้") 1 แชทมีโฟกัสได้แค่ไฟล์เดียว ณ เวลาหนึ่ง (chat_id เป็น primary key ตรงๆ
@@ -1260,30 +1274,115 @@ def get_chat_document_focus(chat_id: int, user_id: int) -> Optional[dict]:
     return get_editable_document(document_id, user_id)
 
 
+def clear_chat_document_focus(chat_id: int) -> None:
+    """ล้างโฟกัสของแชทนี้ (ลบแถวทิ้งถ้ามี ไม่มีก็ไม่ทำอะไร) — ใช้ตอนปิดไฟล์ที่กำลังโฟกัสอยู่
+    (ดู close_editable_document)"""
+    with SessionLocal() as session:
+        row = session.get(ChatDocumentFocus, chat_id)
+        if row is not None:
+            session.delete(row)
+            session.commit()
+
+
+def close_editable_document(document_id: int, user_id: int) -> bool:
+    """ปิดไฟล์นี้ไม่ให้ active ในแชทอีก — ใช้กลไกหมดอายุที่มีอยู่แล้ว (ตั้ง expires_at ไปในอดีต) แทนการเพิ่ม
+    คอลัมน์/ตารางใหม่ ไม่ลบแถวจริง (original_bytes/label_map ยังอยู่ แค่ไม่ถูกนับว่า active อีกต่อไปในทุก
+    ฟังก์ชันที่เช็คผ่าน _is_editable_document_expired เช่น list_active_editable_documents_by_chat) คืน False
+    ถ้าไม่พบไฟล์นี้หรือไม่ใช่เจ้าของ"""
+    with SessionLocal() as session:
+        row = session.get(EditableDocument, document_id)
+        if row is None or row.user_id != user_id:
+            return False
+        row.expires_at = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
+        session.commit()
+        return True
+
+
+def log_document_edit(document_id: int, label: str, old_value, new_value) -> None:
+    """บันทึกการแก้ 1 ครั้งลงประวัติ — เรียกจาก _match_and_apply_excel_edit() (main.py) ทุกครั้งที่แก้สำเร็จ"""
+    with SessionLocal() as session:
+        row = DocumentEditLog(document_id=document_id, label=label, old_value=old_value, new_value=new_value)
+        session.add(row)
+        session.commit()
+
+
+def get_recent_document_edits(document_id: int, limit: int = 5) -> list[dict]:
+    """คืนประวัติการแก้ล่าสุด limit รายการ (ใหม่สุดก่อน) ของไฟล์นี้ — ใช้ใน build_chat_state() (main.py)"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(DocumentEditLog)
+            .filter(DocumentEditLog.document_id == document_id)
+            .order_by(DocumentEditLog.created_at.desc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {"label": r.label, "old_value": r.old_value, "new_value": r.new_value, "created_at": r.created_at}
+            for r in rows
+        ]
+
+
+def pop_last_document_edit(document_id: int) -> Optional[dict]:
+    """ดึงประวัติการแก้ล่าสุดของไฟล์นี้แล้วลบแถวนั้นทิ้งทันที (atomic ในทรานแซกชันเดียว) คืน {"label":,
+    "old_value":, "new_value":} หรือ None ถ้าไม่มีประวัติเลย ใช้โดย undo_last_edit() (main.py) ซึ่งเป็นคนเอา
+    old_value ไปเขียนกลับ label_map เอง (ผ่าน get_editable_document/update_editable_document_label_map
+    เส้นทางเดียวกับการแก้ปกติทุกประการ)"""
+    with SessionLocal() as session:
+        row = (
+            session.query(DocumentEditLog)
+            .filter(DocumentEditLog.document_id == document_id)
+            .order_by(DocumentEditLog.created_at.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        result = {"label": row.label, "old_value": row.old_value, "new_value": row.new_value}
+        session.delete(row)
+        session.commit()
+        return result
+
+
 def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
     """บันทึกทับรายการล่าสุดของแชทนี้เสมอ (upsert — 1 แชทมีรายการล่าสุดได้แค่ชุดเดียว) เรียกจาก
     find_customers/list_customer_documents/list_project_documents/list_templates/select_list_item
-    (main.py) ทุกครั้งที่คืนรายการให้ผู้ใช้ดู"""
+    (main.py) ทุกครั้งที่คืนรายการให้ผู้ใช้ดู
+
+    เก็บจำนวนข้อความทั้งหมดในแชท ณ ตอนบันทึกไว้ในคอลัมน์ items เอง (ห้าม ALTER ตารางเพิ่มคอลัมน์ใหม่) ภายใต้คีย์
+    "message_count_at_creation" คู่กับ "entries" (รายการจริง) — ใช้โดย is_listing_fresh() (main.py) ตัดสินว่า
+    รายการนี้ถูกสร้างในเทิร์นผู้ช่วยที่เพิ่งจบจริงไหม (ยังไม่มีข้อความผู้ใช้อื่นแทรกมาหลังจากนั้น)"""
     now = datetime.datetime.utcnow()
     with SessionLocal() as session:
+        message_count = session.query(ChatMessage).filter(ChatMessage.session_id == chat_id).count()
+        stored = {"entries": items, "message_count_at_creation": message_count}
         row = session.get(ChatLastListing, chat_id)
         if row is None:
-            row = ChatLastListing(chat_id=chat_id, kind=kind, items=items, created_at=now)
+            row = ChatLastListing(chat_id=chat_id, kind=kind, items=stored, created_at=now)
             session.add(row)
         else:
             row.kind = kind
-            row.items = items
+            row.items = stored
             row.created_at = now
         session.commit()
 
 
 def get_chat_last_listing(chat_id: int) -> Optional[dict]:
-    """คืน {"kind":, "items":, "created_at":} ของรายการล่าสุดในแชทนี้ หรือ None ถ้ายังไม่เคยมีรายการเลย"""
+    """คืน {"kind":, "items":, "message_count_at_creation":, "created_at":} ของรายการล่าสุดในแชทนี้ หรือ None
+    ถ้ายังไม่เคยมีรายการเลย รองรับ backward-compat กับแถวเก่าก่อนมีการเก็บ message_count_at_creation ที่ items
+    เป็น list ตรงๆ (ไม่ใช่ dict ที่มี "entries") — กรณีนั้นคืน message_count_at_creation=None ให้ is_listing_fresh()
+    ถือว่าไม่สดแทน (ปลอดภัยกว่าเดาว่าสด)"""
     with SessionLocal() as session:
         row = session.get(ChatLastListing, chat_id)
         if row is None:
             return None
-        return {"kind": row.kind, "items": row.items, "created_at": row.created_at}
+        stored = row.items
+        if isinstance(stored, list):  # แถวเก่าก่อนมี message_count_at_creation
+            return {"kind": row.kind, "items": stored, "message_count_at_creation": None, "created_at": row.created_at}
+        return {
+            "kind": row.kind,
+            "items": stored.get("entries", []),
+            "message_count_at_creation": stored.get("message_count_at_creation"),
+            "created_at": row.created_at,
+        }
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------
