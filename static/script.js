@@ -213,6 +213,7 @@ async function askQuestion() {
 
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
+        loadChatFilesPanel(); // สถานะไฟล์อาจเปลี่ยน (เปิด/แก้/ปิดไฟล์ผ่าน tool) หลังได้คำตอบทุกครั้ง
 
         // เช็คไว้ก่อน "ก่อน" ที่จะไป sync currentChatId ด้านล่าง — กันบั๊กที่การ sync
         // เปลี่ยนค่า currentChatId ไปแล้วทำให้เช็คซ้ำทีหลังผิดพลาด (เช่น null -> id จริงตอนแชทใหม่)
@@ -279,6 +280,7 @@ async function submitAttachmentUpload(endpoint, file, instruction = null) {
 
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
+        loadChatFilesPanel(); // แนบไฟล์ (Excel Editor) อาจสร้าง/แก้ไฟล์ในแชทนี้ทันที — รีเฟรชแผงเสมอ
 
         // เช็คไว้ก่อน sync currentChatId เหมือน askQuestion() — กันเช็คซ้ำทีหลังผิดพลาดตอนเป็นแชทใหม่ (null -> id จริง)
         const stillSameChat = (currentChatId === requestChatId);
@@ -420,8 +422,250 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") {
         closeSidebar();
         closeModal();
+        closeFilesPanel();
     }
 });
+
+// =====================================================================
+// แผงไฟล์ในแชท (ขวา) — แสดงไฟล์ Excel ที่กำลังเปิดอยู่ในแชทปัจจุบัน (จาก GET /api/chats/{id}/state)
+// ซ่อนทั้งหมดถ้าไม่ได้ login (ดู loadChatFilesPanel) เปิด/ปิดด้วยปุ่มมุมขวาบน (เหมือนปุ่ม ☰ ซ้าย)
+// =====================================================================
+function openFilesPanel() {
+    document.getElementById("filesPanel").classList.add("open");
+    document.getElementById("filesPanel").setAttribute("aria-hidden", "false");
+    document.getElementById("filesPanelToggle").setAttribute("aria-expanded", "true");
+    // backdrop (พื้นหลังมืด) โชว์เฉพาะจอแคบ (<768px — ดู @media ใน style.css ที่ซ่อนไว้บนจอกว้างเสมอ)
+    document.getElementById("filesPanelBackdrop").hidden = false;
+    loadChatFilesPanel(); // รีเฟรชสถานะล่าสุดทุกครั้งที่เปิดแผง กันข้อมูลค้างจากตอนปิดแผงไว้นาน
+}
+
+function closeFilesPanel() {
+    document.getElementById("filesPanel").classList.remove("open");
+    document.getElementById("filesPanel").setAttribute("aria-hidden", "true");
+    document.getElementById("filesPanelToggle").setAttribute("aria-expanded", "false");
+    document.getElementById("filesPanelBackdrop").hidden = true;
+}
+
+function toggleFilesPanel() {
+    if (document.getElementById("filesPanel").classList.contains("open")) {
+        closeFilesPanel();
+    } else {
+        openFilesPanel();
+    }
+}
+
+document.getElementById("filesPanelToggle").addEventListener("click", toggleFilesPanel);
+document.getElementById("filesPanelCloseBtn").addEventListener("click", closeFilesPanel);
+document.getElementById("filesPanelNewDocBtn").addEventListener("click", requestNewDocumentFromTemplate);
+
+let filesPanelBackdropMouseDown = false;
+document.getElementById("filesPanelBackdrop").addEventListener("mousedown", (e) => {
+    filesPanelBackdropMouseDown = (e.target.id === "filesPanelBackdrop");
+});
+document.getElementById("filesPanelBackdrop").addEventListener("click", (e) => {
+    if (e.target.id === "filesPanelBackdrop" && filesPanelBackdropMouseDown) {
+        closeFilesPanel();
+    }
+    filesPanelBackdropMouseDown = false;
+});
+
+// ปุ่ม "สร้างเอกสารใหม่จากแม่แบบ" ท้ายแผง — ส่งข้อความคงที่เข้าแชทผ่านฟังก์ชันส่งข้อความเดิม (askQuestion)
+// เหมือนผู้ใช้พิมพ์เองทุกประการ ไม่ใช่ endpoint แยก
+function requestNewDocumentFromTemplate() {
+    document.getElementById("questionInput").value = "อยากร่างเอกสารใหม่";
+    askQuestion();
+}
+
+// โหลด/แสดงสถานะไฟล์ล่าสุดของแชทที่กำลังดูอยู่ (currentChatId) — เรียกหลังได้คำตอบทุกครั้ง, หลังแนบไฟล์,
+// หลังสลับแชท, หลังกดปุ่มในแผง, และตอนเปิดแผง (ดูจุดเรียกทั้งหมดในไฟล์นี้) ซ่อนปุ่มเปิด+ปิดแผงทิ้งถ้าไม่ได้ login
+async function loadChatFilesPanel() {
+    const toggle = document.getElementById("filesPanelToggle");
+
+    if (!currentUser) {
+        toggle.hidden = true;
+        closeFilesPanel();
+        return;
+    }
+    toggle.hidden = false;
+
+    // แชทใหม่ที่ยังไม่มี chat_id จริง (ยังไม่เคยถามอะไรเลย) -> ไม่มีอะไรให้โหลด แสดงสถานะว่างตรงๆ
+    if (!currentChatId) {
+        renderFilesPanel({ documents: [] });
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/chats/${currentChatId}/state`);
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const data = await res.json();
+        renderFilesPanel(data);
+    } catch (error) {
+        renderFilesPanel({ documents: [], loadError: true });
+    }
+}
+
+function showFilesPanelMessage(text) {
+    const el = document.getElementById("filesPanelMessage");
+    el.textContent = text;
+    el.hidden = false;
+}
+
+function updateFilesPanelBadge(count) {
+    const badge = document.getElementById("filesPanelBadge");
+    if (count > 0) {
+        badge.textContent = String(count);
+        badge.hidden = false;
+    } else {
+        badge.hidden = true;
+    }
+}
+
+function renderFilesPanel(state) {
+    const body = document.getElementById("filesPanelBody");
+    body.innerHTML = ""; // เคลียร์การ์ดเก่าทิ้ง (ไม่ใช่การประกอบ HTML จากข้อมูลดิบ — แค่ล้างก่อนสร้างใหม่)
+    const documents = state.documents || [];
+    updateFilesPanelBadge(documents.length);
+
+    if (state.loadError) {
+        const p = document.createElement("p");
+        p.className = "files-panel-empty";
+        p.textContent = "โหลดสถานะไฟล์ไม่สำเร็จ";
+        body.appendChild(p);
+        return;
+    }
+
+    if (documents.length === 0) {
+        const p = document.createElement("p");
+        p.className = "files-panel-empty";
+        p.textContent = "ยังไม่มีไฟล์เปิดในแชทนี้";
+        body.appendChild(p);
+        return;
+    }
+
+    documents.forEach(doc => body.appendChild(buildFileCard(doc)));
+}
+
+// สร้างการ์ดไฟล์ 1 ใบด้วย DOM API ล้วนๆ (textContent เท่านั้น) — ห้ามประกอบ innerHTML จากข้อมูลที่มาจาก
+// server (ชื่อไฟล์/label/ค่าที่แก้ ล้วนเป็นข้อมูลที่ผู้ใช้หรือไฟล์ที่อัปโหลดกำหนดได้ ถือเป็นข้อมูลดิบเสมอ)
+function buildFileCard(doc) {
+    const card = document.createElement("div");
+    card.className = "file-card";
+
+    const nameRow = document.createElement("div");
+    nameRow.className = "file-card-name";
+    nameRow.textContent = doc.filename;
+    card.appendChild(nameRow);
+
+    const metaParts = [];
+    if (doc.folder) metaParts.push(doc.folder);
+    if (doc.document_no) metaParts.push("เลขเอกสาร " + doc.document_no);
+    if (metaParts.length > 0) {
+        const metaRow = document.createElement("div");
+        metaRow.className = "file-card-meta";
+        metaRow.textContent = metaParts.join(" · ");
+        card.appendChild(metaRow);
+    }
+
+    if (doc.has_macros || doc.is_focused) {
+        const badgeRow = document.createElement("div");
+        badgeRow.className = "file-card-badges";
+        if (doc.has_macros) {
+            const b = document.createElement("span");
+            b.className = "file-card-badge";
+            b.textContent = "มีมาโคร";
+            badgeRow.appendChild(b);
+        }
+        if (doc.is_focused) {
+            const b = document.createElement("span");
+            b.className = "file-card-badge file-card-badge-focus";
+            b.textContent = "กำลังใช้งาน";
+            badgeRow.appendChild(b);
+        }
+        card.appendChild(badgeRow);
+    }
+
+    const edits = doc.recent_edits || [];
+    if (edits.length > 0) {
+        const details = document.createElement("details");
+        details.className = "file-card-edits";
+        const summary = document.createElement("summary");
+        summary.textContent = `การแก้ล่าสุด (${edits.length})`;
+        details.appendChild(summary);
+
+        const ul = document.createElement("ul");
+        edits.forEach(edit => {
+            const li = document.createElement("li");
+            li.textContent = `${edit.label}: ${edit.old_value} → ${edit.new_value}`;
+            if (edit.was_formula) {
+                const warn = document.createElement("span");
+                warn.className = "file-card-formula-warning";
+                warn.textContent = " ⚠️ เดิมเป็นสูตรคำนวณ";
+                li.appendChild(warn);
+            }
+            ul.appendChild(li);
+        });
+        details.appendChild(ul);
+        card.appendChild(details);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "file-card-actions";
+
+    const downloadBtn = document.createElement("a");
+    downloadBtn.className = "file-card-btn";
+    downloadBtn.textContent = "ดาวน์โหลด";
+    downloadBtn.href = doc.download_url;
+    actions.appendChild(downloadBtn);
+
+    const undoBtn = document.createElement("button");
+    undoBtn.type = "button";
+    undoBtn.className = "file-card-btn";
+    undoBtn.textContent = "ย้อนการแก้";
+    undoBtn.disabled = !doc.edit_count;
+    undoBtn.onclick = () => handleUndoFromPanel(doc.document_id);
+    actions.appendChild(undoBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "file-card-btn file-card-btn-danger";
+    closeBtn.textContent = "ปิดไฟล์";
+    closeBtn.onclick = () => handleCloseFromPanel(doc.document_id, doc.filename);
+    actions.appendChild(closeBtn);
+
+    card.appendChild(actions);
+    return card;
+}
+
+async function handleUndoFromPanel(documentId) {
+    if (!currentChatId) return;
+    try {
+        const res = await fetch(`/api/chats/${currentChatId}/documents/${documentId}/undo`, { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        showFilesPanelMessage(data.message || data.error || "ดำเนินการแล้ว");
+    } catch (error) {
+        showFilesPanelMessage("⚠️ " + error);
+    }
+    loadChatFilesPanel();
+}
+
+function handleCloseFromPanel(documentId, filename) {
+    showConfirmDialog(
+        `ปิดไฟล์ "${filename}" ในแชทนี้?`,
+        async () => {
+            try {
+                const res = await fetch(`/api/chats/${currentChatId}/documents/${documentId}/close`, { method: "POST" });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+                showFilesPanelMessage(data.message || data.error || "ดำเนินการแล้ว");
+            } catch (error) {
+                showFilesPanelMessage("⚠️ " + error);
+            }
+            loadChatFilesPanel();
+        },
+        { confirmText: "ปิดไฟล์" }
+    );
+}
 
 // =====================================================================
 // Modal (ใช้ร่วมกัน: login / register / forgot password / profile)
@@ -492,6 +736,7 @@ async function checkAuthStatus() {
     if (currentUser) {
         loadChatHistory();
     }
+    loadChatFilesPanel(); // ซ่อนปุ่ม/แผงทิ้งเองถ้าไม่ได้ login (เช็คภายในฟังก์ชัน)
 }
 
 function renderUserArea() {
@@ -528,6 +773,7 @@ async function handleSignOut() {
     renderUserArea();
     resetChatHistoryUI();
     document.getElementById("answerBox").innerHTML = "";
+    loadChatFilesPanel();
 }
 
 // ---------- ดึงรายการ security questions (cache ไว้ ไม่ต้องดึงซ้ำ) ----------
@@ -576,6 +822,7 @@ function openLoginModal() {
             closeModal();
             renderUserArea();
             loadChatHistory();
+            loadChatFilesPanel();
         } catch (error) {
             errorEl.textContent = String(error.message || error);
         }
@@ -934,6 +1181,7 @@ function handleDeleteAccount() {
                 renderUserArea();
                 resetChatHistoryUI();
                 document.getElementById("answerBox").innerHTML = "";
+                loadChatFilesPanel();
                 showAlertDialog("ลบบัญชีเรียบร้อยแล้ว");
             } catch (error) {
                 showAlertDialog("ลบบัญชีไม่สำเร็จ: " + error);
@@ -1029,6 +1277,7 @@ async function loadChat(chatId) {
         renderChatTranscript(data.messages);
         updateLoadingIndicator(); // ถ้าแชทนี้ยังมีคำถามค้างรอคำตอบอยู่ (ถามไว้ตอนอยู่แชทอื่น) ให้โชว์ loading กลับมา
         loadChatHistory();
+        loadChatFilesPanel(); // แชทที่สลับไปอาจมีไฟล์เปิดอยู่ไม่เหมือนแชทเดิม
         closeSidebar();
     } catch (error) {
         showAlertDialog("โหลดแชทไม่สำเร็จ: " + error);
@@ -1067,6 +1316,7 @@ function startNewChat() {
     updateTitleVisibility(); // แชทว่างแล้ว → โชว์ข้อความทักทายกลับมา
     updateLoadingIndicator(); // เผื่อมีคำถามใหม่ (ที่ยังไม่มี id) ค้างรออยู่ตอนกด "แชทใหม่" ซ้อนอีกที
     loadChatHistory();
+    loadChatFilesPanel(); // แชทใหม่ยังไม่มี chat_id จริง -> แสดงสถานะว่าง
     closeSidebar();
 }
 

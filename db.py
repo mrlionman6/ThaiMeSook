@@ -212,6 +212,29 @@ class DocumentEditLog(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class DocumentEditFormulaFlag(Base):
+    """ธง 'เซลล์นี้เดิมเป็นสูตรคำนวณอัตโนมัติ' ของการแก้แต่ละครั้งใน DocumentEditLog — แยกตารางต่างหากแทนการ
+    ALTER document_edit_log เดิม (เพิ่มคอลัมน์ไม่ได้) 1 แถวของ DocumentEditLog มีแถวคู่กันในตารางนี้ได้สูงสุด
+    1 แถว (edit_log_id เป็น primary key ตรงๆ) — มีแถว = เซลล์เดิมเป็นสูตร (True), ไม่มีแถว = ไม่ใช่ (False)
+    เขียนจาก log_document_edit() เสมอตอนแก้สำเร็จที่เซลล์เดิม (ใน original_bytes) เป็นสูตร การแก้ก่อนมี
+    PR นี้ไม่มีแถวในตารางนี้เลย ถือว่า False ให้หมด (ยอมรับได้ — แค่ไม่มีคำเตือนย้อนหลัง)"""
+    __tablename__ = "document_edit_formula_flags"
+
+    edit_log_id = Column(Integer, ForeignKey("document_edit_log.id", ondelete="CASCADE"), primary_key=True)
+
+
+class ClosedChatDocument(Base):
+    """ไฟล์ (EditableDocument) ที่ถูก 'ปิด' ในแชทแล้ว ไม่นับเป็น active อีกต่อไป — แยกกลไกนี้ออกจากการหมดอายุ
+    (expires_at) เดิมโดยสิ้นเชิง (เดิมใช้ expires_at ปิดไฟล์ แต่ทำให้ดาวน์โหลดไฟล์ที่ปิดแล้วไม่ได้ด้วย ทั้งที่
+    อยากให้ยังดาวน์โหลดได้จนกว่าจะหมดอายุจริง) มีแถว = ปิดแล้ว (เช็คใน list_active_editable_documents_by_chat
+    เท่านั้น — get_editable_document()/download_excel_editor_document() ไม่เช็คตารางนี้เลย จึงยังดาวน์โหลด
+    ไฟล์ที่ปิดแล้วได้ปกติ) ลบไฟล์จริง (EditableDocument) -> แถวนี้หายไปด้วยอัตโนมัติ (ON DELETE CASCADE)"""
+    __tablename__ = "closed_chat_documents"
+
+    document_id = Column(Integer, ForeignKey("editable_documents.id", ondelete="CASCADE"), primary_key=True)
+    closed_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class ChatDocumentFocus(Base):
     """ไฟล์ Excel ที่ 'กำลังโฟกัส' อยู่ในแชทหนึ่งๆ ตอนนี้ — ใช้เป็นค่า default เวลาคำสั่งผู้ใช้ไม่ได้ระบุไฟล์
     ชัดเจน (เช่น "ไฟล์ที่แก้ไปเมื่อกี้") 1 แชทมีโฟกัสได้แค่ไฟล์เดียว ณ เวลาหนึ่ง (chat_id เป็น primary key ตรงๆ
@@ -1219,9 +1242,10 @@ def get_editable_document_by_chat(chat_id: int, user_id: int) -> Optional[dict]:
 
 
 def list_active_editable_documents_by_chat(chat_id: int, user_id: int) -> list[dict]:
-    """คืนทุก EditableDocument ที่ยังไม่หมดอายุผูกกับแชทนี้ (ไม่ใช่แค่ตัวล่าสุดแบบ
-    get_editable_document_by_chat() เดิม — ฟังก์ชันนั้นยังเก็บไว้ไม่ลบ) เรียงใหม่สุดก่อน
-    ใช้รองรับหลายไฟล์ในแชทเดียวกัน (แก้/เปรียบเทียบหลายไฟล์พร้อมกัน)"""
+    """คืนทุก EditableDocument ที่ยังไม่หมดอายุ "และยังไม่ถูกปิด" (ดู ClosedChatDocument) ผูกกับแชทนี้
+    (ไม่ใช่แค่ตัวล่าสุดแบบ get_editable_document_by_chat() เดิม — ฟังก์ชันนั้นยังเก็บไว้ไม่ลบ) เรียงใหม่สุดก่อน
+    ใช้รองรับหลายไฟล์ในแชทเดียวกัน (แก้/เปรียบเทียบหลายไฟล์พร้อมกัน) — จุดเดียวที่เช็ค "ปิดแล้วหรือยัง"
+    ทั้งระบบ ทุกจุดที่ต้องการรายการไฟล์ active (build_chat_state, CHAT_DOCUMENT_TOOLS ฯลฯ) เรียกผ่านนี่หมด"""
     with SessionLocal() as session:
         rows = (
             session.query(EditableDocument)
@@ -1229,10 +1253,19 @@ def list_active_editable_documents_by_chat(chat_id: int, user_id: int) -> list[d
             .order_by(EditableDocument.created_at.desc())
             .all()
         )
+        active_rows = [row for row in rows if not _is_editable_document_expired(row.expires_at)]
+        if not active_rows:
+            return []
+        closed_ids = {
+            r.document_id
+            for r in session.query(ClosedChatDocument.document_id)
+            .filter(ClosedChatDocument.document_id.in_([row.id for row in active_rows]))
+            .all()
+        }
         return [
             _editable_document_to_dict(row)
-            for row in rows
-            if not _is_editable_document_expired(row.expires_at)
+            for row in active_rows
+            if row.id not in closed_ids
         ]
 
 
@@ -1285,29 +1318,37 @@ def clear_chat_document_focus(chat_id: int) -> None:
 
 
 def close_editable_document(document_id: int, user_id: int) -> bool:
-    """ปิดไฟล์นี้ไม่ให้ active ในแชทอีก — ใช้กลไกหมดอายุที่มีอยู่แล้ว (ตั้ง expires_at ไปในอดีต) แทนการเพิ่ม
-    คอลัมน์/ตารางใหม่ ไม่ลบแถวจริง (original_bytes/label_map ยังอยู่ แค่ไม่ถูกนับว่า active อีกต่อไปในทุก
-    ฟังก์ชันที่เช็คผ่าน _is_editable_document_expired เช่น list_active_editable_documents_by_chat) คืน False
-    ถ้าไม่พบไฟล์นี้หรือไม่ใช่เจ้าของ"""
+    """ปิดไฟล์นี้ไม่ให้ active ในแชทอีก — เพิ่มแถวใน ClosedChatDocument (ตารางใหม่ล้วนๆ ไม่ ALTER ตารางเดิม
+    และไม่ใช้กลไกหมดอายุ/expires_at อีกต่อไป ต่างจากเวอร์ชันก่อนหน้า) ไม่ลบแถวจริง (original_bytes/label_map
+    ยังอยู่ครบ แค่ไม่ถูกนับว่า active อีกต่อไปใน list_active_editable_documents_by_chat เท่านั้น — ไฟล์ที่ปิด
+    แล้วยังดาวน์โหลดได้ปกติจนกว่าจะหมดอายุจริง เพราะ get_editable_document()/download ไม่เช็คตารางนี้เลย)
+    คืน False ถ้าไม่พบไฟล์นี้หรือไม่ใช่เจ้าของ เรียกซ้ำกับไฟล์ที่ปิดไปแล้วได้ปลอดภัย (idempotent)"""
     with SessionLocal() as session:
         row = session.get(EditableDocument, document_id)
         if row is None or row.user_id != user_id:
             return False
-        row.expires_at = datetime.datetime.utcnow() - datetime.timedelta(seconds=1)
-        session.commit()
+        if session.get(ClosedChatDocument, document_id) is None:
+            session.add(ClosedChatDocument(document_id=document_id, closed_at=datetime.datetime.utcnow()))
+            session.commit()
         return True
 
 
-def log_document_edit(document_id: int, label: str, old_value, new_value) -> None:
-    """บันทึกการแก้ 1 ครั้งลงประวัติ — เรียกจาก _match_and_apply_excel_edit() (main.py) ทุกครั้งที่แก้สำเร็จ"""
+def log_document_edit(document_id: int, label: str, old_value, new_value, was_formula: bool = False) -> None:
+    """บันทึกการแก้ 1 ครั้งลงประวัติ — เรียกจาก _match_and_apply_excel_edit() (main.py) ทุกครั้งที่แก้สำเร็จ
+    was_formula=True ถ้าเซลล์นี้ในไฟล์ต้นฉบับ (original_bytes) เดิมเป็นสูตรคำนวณ — เก็บแยกในตารางเสริม
+    DocumentEditFormulaFlag แทนการ ALTER document_edit_log (ดู docstring ของตารางนั้น)"""
     with SessionLocal() as session:
         row = DocumentEditLog(document_id=document_id, label=label, old_value=old_value, new_value=new_value)
         session.add(row)
+        session.flush()  # ต้อง flush ก่อนอ่าน row.id (autoincrement กำหนดค่าตอน flush ไม่ใช่ตอน add)
+        if was_formula:
+            session.add(DocumentEditFormulaFlag(edit_log_id=row.id))
         session.commit()
 
 
 def get_recent_document_edits(document_id: int, limit: int = 5) -> list[dict]:
-    """คืนประวัติการแก้ล่าสุด limit รายการ (ใหม่สุดก่อน) ของไฟล์นี้ — ใช้ใน build_chat_state() (main.py)"""
+    """คืนประวัติการแก้ล่าสุด limit รายการ (ใหม่สุดก่อน) ของไฟล์นี้ — ใช้ใน build_chat_state() (main.py)
+    แต่ละรายการมี was_formula ด้วย (True ถ้าตอนแก้ครั้งนั้นเซลล์เดิมเป็นสูตรคำนวณ — ดู DocumentEditFormulaFlag)"""
     with SessionLocal() as session:
         rows = (
             session.query(DocumentEditLog)
@@ -1316,10 +1357,36 @@ def get_recent_document_edits(document_id: int, limit: int = 5) -> list[dict]:
             .limit(limit)
             .all()
         )
+        if not rows:
+            return []
+        row_ids = [r.id for r in rows]
+        formula_ids = {
+            f.edit_log_id
+            for f in session.query(DocumentEditFormulaFlag)
+            .filter(DocumentEditFormulaFlag.edit_log_id.in_(row_ids))
+            .all()
+        }
         return [
-            {"label": r.label, "old_value": r.old_value, "new_value": r.new_value, "created_at": r.created_at}
+            {
+                "label": r.label,
+                "old_value": r.old_value,
+                "new_value": r.new_value,
+                "created_at": r.created_at,
+                "was_formula": r.id in formula_ids,
+            }
             for r in rows
         ]
+
+
+def get_document_edit_count(document_id: int) -> int:
+    """นับจำนวนการแก้ทั้งหมด (ไม่จำกัดแค่ limit ของ get_recent_document_edits) ของไฟล์นี้ — ใช้ตัดสินใจว่า
+    ปุ่ม 'ย้อนการแก้' ควรกดได้ไหม (edit_count ใน build_chat_state()/API state ของ main.py)"""
+    with SessionLocal() as session:
+        return (
+            session.query(DocumentEditLog)
+            .filter(DocumentEditLog.document_id == document_id)
+            .count()
+        )
 
 
 def pop_last_document_edit(document_id: int) -> Optional[dict]:

@@ -100,6 +100,7 @@ from db import (
     close_editable_document,
     log_document_edit,
     get_recent_document_edits,
+    get_document_edit_count,
     pop_last_document_edit,
 )
 
@@ -1436,8 +1437,15 @@ def build_chat_state(chat_id: int, user_id: int) -> dict:
             "document_no": library_match["document_no"] if library_match else None,
             "has_macros": _is_macro_workbook(doc["original_bytes"]),
             "is_focused": doc["id"] == focus_id,
+            "download_url": f"/api/excel-editor/{doc['id']}/download",
+            "edit_count": get_document_edit_count(doc["id"]),
             "recent_edits": [
-                {"label": e["label"], "old_value": e["old_value"], "new_value": e["new_value"]}
+                {
+                    "label": e["label"],
+                    "old_value": e["old_value"],
+                    "new_value": e["new_value"],
+                    "was_formula": e.get("was_formula", False),
+                }
                 for e in edits
             ],
         })
@@ -1473,7 +1481,8 @@ def _format_chat_state_text(state: dict) -> str:
             parts.append("กำลังโฟกัสอยู่")
         lines.append("- " + " · ".join(parts))
         for edit in doc.get("recent_edits") or []:
-            lines.append(f"    - แก้ '{edit['label']}' จาก '{edit['old_value']}' เป็น '{edit['new_value']}'")
+            formula_note = " (เดิมเป็นสูตรคำนวณ กลายเป็นค่าคงที่แล้ว)" if edit.get("was_formula") else ""
+            lines.append(f"    - แก้ '{edit['label']}' จาก '{edit['old_value']}' เป็น '{edit['new_value']}'{formula_note}")
 
     pending_listing = state.get("pending_listing")
     if pending_listing:
@@ -1606,6 +1615,30 @@ def _is_undo_command(query: str) -> bool:
     ช่องว่างหัวท้าย) ใช้ดักก่อนเรียก _classify_excel_editor_intent (LLM) ใน ask_question() — คำสั่งชัดเจนแบบนี้
     ไม่ต้องเสีย API call ไปตีความ และกันความเสี่ยงที่ LLM จะตีความผิดเป็นคำสั่งแก้ค่าแทน"""
     return query.strip().lower() in _UNDO_COMMAND_TEXTS
+
+
+_CLOSE_COMMAND_PREFIXES_ATTACHED_OK = ("ปิดไฟล์",)  # ชื่อไฟล์ต่อท้ายได้เลยไม่ต้องมีช่องว่าง เช่น "ปิดไฟล์ป่าไม้เขียว"
+_CLOSE_COMMAND_PREFIXES_SPACE_REQUIRED = ("ปิด",)   # เสี่ยงชนกับคำอื่น ("ปิดท้าย"/"ปิดบัง") ต้องมีช่องว่างคั่น
+                                                     # หรือไม่มีอะไรต่อท้ายเลย ถึงจะถือว่าเป็นคำสั่งปิดไฟล์จริง
+
+
+def _parse_close_command(query: str) -> Optional[str]:
+    """เช็คว่าข้อความนี้ขึ้นต้นด้วยคำสั่งปิดไฟล์ตรงๆ ไหม ("ปิดไฟล์" หรือ "ปิด") คืนส่วนที่เหลือหลังคำนำหน้า
+    (ชื่อไฟล์/ส่วนของชื่อไฟล์ที่ผู้ใช้ระบุมา อาจเป็นสตริงว่างถ้าไม่ได้ระบุ) หรือ None ถ้าไม่ใช่คำสั่งปิดไฟล์
+    "ปิดไฟล์" ตามด้วยชื่อไฟล์ติดกันไม่มีช่องว่างได้เลย (คำว่า "ไฟล์" ทำหน้าที่เป็นตัวแบ่งที่ชัดเจนอยู่แล้ว เช่น
+    "ปิดไฟล์ป่าไม้เขียว") แต่ "ปิด" เฉยๆ ต้องตามด้วยช่องว่างก่อนชื่อไฟล์ หรือไม่มีอะไรต่อท้ายเลย เพราะภาษาไทย
+    ไม่มีช่องว่างระหว่างคำบังคับ ถ้าไม่เช็คจุดนี้จะชนกับคำอื่นที่ขึ้นต้นด้วย "ปิด" เหมือนกันแต่ไม่ใช่คำสั่งปิดไฟล์
+    (เช่น "ปิดท้ายด้วยสรุป" ต้องไม่ถูกตีความเป็นคำสั่งปิดไฟล์)"""
+    stripped = query.strip()
+    for prefix in _CLOSE_COMMAND_PREFIXES_ATTACHED_OK:
+        if stripped.startswith(prefix):
+            return stripped[len(prefix):].strip()
+    for prefix in _CLOSE_COMMAND_PREFIXES_SPACE_REQUIRED:
+        if stripped == prefix:
+            return ""
+        if stripped.startswith(prefix + " "):
+            return stripped[len(prefix):].strip()
+    return None
 
 
 def _calculate_progressive_tax(amount: float, brackets: list) -> dict:
@@ -2684,6 +2717,45 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
+        # คำสั่งปิดไฟล์ตรงๆ ("ปิดไฟล์"/"ปิด" + ชื่อไฟล์ ดู _parse_close_command) ดักก่อนเรียก LLM ใดๆ เสมอ
+        # เหมือนคำสั่งย้อนการแก้ด้านบน — ไม่ระบุชื่อไฟล์ -> ใช้ไฟล์ที่โฟกัส หรือไฟล์เดียวที่เปิดอยู่ถ้ามีแค่ไฟล์เดียว
+        # ระบุชื่อมา -> จับคู่ด้วยโค้ด (match_documents_by_name) กำกวม/ไม่เจอ -> ถามกลับพร้อมรายชื่อไฟล์
+        close_remainder = None if not active_docs else _parse_close_command(query)
+        if close_remainder is not None:
+            no_name_given = not close_remainder
+            if close_remainder:
+                close_matches = match_documents_by_name(close_remainder, active_docs)
+            else:
+                focus_doc = get_chat_document_focus(chat_id, user_id)
+                close_matches = [focus_doc] if focus_doc else (list(active_docs) if len(active_docs) == 1 else [])
+
+            if len(close_matches) == 1:
+                target_doc = close_matches[0]
+                result = close_chat_document(target_doc["id"], user_id, chat_id)
+                if result.get("closed"):
+                    answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
+                    if get_document_edit_count(target_doc["id"]) > 0:
+                        download_url = f"/api/excel-editor/{target_doc['id']}/download"
+                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                else:
+                    answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
+            elif no_name_given:
+                # ไม่ได้ระบุชื่อไฟล์ + ไม่มีโฟกัส + มีมากกว่า 1 ไฟล์เปิดอยู่ -> กำกวมว่าจะปิดไฟล์ไหน (ไม่ใช่ "หาไม่เจอ"
+                # เพราะไม่ได้มีการค้นหาชื่อเลย) ถามกลับพร้อมรายชื่อไฟล์ทั้งหมดที่เปิดอยู่
+                names = ", ".join(f"'{d['filename']}'" for d in active_docs)
+                answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุชื่อไฟล์ที่ต้องการปิดครับ"
+            elif len(close_matches) > 1:
+                names = ", ".join(f"'{d['filename']}'" for d in close_matches)
+                answer = f"พบไฟล์ที่ตรงกับคำสั่งนี้หลายไฟล์ ({names}) กรุณาระบุชื่อไฟล์ให้ชัดเจนขึ้นครับ"
+            else:
+                names = ", ".join(f"'{d['filename']}'" for d in active_docs)
+                answer = f"ไม่พบไฟล์ที่ตรงกับคำสั่งนี้ในแชทนี้ (ไฟล์ที่เปิดอยู่: {names}) กรุณาระบุชื่อไฟล์ให้ชัดเจนขึ้นครับ"
+
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         if len(active_docs) == 1:
             editable_doc = active_docs[0]
             intent = _classify_excel_editor_intent(editable_doc["label_map"], query)
@@ -2709,6 +2781,22 @@ async def ask_question(
                     f"ตอนนี้มีแค่ไฟล์เดียวในแชทนี้ (ชื่อ {editable_doc['filename']}) "
                     "กรุณาแนบอีกไฟล์ หรือเปิดอีกไฟล์จากคลังเอกสาร เพื่อเปรียบเทียบด้วยครับ"
                 )
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if intent == "close":
+                # ไม่ขึ้นต้นด้วยคำสั่งปิดไฟล์ตรงๆ (ดักไปแล้วด้านบนผ่าน _parse_close_command) แต่ความหมายคือ
+                # ขอปิดไฟล์นี้เหมือนกัน เช่น "เลิกใช้ไฟล์นี้" — มีไฟล์เดียวในแชทนี้พอดี ไม่ต้องถามกลับว่าไฟล์ไหน
+                result = close_chat_document(editable_doc["id"], user_id, chat_id)
+                if result.get("closed"):
+                    answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
+                    if get_document_edit_count(editable_doc["id"]) > 0:
+                        download_url = f"/api/excel-editor/{editable_doc['id']}/download"
+                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                else:
+                    answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -2763,6 +2851,25 @@ async def ask_question(
                 else:
                     names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
                     answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการดาวน์โหลดไฟล์ไหนครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if action == "close":
+                target_id = code_matched_document_id or route.get("document_id")
+                if target_id in valid_ids:
+                    result = close_chat_document(target_id, user_id, chat_id)
+                    if result.get("closed"):
+                        answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
+                        if get_document_edit_count(target_id) > 0:
+                            download_url = f"/api/excel-editor/{target_id}/download"
+                            answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                    else:
+                        answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
+                else:
+                    names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
+                    answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการปิดไฟล์ไหนครับ"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -4380,10 +4487,13 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในบทสนทนานี้เกี่ยวข้องกับการแก้ไฟล์ Excel ที่กำลังทำอยู่หรือไม่ "
     "ผู้ใช้กำลังแก้ไฟล์ excel อยู่ โดยมี label ที่แก้ได้ในไฟล์นี้ (JSON) ให้ดูประกอบการตัดสินใจ\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
-    '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "unrelated"}\n\n'
+    '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "unrelated"}\n\n'
     "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
-    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด\n"
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้)\n"
     "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่นที่ 'แนบเข้ามาในแชทแล้ว' เท่านั้น (ไม่ใช่ไฟล์จากคลังเอกสารที่ยังไม่ได้เปิด)\n"
+    "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์นี้ไปเลย ไม่เอาไฟล์นี้ในแชทอีกต่อไป (เช่น \"เลิกใช้ไฟล์นี้\", "
+    "\"ไม่เอาไฟล์นี้แล้ว\") ต่างจาก finalize ตรงที่ finalize คือ 'ขอไฟล์ไปใช้แต่ยังเปิดต่อได้' ส่วน close คือ "
+    "'จบการทำงานกับไฟล์นี้ไปเลย' ถ้าข้อความพูดถึงแค่ขอดาวน์โหลด/เสร็จแล้ว ไม่ได้บอกว่าจะเลิกใช้ไฟล์ ให้ตอบ finalize ไม่ใช่ close\n"
     "- unrelated: ข้อความนี้เป็นคำถามหรือเรื่องอื่นที่ไม่เกี่ยวกับการแก้ไฟล์นี้เลย รวมถึงกรณีที่ผู้ใช้ขอเปิด/อ่าน/"
     "เปรียบเทียบ/ค้นหาไฟล์อื่นที่ไม่ใช่ไฟล์นี้ (เช่น ไฟล์จากคลังเอกสารของระบบ) ให้ถือว่า unrelated เสมอ ไม่ใช่ compare"
 )
@@ -4405,7 +4515,7 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     intent = (parsed or {}).get("intent")
-    return intent if intent in ("edit", "finalize", "compare", "unrelated") else "unrelated"
+    return intent if intent in ("edit", "finalize", "compare", "close", "unrelated") else "unrelated"
 
 
 EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
@@ -4413,8 +4523,8 @@ EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON) "
     "ไฟล์ที่กำลังโฟกัสอยู่ล่าสุด (ถ้ามี) และข้อความ 4 เทิร์นล่าสุดในบทสนทนานี้ (ถ้ามี)\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
-    '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "clarify" หรือ "unrelated", '
-    '"document_id": <เลข document_id ถ้า action เป็น edit หรือ finalize ไม่งั้นใส่ null>, '
+    '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "clarify" หรือ "unrelated", '
+    '"document_id": <เลข document_id ถ้า action เป็น edit, finalize หรือ close ไม่งั้นใส่ null>, '
     '"document_id_a": <เลข document_id ไฟล์แรกถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"document_id_b": <เลข document_id ไฟล์ที่สองถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
@@ -4423,8 +4533,12 @@ EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     "2) ถ้าไม่ได้ระบุไฟล์เลยแต่มีไฟล์ที่กำลังโฟกัสอยู่ ให้ใช้ไฟล์ที่โฟกัส 3) ถ้าคำสั่งอ้างอิงบทสนทนาก่อนหน้า "
     "(เช่น 'ไฟล์ที่แก้ไปเมื่อกี้') ให้ดูจากข้อความล่าสุดหรือไฟล์โฟกัสประกอบกัน ถ้ายังกำกวมจริงๆ (ไม่มีโฟกัสและ "
     "ตัดสินไม่ได้จากขั้นตอนข้างต้นเลย) ให้ตอบ clarify แทน ห้ามเดา\n"
-    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (เฉพาะไฟล์ในรายการนี้) ตัดสินใจว่าเป็นไฟล์ไหน "
-    "ด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ\n"
+    "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้ "
+    "เฉพาะไฟล์ในรายการนี้) ตัดสินใจว่าเป็นไฟล์ไหนด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ\n"
+    "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์ใดไฟล์หนึ่งในรายการนี้ไปเลย ไม่เอาไฟล์นั้นในแชทอีกต่อไป "
+    "(เช่น \"เลิกใช้ไฟล์ A\", \"ไม่เอาไฟล์นี้แล้ว\") ต่างจาก finalize ตรงที่ finalize คือ 'ขอไฟล์ไปใช้แต่ยังเปิดต่อได้' "
+    "ส่วน close คือ 'จบการทำงานกับไฟล์นั้นไปเลย' ตัดสินใจว่าเป็นไฟล์ไหนด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ "
+    "ถ้าข้อความพูดถึงแค่ขอดาวน์โหลด/เสร็จแล้ว ไม่ได้บอกว่าจะเลิกใช้ไฟล์ ให้ตอบ finalize ไม่ใช่ close\n"
     "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์ที่อยู่ใน 'รายการด้านบน' กันเอง ต้องระบุ document_id_a และ "
     "document_id_b เสมอ ถ้าผู้ใช้เอ่ยชื่อไฟล์มาแค่ไฟล์เดียวที่จะเปรียบเทียบ ให้ใช้ไฟล์ที่กำลังโฟกัส (ถ้ามี) "
     "เป็นอีกไฟล์หนึ่งโดยอัตโนมัติ ถ้าไม่มีไฟล์โฟกัสและระบุมาแค่ไฟล์เดียว ให้ตอบ clarify แทน\n"
@@ -4485,7 +4599,7 @@ def _route_multi_file_instruction(
         messages=[{"role": "user", "content": prompt}],
     )
     parsed = _parse_json_response(response.content[0].text, dict)
-    if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "clarify", "unrelated"):
+    if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "close", "clarify", "unrelated"):
         return {"action": "clarify", "document_id": None, "document_id_a": None, "document_id_b": None, "message": None}
     return {
         "action": parsed.get("action"),
@@ -4551,6 +4665,16 @@ def _format_display_value(value, number_format: Optional[str]):
     return value
 
 
+def _cell_values_equal(value_a, value_b) -> bool:
+    """เทียบค่าสองค่าว่า 'เหมือนกัน' ไหม: strip สตริงก่อนเทียบ (กันช่องว่างหัวท้ายที่ไม่มีความหมาย) ส่วน int
+    กับ float ที่ค่าเท่ากัน (เช่น 5 กับ 5.0) ถือว่าเป็นค่าเดียวกันอยู่แล้วโดยธรรมชาติของ Python (5 == 5.0 -> True)
+    ไม่ต้องแปลงเพิ่ม ใช้ร่วมกันทั้ง _build_comparison_table (ตารางเปรียบเทียบไฟล์) และ
+    _filter_labels_actually_edited (ตัดสินใจว่า label ไหน "ถูกแก้จริง" ต้องเขียนทับเซลล์ต้นฉบับตอนสร้างไฟล์)"""
+    compare_a = value_a.strip() if isinstance(value_a, str) else value_a
+    compare_b = value_b.strip() if isinstance(value_b, str) else value_b
+    return compare_a == compare_b
+
+
 def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: str, filename_b: str) -> str:
     """สร้างตาราง markdown เปรียบเทียบด้วยโค้ด Python ล้วนๆ (deterministic ไม่ใช้ AI เลย) ครบทุก label
     ของทั้งสองไฟล์ — เรียงตามลำดับใน label_map_a ก่อน แล้วตามด้วย label ที่มีเฉพาะใน label_map_b
@@ -4577,9 +4701,7 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
             value_b = info_b["current_value"]
             format_a = info_a.get("number_format")
             format_b = info_b.get("number_format")
-            compare_a = value_a.strip() if isinstance(value_a, str) else value_a
-            compare_b = value_b.strip() if isinstance(value_b, str) else value_b
-            if compare_a == compare_b:
+            if _cell_values_equal(value_a, value_b):
                 result_text = "เหมือนกัน"
             else:
                 result_text = "ต่างกัน" + _format_number_diff(value_a, value_b)
@@ -4719,6 +4841,26 @@ def match_documents_by_name(instruction: str, documents: list[dict]) -> list[dic
     return matched
 
 
+def _is_label_cell_formula(original_bytes: bytes, label_info: dict) -> bool:
+    """เช็คว่าเซลล์ของ label นี้ในไฟล์ต้นฉบับ (original_bytes — ไม่แตะค่าที่แก้ระหว่างคุยเลย) เดิมเป็นสูตร
+    คำนวณ (ขึ้นต้นด้วย "=") หรือไม่ เปิดด้วย data_only=False (อ่านสูตรดิบ ไม่ใช่ค่าที่คำนวณแล้ว) อ่านอย่างเดียว
+    ไม่เคย save จึงไม่ต้องผ่าน _load_workbook_preserving_macros คืน False เสมอถ้าอ่านไม่ได้ (fail-safe —
+    ไม่บล็อกการแก้ไฟล์ปกติแค่เพราะเช็คเพิ่มเติมนี้พลาด)"""
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(original_bytes), data_only=False)
+        ws = wb[label_info["sheet"]]
+        cell_value = ws.cell(row=label_info["row"], column=label_info["col"]).value
+        return isinstance(cell_value, str) and cell_value.startswith("=")
+    except Exception:
+        return False
+
+
+FORMULA_EDIT_WARNING_NOTICE = (
+    "\n\n(หมายเหตุ: ช่องนี้เดิมเป็นสูตรคำนวณอัตโนมัติ ตอนนี้กลายเป็นค่าคงที่ "
+    'ถ้าต้องการให้คำนวณอัตโนมัติเหมือนเดิม พิมพ์ "ย้อนการแก้")'
+)
+
+
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
     """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
     คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
@@ -4779,23 +4921,32 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
             "message": f"คำสั่งนี้ไม่ได้ระบุค่าใหม่ที่ชัดเจนสำหรับ '{label}' ในไฟล์ '{doc['filename']}' กรุณาระบุค่าที่ต้องการแก้ครับ",
         }
 
+    # เช็คว่าเซลล์เดิม (ในไฟล์ต้นฉบับ) เป็นสูตรคำนวณไหม "ก่อน" เขียนทับ — ยังแก้ได้ตามปกติเสมอ แค่เตือนต่อท้าย
+    # ข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรหลังแก้ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะย้อนการแก้)
+    was_formula = _is_label_cell_formula(doc["original_bytes"], label_map[label])
+
     old_value = label_map[label]["current_value"]
     label_map[label]["current_value"] = new_value
     update_editable_document_label_map(document_id, label_map)
-    log_document_edit(document_id, label, old_value, new_value)
+    log_document_edit(document_id, label, old_value, new_value, was_formula=was_formula)
 
     # แก้สำเร็จ = ไฟล์นี้กลายเป็นไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (ถ้ามี chat_id ผูกอยู่จริง — อัปโหลดบางเส้นทาง
     # อาจยังไม่มี chat_id ตอนเรียกครั้งแรกสุด แต่ไม่เคยเกิดในทางปฏิบัติเพราะ _resolve_chat_id เรียกมาก่อนเสมอ)
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
+    # สร้างข้อความยืนยันเองด้วยโค้ดเสมอ ห้ามใช้ parsed["reason"] (ข้อความภายในของตัวจับคู่)
+    message = f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value}' แล้ว"
+    if was_formula:
+        message += FORMULA_EDIT_WARNING_NOTICE
+
     return {
         "matched": True,
         "label": label,
         "old_value": old_value,
         "new_value": new_value,
-        # สร้างข้อความยืนยันเองด้วยโค้ดเสมอ ห้ามใช้ parsed["reason"] (ข้อความภายในของตัวจับคู่)
-        "message": f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value}' แล้ว",
+        "was_formula": was_formula,
+        "message": message,
     }
 
 
@@ -4877,11 +5028,36 @@ async def upload_excel_editor_document(
     return {"summary_text": response_text, "chat_id": final_chat_id}
 
 
+def _filter_labels_actually_edited(original_bytes: bytes, label_map: dict) -> dict:
+    """คืน label_map เฉพาะ label ที่ current_value 'ต่างจริง' จากค่าต้นฉบับ (สกัดสดจาก original_bytes ด้วย
+    _extract_excel_labels ทุกครั้ง — ไม่แคชไว้ เพราะ original_bytes ไม่เคยเปลี่ยนอยู่แล้ว) เทียบด้วย
+    _cell_values_equal เดียวกับตารางเปรียบเทียบไฟล์ — ใช้ก่อนเขียนไฟล์ทุกจุดที่สร้างไฟล์จริงจาก label_map
+    (ตอนนี้มีจุดเดียวคือ download_excel_editor_document ด้านล่าง)
+
+    ป้องกันบั๊กที่เคยเกิดจริง: เดิมเขียนทับทุกเซลล์ของทุก label เสมอไม่ว่าจะถูกแก้หรือไม่ ทำให้เซลล์ที่เดิมเป็น
+    สูตร (เช่น 'รวมเงิน'/'ภาษีมูลค่าเพิ่ม 7%' ในไฟล์ใบเสนอราคาจริง) กลายเป็นค่าคงที่ถาวรทุกครั้งที่ดาวน์โหลด
+    ทั้งที่ไม่เคยถูกแก้เลย และทำให้ undo คืนสูตรกลับไม่ได้ (ดาวน์โหลดรอบถัดไปเขียนค่าคงที่ทับสูตรซ้ำอีก)
+
+    label ที่หาไม่เจอในค่าต้นฉบับ (ไม่ควรเกิดในทางปฏิบัติ — label_map มาจาก _extract_excel_labels ของไฟล์
+    เดียวกันนี้ตั้งแต่ตอนอัปโหลด) ถือว่า "ต่าง" เสมอ (fail-safe เขียนไปก่อน ดีกว่าข้ามแล้วข้อมูลหาย)"""
+    original_label_map = _extract_excel_labels(original_bytes)
+    changed = {}
+    for label, info in label_map.items():
+        original_info = original_label_map.get(label)
+        if original_info is None or not _cell_values_equal(info["current_value"], original_info["current_value"]):
+            changed[label] = info
+    return changed
+
+
 @app.get("/api/excel-editor/{document_id}/download")
 def download_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
     """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้) ไม่แก้ไฟล์/
     label_map เลย จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ (side effect เดียว
-    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)"""
+    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)
+
+    เขียนทับเซลล์เฉพาะ label ที่ถูกแก้จริง (ดู _filter_labels_actually_edited) — label ที่ไม่ถูกแก้เลย
+    (รวมถึง label ที่เซลล์เดิมเป็นสูตรคำนวณ) ไม่ถูกแตะเลย ไฟล์ผลลัพธ์จึงยังมีสูตรเดิมอยู่ครบสำหรับ label
+    ที่ไม่เคยแก้ ไม่ว่าจะดาวน์โหลดซ้ำกี่ครั้งก็ตาม"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
@@ -4889,9 +5065,11 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
-    # ตรวจสอบให้ผ่านทุก label ก่อน ค่อยเริ่มเขียนไฟล์จริง — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
+    labels_to_write = _filter_labels_actually_edited(doc["original_bytes"], doc["label_map"])
+
+    # ตรวจสอบให้ผ่านทุก label ที่ "จะเขียนจริง" ก่อน ค่อยเริ่มเขียนไฟล์ — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
     resolved = {}
-    for label, info in doc["label_map"].items():
+    for label, info in labels_to_write.items():
         ok, value, error = _coerce_value_for_cell(info["current_value"], info.get("number_format"))
         if not ok:
             raise HTTPException(
@@ -4903,7 +5081,7 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว — ผ่าน helper นี้แทน load_workbook ตรงๆ
     # เพื่อส่ง keep_vba=True อัตโนมัติถ้าไฟล์มีมาโคร กันมาโครหายตอน wb.save() ด้านล่าง
     wb = _load_workbook_preserving_macros(doc["original_bytes"])
-    for label, info in doc["label_map"].items():
+    for label, info in labels_to_write.items():
         ws = wb[info["sheet"]]
         ws.cell(row=info["row"], column=info["col"], value=resolved[label])
 
