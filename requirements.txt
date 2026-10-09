@@ -16,3 +16,4 @@ pandas
 openpyxl
 xlrd
 boto3
+pycel

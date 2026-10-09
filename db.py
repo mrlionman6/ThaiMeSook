@@ -223,6 +223,40 @@ class DocumentEditFormulaFlag(Base):
     edit_log_id = Column(Integer, ForeignKey("document_edit_log.id", ondelete="CASCADE"), primary_key=True)
 
 
+class DocumentVersion(Base):
+    """สำเนาทำงาน (working copy) แบบมีเวอร์ชันของ EditableDocument — แทนที่การเก็บแค่ "ต้นฉบับ + label_map
+    ที่แก้ไปเรื่อยๆ" เดิม ทุกการแก้สำเร็จสร้างแถวใหม่ในตารางนี้แทนการแก้ EditableDocument.label_map ตรงๆ
+    (original_bytes ของ EditableDocument ไม่เคยถูกแตะอีกเลยตั้งแต่ PR นี้) version_no เรียงจาก 1 ขึ้นไปต่อไฟล์
+    ไม่มีแถวเลย = ยังไม่เคยแก้ (ใช้ EditableDocument.original_bytes/label_map ตรงๆ — ดู get_working_copy()
+    ใน main.py) เก็บสูงสุด DOCUMENT_VERSION_LIMIT เวอร์ชันล่าสุดต่อไฟล์ (ตัดทิ้งอัตโนมัติใน
+    create_document_version() — ต้นฉบับใน EditableDocument ไม่นับรวมในลิมิตนี้) change_summary เป็นข้อความ
+    สั้นๆ อธิบายว่าเวอร์ชันนี้เปลี่ยนอะไร (nullable — เฟส 1 นี้ยังไม่ได้ใช้งานจริง เตรียมไว้ให้เฟส 2 ที่การแก้
+    อาจไม่ใช่แค่ "label เดียวจาก A เป็น B" อีกต่อไป เช่น เพิ่ม/ลบแถวตาราง) ลบไฟล์ (EditableDocument) -> ทุก
+    เวอร์ชันหายไปด้วยอัตโนมัติ (ON DELETE CASCADE)"""
+    __tablename__ = "document_versions"
+
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("editable_documents.id", ondelete="CASCADE"), nullable=False, index=True)
+    version_no = Column(Integer, nullable=False)
+    file_bytes = Column(LargeBinary, nullable=False)
+    label_map = Column(JSON, nullable=False)
+    change_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
+class DocumentEditLogVersion(Base):
+    """เชื่อม DocumentEditLog แต่ละแถวกับ DocumentVersion ที่การแก้นั้นสร้างขึ้น — ตารางเสริม ไม่ ALTER
+    document_edit_log เดิม ใช้ตอนย้อนการแก้ (delete_latest_document_version ใน db.py) เพื่อรู้ว่าต้องลบ
+    ประวัติแถวไหนไปด้วยพร้อมกับเวอร์ชันที่ลบ 1 แถวของ DocumentEditLog ผูกกับได้แค่ 1 เวอร์ชัน (edit_log_id
+    เป็น primary key ตรงๆ) แต่ 1 เวอร์ชันผูกกับ DocumentEditLog ได้หลายแถว (เช่น แก้ label หลักแล้ว label
+    สูตรอื่นเปลี่ยนค่าตามไปด้วย — ดู _match_and_apply_excel_edit) ลบ DocumentEditLog หรือ DocumentVersion
+    ฝั่งใดฝั่งหนึ่ง -> แถวนี้หายไปด้วยอัตโนมัติ (ON DELETE CASCADE ทั้งคู่)"""
+    __tablename__ = "document_edit_log_versions"
+
+    edit_log_id = Column(Integer, ForeignKey("document_edit_log.id", ondelete="CASCADE"), primary_key=True)
+    version_id = Column(Integer, ForeignKey("document_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+
+
 class ClosedChatDocument(Base):
     """ไฟล์ (EditableDocument) ที่ถูก 'ปิด' ในแชทแล้ว ไม่นับเป็น active อีกต่อไป — แยกกลไกนี้ออกจากการหมดอายุ
     (expires_at) เดิมโดยสิ้นเชิง (เดิมใช้ expires_at ปิดไฟล์ แต่ทำให้ดาวน์โหลดไฟล์ที่ปิดแล้วไม่ได้ด้วย ทั้งที่
@@ -1269,18 +1303,6 @@ def list_active_editable_documents_by_chat(chat_id: int, user_id: int) -> list[d
         ]
 
 
-def update_editable_document_label_map(document_id: int, label_map: dict) -> bool:
-    """อัปเดตแค่ label_map (current_value ที่แก้ระหว่างคุย) — ไม่แตะ original_bytes เลย
-    caller ต้องเช็ค ownership ผ่าน get_editable_document() มาก่อนแล้วเสมอ"""
-    with SessionLocal() as session:
-        row = session.get(EditableDocument, document_id)
-        if row is None:
-            return False
-        row.label_map = label_map
-        session.commit()
-        return True
-
-
 def set_chat_document_focus(chat_id: int, document_id: int) -> None:
     """ตั้ง/อัปเดตไฟล์ที่กำลังโฟกัสของแชทนี้ (upsert — 1 แชทมีโฟกัสได้แค่ไฟล์เดียว แทนที่แถวเดิมเสมอ)"""
     now = datetime.datetime.utcnow()
@@ -1333,10 +1355,11 @@ def close_editable_document(document_id: int, user_id: int) -> bool:
         return True
 
 
-def log_document_edit(document_id: int, label: str, old_value, new_value, was_formula: bool = False) -> None:
+def log_document_edit(document_id: int, label: str, old_value, new_value, was_formula: bool = False) -> int:
     """บันทึกการแก้ 1 ครั้งลงประวัติ — เรียกจาก _match_and_apply_excel_edit() (main.py) ทุกครั้งที่แก้สำเร็จ
-    was_formula=True ถ้าเซลล์นี้ในไฟล์ต้นฉบับ (original_bytes) เดิมเป็นสูตรคำนวณ — เก็บแยกในตารางเสริม
-    DocumentEditFormulaFlag แทนการ ALTER document_edit_log (ดู docstring ของตารางนั้น)"""
+    was_formula=True ถ้าเซลล์นี้ในสำเนาทำงานก่อนแก้เดิมเป็นสูตรคำนวณ — เก็บแยกในตารางเสริม
+    DocumentEditFormulaFlag แทนการ ALTER document_edit_log (ดู docstring ของตารางนั้น) คืน id ของแถวที่สร้าง
+    ใหม่ (ใช้ผูกกับเวอร์ชันที่การแก้นี้สร้างขึ้นผ่าน link_edit_log_to_version())"""
     with SessionLocal() as session:
         row = DocumentEditLog(document_id=document_id, label=label, old_value=old_value, new_value=new_value)
         session.add(row)
@@ -1344,6 +1367,7 @@ def log_document_edit(document_id: int, label: str, old_value, new_value, was_fo
         if was_formula:
             session.add(DocumentEditFormulaFlag(edit_log_id=row.id))
         session.commit()
+        return row.id
 
 
 def get_recent_document_edits(document_id: int, limit: int = 5) -> list[dict]:
@@ -1389,24 +1413,129 @@ def get_document_edit_count(document_id: int) -> int:
         )
 
 
-def pop_last_document_edit(document_id: int) -> Optional[dict]:
-    """ดึงประวัติการแก้ล่าสุดของไฟล์นี้แล้วลบแถวนั้นทิ้งทันที (atomic ในทรานแซกชันเดียว) คืน {"label":,
-    "old_value":, "new_value":} หรือ None ถ้าไม่มีประวัติเลย ใช้โดย undo_last_edit() (main.py) ซึ่งเป็นคนเอา
-    old_value ไปเขียนกลับ label_map เอง (ผ่าน get_editable_document/update_editable_document_label_map
-    เส้นทางเดียวกับการแก้ปกติทุกประการ)"""
+DOCUMENT_VERSION_LIMIT = 20  # เก็บสูงสุดเท่านี้เวอร์ชันล่าสุดต่อไฟล์ (ไม่นับต้นฉบับใน EditableDocument.original_bytes)
+
+
+def get_editable_document_raw(document_id: int) -> Optional[dict]:
+    """คืน EditableDocument แบบไม่เช็ค ownership/expiry เลย (ต่างจาก get_editable_document()) ใช้เฉพาะภายใน
+    ฟังก์ชันระบบที่ caller เช็ค ownership มาแล้วแน่นอนก่อนหน้านี้ (get_working_copy()/create_new_version()
+    ใน main.py ที่รับ document_id มาจากจุดที่เรียก get_editable_document() เช็ค ownership ไปแล้วชั้นนอกสุดเสมอ)"""
+    with SessionLocal() as session:
+        row = session.get(EditableDocument, document_id)
+        if row is None:
+            return None
+        return _editable_document_to_dict(row)
+
+
+def get_latest_document_version(document_id: int) -> Optional[dict]:
+    """คืนเวอร์ชันล่าสุด (version_no มากสุด) ของไฟล์นี้ หรือ None ถ้ายังไม่เคยมีเวอร์ชันเลย (ยังไม่เคยแก้ —
+    ใช้ต้นฉบับตรงๆ) ใช้โดย get_working_copy() (main.py)"""
     with SessionLocal() as session:
         row = (
-            session.query(DocumentEditLog)
-            .filter(DocumentEditLog.document_id == document_id)
-            .order_by(DocumentEditLog.created_at.desc())
+            session.query(DocumentVersion)
+            .filter(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.version_no.desc())
             .first()
         )
         if row is None:
             return None
-        result = {"label": row.label, "old_value": row.old_value, "new_value": row.new_value}
+        return {
+            "id": row.id, "version_no": row.version_no,
+            "file_bytes": row.file_bytes, "label_map": row.label_map,
+        }
+
+
+def create_document_version(
+    document_id: int, file_bytes: bytes, label_map: dict, change_summary: Optional[str] = None
+) -> int:
+    """สร้างเวอร์ชันใหม่ (version_no ต่อจากเวอร์ชันล่าสุด หรือ 1 ถ้ายังไม่เคยมี) แล้วตัดเวอร์ชันเก่าสุดทิ้งถ้า
+    เกิน DOCUMENT_VERSION_LIMIT รายการ (ลบ DocumentEditLogVersion ที่ผูกกับเวอร์ชันที่ถูกตัดทิ้งไปด้วย —
+    ไม่ลบ DocumentEditLog เอง ปล่อยเป็นประวัติที่ไม่ผูกกับเวอร์ชันไหนต่อไป) คืน id ของเวอร์ชันใหม่ ใช้โดย
+    create_new_version() (main.py)"""
+    with SessionLocal() as session:
+        latest_no = (
+            session.query(func.max(DocumentVersion.version_no))
+            .filter(DocumentVersion.document_id == document_id)
+            .scalar()
+        )
+        row = DocumentVersion(
+            document_id=document_id,
+            version_no=(latest_no or 0) + 1,
+            file_bytes=file_bytes,
+            label_map=label_map,
+            change_summary=change_summary,
+        )
+        session.add(row)
+        session.flush()
+        new_version_id = row.id
+
+        excess = (
+            session.query(DocumentVersion.id)
+            .filter(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.version_no.desc())
+            .offset(DOCUMENT_VERSION_LIMIT)
+            .all()
+        )
+        excess_ids = [v.id for v in excess]
+        if excess_ids:
+            session.query(DocumentEditLogVersion).filter(
+                DocumentEditLogVersion.version_id.in_(excess_ids)
+            ).delete(synchronize_session=False)
+            session.query(DocumentVersion).filter(
+                DocumentVersion.id.in_(excess_ids)
+            ).delete(synchronize_session=False)
+
+        session.commit()
+        return new_version_id
+
+
+def link_edit_log_to_version(edit_log_id: int, version_id: int) -> None:
+    """ผูกแถว document_edit_log 1 แถว เข้ากับเวอร์ชันที่การแก้นั้นสร้างขึ้น — เรียกจาก _match_and_apply_excel_edit()
+    (main.py) ทุกครั้งหลัง log_document_edit() + create_new_version() สำเร็จ ให้ delete_latest_document_version()
+    รู้ว่าต้องลบประวัติแถวไหนไปด้วยตอนย้อนการแก้"""
+    with SessionLocal() as session:
+        session.add(DocumentEditLogVersion(edit_log_id=edit_log_id, version_id=version_id))
+        session.commit()
+
+
+def delete_latest_document_version(document_id: int) -> Optional[dict]:
+    """ลบเวอร์ชันล่าสุดของไฟล์นี้ทิ้ง พร้อมประวัติการแก้ (document_edit_log) ที่ผูกกับเวอร์ชันนั้นทั้งหมด —
+    คืน {"version_no":, "label_map":} ของเวอร์ชันที่เพิ่งลบไป (label_map ใช้คำนวณว่าช่องไหนค่าเปลี่ยนกลับบ้าง
+    โดยเทียบกับ label_map ของเวอร์ชันที่เหลืออยู่ — ดู undo_last_edit() main.py ไม่ได้พึ่งประวัติ
+    document_edit_log ในการสร้างข้อความเลย เพราะช่องผลข้างเคียงจากสูตรไม่ถูกบันทึกเป็นประวัติอีกต่อไป)
+    หรือ None ถ้าไม่มีเวอร์ชันให้ลบเลย (อยู่ที่ต้นฉบับอยู่แล้ว) ใช้โดย undo_last_edit() (main.py) — หลังลบแล้ว
+    ไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้า (หรือต้นฉบับถ้าไม่มีเวอร์ชันเหลือ) โดยอัตโนมัติ เพราะ
+    get_working_copy()/get_latest_document_version() อ่านจากเวอร์ชันที่เหลืออยู่จริงเสมอ"""
+    with SessionLocal() as session:
+        row = (
+            session.query(DocumentVersion)
+            .filter(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.version_no.desc())
+            .first()
+        )
+        if row is None:
+            return None
+        version_id = row.id
+        version_no = row.version_no
+        label_map = row.label_map
+
+        linked_log_ids = [
+            v.edit_log_id
+            for v in session.query(DocumentEditLogVersion.edit_log_id)
+            .filter(DocumentEditLogVersion.version_id == version_id)
+            .all()
+        ]
+        if linked_log_ids:
+            session.query(DocumentEditLogVersion).filter(
+                DocumentEditLogVersion.version_id == version_id
+            ).delete(synchronize_session=False)
+            session.query(DocumentEditLog).filter(
+                DocumentEditLog.id.in_(linked_log_ids)
+            ).delete(synchronize_session=False)
+
         session.delete(row)
         session.commit()
-        return result
+        return {"version_no": version_no, "label_map": label_map}
 
 
 def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
