@@ -125,6 +125,7 @@ import pandas as pd
 import openpyxl
 import xlrd
 from openpyxl.styles.numbers import is_date_format
+from openpyxl.workbook.properties import CalcProperties
 from pycel import ExcelCompiler
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
@@ -1575,7 +1576,11 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
     delete_latest_document_version) ไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้าโดยอัตโนมัติ (หรือต้นฉบับถ้าไม่มีเวอร์ชัน
     เหลือเลย — ดู get_working_copy) สูตรในไฟล์กลับมาเหมือนเดิมทุกตัวอักษร เพราะเราไม่เคยแก้ bytes ของเวอร์ชัน
     เก่าเลยสักไบต์เดียว คืน dict เสมอ ไม่ raise เลย รูปแบบเดียวกับ _match_and_apply_excel_edit
-    ({"matched": True/False, "message": ...}) ตรวจ ownership ผ่าน get_editable_document() ก่อนเสมอ"""
+    ({"matched": True/False, "message": ...}) ตรวจ ownership ผ่าน get_editable_document() ก่อนเสมอ
+
+    ข้อความยืนยันบอกช่องที่ค่าเปลี่ยนกลับ โดยเทียบ label_map ของเวอร์ชันที่เพิ่งลบไป กับ label_map ของสถานะ
+    ปัจจุบันหลังย้อน (เวอร์ชันก่อนหน้า หรือต้นฉบับ) ตรงๆ ไม่พึ่งประวัติ document_edit_log เลย (เพราะช่อง
+    ผลข้างเคียงจากสูตรไม่ถูกบันทึกเป็นประวัติอีกต่อไป — ดู _match_and_apply_excel_edit)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
@@ -1587,11 +1592,17 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
-    edit_logs = deleted["edit_logs"]
-    if not edit_logs:
-        # เวอร์ชันที่ลบไปไม่มีประวัติ document_edit_log ผูกอยู่เลย (เช่น เวอร์ชันที่สร้างจาก migration อัตโนมัติ
-        # ของไฟล์เก่า — ดู get_working_copy) ยังถือว่าย้อนสำเร็จ (ไฟล์กลับเวอร์ชันก่อนหน้าแล้วจริง) แค่ไม่มี
-        # รายละเอียดระดับ label ให้บอก
+    _, current_label_map = get_working_copy(doc)
+    deleted_label_map = deleted["label_map"]
+    changed_labels = [
+        lbl for lbl in deleted_label_map
+        if lbl in current_label_map
+        and not _cell_values_equal(deleted_label_map[lbl]["current_value"], current_label_map[lbl]["current_value"])
+    ]
+
+    if not changed_labels:
+        # เวอร์ชันที่ลบไปไม่มีช่องไหนค่าต่างจากสถานะปัจจุบันเลย (ไม่ควรเกิดในทางปฏิบัติ) ยังถือว่าย้อนสำเร็จ
+        # (ไฟล์กลับเวอร์ชันก่อนหน้าแล้วจริง) แค่ไม่มีรายละเอียดระดับ label ให้บอก
         return {
             "matched": True,
             "label": None,
@@ -1600,20 +1611,21 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
             "message": f"ย้อนไฟล์ '{doc['filename']}' กลับเวอร์ชันก่อนหน้าแล้วครับ",
         }
 
-    # เวอร์ชันหนึ่งอาจมีหลาย label เปลี่ยน (label หลักที่แก้ตรงๆ + label สูตรอื่นที่เปลี่ยนตาม — ดู
+    # อาจมีหลาย label เปลี่ยนกลับพร้อมกัน (label หลักที่แก้ตรงๆ + label สูตรอื่นที่เปลี่ยนตาม — ดู
     # _match_and_apply_excel_edit) บอกรายละเอียดไม่เกิน 3 รายการเหมือนข้อความยืนยันตอนแก้
-    primary = edit_logs[0]
-    message = f"ย้อนการแก้ '{primary['label']}' ในไฟล์ '{doc['filename']}' กลับเป็น '{primary['old_value']}' แล้ว"
-    extra_logs = edit_logs[1:4]
-    if extra_logs:
-        extra_lines = [f"{e['label']}กลับเป็น {e['old_value']}" for e in extra_logs]
+    primary = changed_labels[0]
+    primary_new_value = current_label_map[primary]["current_value"]
+    message = f"ย้อนการแก้ '{primary}' ในไฟล์ '{doc['filename']}' กลับเป็น '{primary_new_value}' แล้ว"
+    extra_labels = changed_labels[1:4]
+    if extra_labels:
+        extra_lines = [f"{lbl}กลับเป็น {current_label_map[lbl]['current_value']}" for lbl in extra_labels]
         message += "\n\n" + " / ".join(extra_lines)
 
     return {
         "matched": True,
-        "label": primary["label"],
-        "old_value": primary["new_value"],
-        "new_value": primary["old_value"],
+        "label": primary,
+        "old_value": deleted_label_map[primary]["current_value"],
+        "new_value": primary_new_value,
         "message": message,
     }
 
@@ -5056,6 +5068,16 @@ def _build_document_version(base_bytes: bytes, base_label_map: dict, mutate_fn) 
     ด้านล่างอยู่แล้ว ไม่ต้องพึ่งค่าจาก data_only=True เลยสักเซลล์เดียว)"""
     wb = _load_workbook_preserving_macros(base_bytes)
     mutate_fn(wb)
+
+    # บังคับให้ Excel/LibreOffice (หรือโปรแกรมอื่นที่เปิดไฟล์นี้) คำนวณสูตรใหม่ทั้งหมดตอนเปิดไฟล์เสมอ — กันเคส
+    # เปิดไฟล์ด้วยโปรแกรมที่ไม่รู้จะคำนวณเองไหมแล้วเห็นค่า cache เก่าที่เราคำนวณไว้ตอน build (ซึ่งถูกต้องอยู่
+    # แล้วในกรณีปกติ แต่ไฟล์บางไฟล์ไม่มี calculation properties เลยด้วยซ้ำ — เช่นมาจากโปรแกรมอื่นที่ไม่เขียน
+    # <calcPr> ไว้ — ต้องสร้างขึ้นมาเองก่อน ไม่งั้น wb.calculation เป็น None เซ็ต attribute ไม่ได้)
+    if wb.calculation is None:
+        wb.calculation = CalcProperties(fullCalcOnLoad=True)
+    else:
+        wb.calculation.fullCalcOnLoad = True
+
     buf = io.BytesIO()
     wb.save(buf)
     new_bytes = buf.getvalue()
@@ -5223,16 +5245,10 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
     ]
 
     new_value_actual = new_label_map.get(label, {}).get("current_value", coerced_value)
-    edit_log_ids = [log_document_edit(document_id, label, old_value, new_value_actual, was_formula=was_formula)]
-    for side_label in side_effect_labels:
-        edit_log_ids.append(log_document_edit(
-            document_id, side_label,
-            label_map[side_label]["current_value"], new_label_map[side_label]["current_value"],
-            was_formula=True,
-        ))
-    for edit_log_id in edit_log_ids:
-        if edit_log_id is not None:
-            link_edit_log_to_version(edit_log_id, version_id)
+    # บันทึกประวัติเฉพาะ label ที่ผู้ใช้แก้ตรงๆ เท่านั้น — ช่องสูตรอื่นที่เปลี่ยนตาม (side_effect_labels) ไม่
+    # บันทึกเป็นประวัติ เก็บไว้แค่ในข้อความยืนยันด้านล่าง (ประวัติของแต่ละเวอร์ชันจึงมีแค่การแก้ที่ตั้งใจจริงๆ)
+    edit_log_id = log_document_edit(document_id, label, old_value, new_value_actual, was_formula=was_formula)
+    link_edit_log_to_version(edit_log_id, version_id)
 
     # แก้สำเร็จ = ไฟล์นี้กลายเป็นไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (ถ้ามี chat_id ผูกอยู่จริง — อัปโหลดบางเส้นทาง
     # อาจยังไม่มี chat_id ตอนเรียกครั้งแรกสุด แต่ไม่เคยเกิดในทางปฏิบัติเพราะ _resolve_chat_id เรียกมาก่อนเสมอ)

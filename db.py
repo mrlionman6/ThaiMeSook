@@ -1500,11 +1500,12 @@ def link_edit_log_to_version(edit_log_id: int, version_id: int) -> None:
 
 def delete_latest_document_version(document_id: int) -> Optional[dict]:
     """ลบเวอร์ชันล่าสุดของไฟล์นี้ทิ้ง พร้อมประวัติการแก้ (document_edit_log) ที่ผูกกับเวอร์ชันนั้นทั้งหมด —
-    คืน {"version_no":, "edit_logs": [{"label":, "old_value":, "new_value":}, ...]} ของเวอร์ชันที่เพิ่งลบไป
-    (เรียงเก่า->ใหม่ ใช้สร้างข้อความ "ย้อนการแก้ ... แล้ว") หรือ None ถ้าไม่มีเวอร์ชันให้ลบเลย (อยู่ที่ต้นฉบับ
-    อยู่แล้ว) ใช้โดย undo_last_edit() (main.py) — หลังลบแล้วไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้า (หรือต้นฉบับถ้า
-    ไม่มีเวอร์ชันเหลือ) โดยอัตโนมัติ เพราะ get_working_copy()/get_latest_document_version() อ่านจากเวอร์ชัน
-    ที่เหลืออยู่จริงเสมอ"""
+    คืน {"version_no":, "label_map":} ของเวอร์ชันที่เพิ่งลบไป (label_map ใช้คำนวณว่าช่องไหนค่าเปลี่ยนกลับบ้าง
+    โดยเทียบกับ label_map ของเวอร์ชันที่เหลืออยู่ — ดู undo_last_edit() main.py ไม่ได้พึ่งประวัติ
+    document_edit_log ในการสร้างข้อความเลย เพราะช่องผลข้างเคียงจากสูตรไม่ถูกบันทึกเป็นประวัติอีกต่อไป)
+    หรือ None ถ้าไม่มีเวอร์ชันให้ลบเลย (อยู่ที่ต้นฉบับอยู่แล้ว) ใช้โดย undo_last_edit() (main.py) — หลังลบแล้ว
+    ไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้า (หรือต้นฉบับถ้าไม่มีเวอร์ชันเหลือ) โดยอัตโนมัติ เพราะ
+    get_working_copy()/get_latest_document_version() อ่านจากเวอร์ชันที่เหลืออยู่จริงเสมอ"""
     with SessionLocal() as session:
         row = (
             session.query(DocumentVersion)
@@ -1516,6 +1517,7 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
             return None
         version_id = row.id
         version_no = row.version_no
+        label_map = row.label_map
 
         linked_log_ids = [
             v.edit_log_id
@@ -1523,15 +1525,7 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
             .filter(DocumentEditLogVersion.version_id == version_id)
             .all()
         ]
-        edit_logs = []
         if linked_log_ids:
-            log_rows = (
-                session.query(DocumentEditLog)
-                .filter(DocumentEditLog.id.in_(linked_log_ids))
-                .order_by(DocumentEditLog.created_at.asc())
-                .all()
-            )
-            edit_logs = [{"label": r.label, "old_value": r.old_value, "new_value": r.new_value} for r in log_rows]
             session.query(DocumentEditLogVersion).filter(
                 DocumentEditLogVersion.version_id == version_id
             ).delete(synchronize_session=False)
@@ -1541,7 +1535,7 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
 
         session.delete(row)
         session.commit()
-        return {"version_no": version_no, "edit_logs": edit_logs}
+        return {"version_no": version_no, "label_map": label_map}
 
 
 def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
