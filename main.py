@@ -622,6 +622,7 @@ LIBRARY_TOOLS = [
 # (กันคำเหล่านี้ไปบวกคะแนนปลอมให้ทุกไฟล์เท่าๆ กัน ซึ่งไม่ช่วยแยกไฟล์เลย)
 _LIBRARY_QUERY_STOPWORDS = {
     "เปิด", "ดู", "อ่าน", "ไฟล์", "ของ", "ด้วย", "และ", "ให้", "หน่อย", "ขอ", "แล้ว", "เปรียบเทียบ", "แก้",
+    "ปิด", "ใช้", "ลบ", "เลิก",
 }
 
 # วรรณยุกต์ไทย (่ ้ ๊ ๋) และไม้ไต่คู้ (็) — ตัดออกก่อนเทียบกันคีย์คำค้นหา/ชื่อไฟล์ต่างกันแค่พิมพ์ผิดวรรณยุกต์
@@ -1409,6 +1410,31 @@ def _get_active_chat_document(document_id, user_id: int, chat_id: int) -> Option
     return None
 
 
+def _enrich_chat_documents(active_docs: list[dict]) -> list[dict]:
+    """เติมข้อมูลประกอบจากคลังไฟล์ (folder, document_no, customer_name, project_name) ให้แต่ละไฟล์ที่เปิดอยู่ใน
+    แชท — จับคู่ด้วยชื่อไฟล์ normalize แล้ว (เส้นทางเดียวกับที่ execute_open_library_file ใช้กันเปิดไฟล์ซ้ำ)
+    ไฟล์ที่ผู้ใช้แนบเองตรงๆ (ไม่ได้มาจากคลัง) จะไม่เจอคู่ ปล่อยทั้ง 4 ฟิลด์เป็น None ไม่ถือว่าผิดปกติ
+
+    คืน list ใหม่ (ไม่แก้ dict เดิม) — แต่ละตัวมี key เดิมของ EditableDocument ครบ (id, filename,
+    original_bytes, label_map, chat_id, …) บวกกับ 4 ฟิลด์ใหม่นี้ ใช้ร่วมกันทั้ง build_chat_state() (แสดง
+    สถานะแชท) และ match_documents_by_name() (จับคู่คำสั่งผู้ใช้กับไฟล์ด้วยข้อมูลประกอบ ไม่ใช่แค่ชื่อไฟล์ —
+    ดูเหตุการณ์จริงใน docstring ของ match_documents_by_name)"""
+    library_by_name = {
+        _normalize_filename_for_matching(item["filename"]): item for item in _get_enriched_library_files()
+    }
+    enriched = []
+    for doc in active_docs:
+        library_match = library_by_name.get(_normalize_filename_for_matching(doc["filename"]))
+        enriched.append({
+            **doc,
+            "folder": library_match["folder"] if library_match else None,
+            "document_no": library_match["document_no"] if library_match else None,
+            "customer_name": library_match["customer_name"] if library_match else None,
+            "project_name": library_match["project_name"] if library_match else None,
+        })
+    return enriched
+
+
 def build_chat_state(chat_id: int, user_id: int) -> dict:
     """สร้าง "สถานะของแชทนี้" ด้วยโค้ดล้วนๆ (ไม่ใช้ AI เลย) — ไฟล์ที่เปิดอยู่ (ชื่อไฟล์ โฟลเดอร์/เลขเอกสารถ้าจับคู่
     กับไฟล์ในคลังได้ด้วยชื่อไฟล์ normalize แล้ว มีมาโครไหม กำลังโฟกัสอยู่ไหม) การแก้ 5 รายการล่าสุดของแต่ละไฟล์
@@ -1419,22 +1445,16 @@ def build_chat_state(chat_id: int, user_id: int) -> dict:
     focus_doc = get_chat_document_focus(chat_id, user_id)
     focus_id = focus_doc["id"] if focus_doc else None
 
-    # จับคู่ไฟล์ที่เปิดอยู่กับไฟล์ในคลังด้วยชื่อไฟล์ normalize แล้ว (เส้นทางเดียวกับที่ execute_open_library_file
-    # ใช้กันเปิดไฟล์ซ้ำ) เพื่อดึงโฟลเดอร์/เลขเอกสารมาแสดง — ไฟล์ที่ผู้ใช้แนบเองตรงๆ (ไม่ได้มาจากคลัง) จะไม่เจอ
-    # คู่ ปล่อยเป็น None ทั้งสองฟิลด์ ไม่ถือว่าผิดปกติ
-    library_by_name = {
-        _normalize_filename_for_matching(item["filename"]): item for item in _get_enriched_library_files()
-    }
+    enriched_docs = _enrich_chat_documents(active_docs)
 
     documents = []
-    for doc in active_docs:
-        library_match = library_by_name.get(_normalize_filename_for_matching(doc["filename"]))
+    for doc in enriched_docs:
         edits = get_recent_document_edits(doc["id"], limit=5)
         documents.append({
             "document_id": doc["id"],
             "filename": doc["filename"],
-            "folder": library_match["folder"] if library_match else None,
-            "document_no": library_match["document_no"] if library_match else None,
+            "folder": doc["folder"],
+            "document_no": doc["document_no"],
             "has_macros": _is_macro_workbook(doc["original_bytes"]),
             "is_focused": doc["id"] == focus_id,
             "download_url": f"/api/excel-editor/{doc['id']}/download",
@@ -2700,7 +2720,10 @@ async def ask_question(
     # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize/compare) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
     # (unrelated) ซึ่งจะปล่อยผ่านไป flow RAG ปกติด้านล่างทันที ไม่บล็อกการสนทนาปกติ
     if user_id and chat_id and query.strip() and image is None and not skip_excel_editor_for_pending_selection:
-        active_docs = list_active_editable_documents_by_chat(chat_id, user_id)
+        # เติมข้อมูลประกอบจากคลัง (folder/document_no/customer_name/project_name) ให้ทุกไฟล์ที่เปิดอยู่ในแชทนี้
+        # ตั้งแต่จุดเดียวนี้ — ให้ match_documents_by_name() ด้านล่าง (คำสั่งปิด + การจัดเส้นทางหลายไฟล์) ใช้
+        # ข้อมูลนี้จับคู่ได้ ไม่ใช่แค่ชื่อไฟล์เหมือนเดิม (ดู _enrich_chat_documents)
+        active_docs = _enrich_chat_documents(list_active_editable_documents_by_chat(chat_id, user_id))
 
         # คำสั่งย้อนการแก้ตรงๆ ("ย้อนการแก้"/"undo") ดักก่อนเรียก LLM ใดๆ เสมอ ย้อนไฟล์ที่โฟกัสอยู่ (หรือไฟล์
         # เดียวที่เปิดอยู่ถ้ามีแค่ไฟล์เดียว) ถ้ามีหลายไฟล์และไม่มีโฟกัส ให้ถามกลับแทนการเดา
@@ -4819,26 +4842,69 @@ def _normalize_filename_for_matching(name: str) -> str:
 
 
 def match_documents_by_name(instruction: str, documents: list[dict]) -> list[dict]:
-    """หาว่าข้อความผู้ใช้ (instruction) อ้างถึงไฟล์ไหนในรายการ documents (แต่ละตัวมี key 'filename' อย่างน้อย)
-    ด้วยโค้ดล้วนๆ ไม่เรียก LLM เลย — เทียบแบบ bidirectional substring หลัง normalize (ตัดนามสกุล/lowercase/
-    รวมช่องว่าง) แล้ว: ชื่อไฟล์เป็นส่วนหนึ่งของข้อความ (เช่นผู้ใช้พิมพ์ชื่อเต็มในประโยคยาว) หรือข้อความเป็น
-    ส่วนหนึ่งของชื่อไฟล์ (เช่นผู้ใช้พิมพ์แค่ส่วนย่อยที่จำได้ อย่าง 'ป่าไม้เขียว' ซึ่งเป็นส่วนหนึ่งของ
-    '...ป่าไม้เขียวจำกัด.xlsm') คืน list ของไฟล์ที่ตรง: ว่างเปล่า = ไม่ตรงเลย, มี 1 ตัว = ตรงชัดเจนใช้ได้เลย,
-    มากกว่า 1 ตัว = กำกวม (เช่นข้อความเป็นคำที่ทุกไฟล์มีร่วมกัน อย่าง 'ใบประเมินความคุ้มค่า' ที่เป็น prefix
-    ของทุกไฟล์) — ปล่อยให้ตัวจัดเส้นทาง (LLM) หรือถามกลับผู้ใช้ตัดสินใจต่อในกรณีนั้น ไม่เดาเอง"""
+    """หาว่าข้อความผู้ใช้ (instruction) อ้างถึงไฟล์ไหนในรายการ documents ด้วยโค้ดล้วนๆ ไม่เรียก LLM เลย
+
+    ขั้นที่ 1 (เดิม): เทียบแบบ bidirectional substring หลัง normalize ชื่อไฟล์ (ตัดนามสกุล/lowercase/รวม
+    ช่องว่าง) — ชื่อไฟล์เป็นส่วนหนึ่งของข้อความ หรือข้อความเป็นส่วนหนึ่งของชื่อไฟล์ (เช่น 'ป่าไม้เขียว' ซึ่งเป็น
+    ส่วนหนึ่งของ '...ป่าไม้เขียวจำกัด.xlsm') ได้ไฟล์ตรงเดียวชัดเจน -> คืนไฟล์นั้นทันที ไม่ต้องทำขั้นต่อไป
+
+    ขั้นที่ 2 (ใช้ข้อมูลประกอบ — เหตุการณ์จริงที่แก้: แชทเปิดไฟล์ "ติดตั้งกล้อง cctv ... - ป่าไม้เขียวจำกัด.xlsx"
+    (โฟลเดอร์ "ใบเสนอราคา" เลขเอกสาร SSF-02) อยู่ไฟล์เดียว ผู้ใช้พิมพ์ "ปิดไฟล์ใบเสนอราคา" ขั้นที่ 1 หาไม่เจอ
+    เพราะคำว่า "ใบเสนอราคา" ไม่ได้อยู่ในชื่อไฟล์เลย เป็นแค่ชื่อโฟลเดอร์): ถ้าขั้นที่ 1 ไม่ได้ไฟล์เดียว (ว่างเปล่า
+    หรือกำกวม) ให้ให้คะแนนด้วยข้อมูลประกอบแทน —
+    - เลขเอกสาร (document_no) เทียบแบบตรงตัวทั้งสตริงไม่สนตัวพิมพ์เล็กใหญ่ (ไม่ตัดคำ): ถ้าข้อความ (หลัง
+      normalize) มีเลขเอกสารของไฟล์ใดอยู่ในตัวมันเป็นสตริงต่อเนื่อง ไฟล์นั้นชนะทันที ("SSF-02"/"ssf-02" ตรง
+      แต่ "ss f-02" ไม่ตรงเพราะมีช่องว่างคั่นกลาง ไม่ใช่สตริงต่อเนื่องเดียวกัน) มีมากกว่า 1 ไฟล์ตรง -> คืนทุกไฟล์
+      ที่ตรง (กำกวม ให้ผู้เรียกถามกลับ)
+    - ไม่มีเลขเอกสารตรงเป๊ะเลยสักไฟล์: ตัดคำข้อความด้วย _tokenize_library_query แล้วให้คะแนนเทียบกับ
+      filename + folder + customer_name + project_name (ไม่รวม document_no — เทียบแบบตรงตัวไปแล้วข้างต้น
+      แยกต่างหาก กันคำสั้นๆ ในเลขเอกสาร เช่น "ss" ไปจับคู่มั่วกับ "SSF-02" ผ่านการตัดคำ) หลัง
+      _normalize_library_search_text ไฟล์ที่ได้คะแนนสูงสุดมีไฟล์เดียวและมากกว่า 0 -> คืนไฟล์นั้น เสมอกัน
+      หลายไฟล์ -> คืนทุกไฟล์ที่เสมอ (กำกวม) ไม่มีไฟล์ไหนได้คะแนนเลย -> คืน list ว่าง (ไม่พบ)
+
+    ใช้กับทุกจุดที่จับคู่ไฟล์ในแชทจากข้อความผู้ใช้ (คำสั่งปิดไฟล์ + การจัดเส้นทางคำสั่งตอนมีหลายไฟล์เปิดพร้อมกัน)
+    — documents ควรผ่าน _enrich_chat_documents() มาก่อนเสมอ เพื่อให้มี folder/document_no/customer_name/
+    project_name ให้ขั้นที่ 2 ใช้ (ไฟล์ที่ไม่ได้มาจากคลัง เช่นผู้ใช้แนบเอง จะมีฟิลด์พวกนี้เป็น None ทั้งหมด
+    ร่วมสกอร์ด้วยได้ปกติ แค่ไม่ช่วยอะไรเพิ่มในทางปฏิบัติ)"""
     normalized_instruction = _normalize_filename_for_matching(instruction)
-    if not normalized_instruction:
+    if normalized_instruction:
+        matched = []
+        for doc in documents:
+            normalized_filename = _normalize_filename_for_matching(doc["filename"])
+            if not normalized_filename:
+                continue
+            if normalized_instruction in normalized_filename or normalized_filename in normalized_instruction:
+                matched.append(doc)
+        if len(matched) == 1:
+            return matched
+
+    normalized_text = _normalize_library_search_text(instruction)
+
+    document_no_matches = [
+        doc for doc in documents
+        if doc.get("document_no") and _normalize_library_search_text(doc["document_no"]) in normalized_text
+    ]
+    if document_no_matches:
+        return document_no_matches
+
+    tokens = _tokenize_library_query(instruction)
+    if not tokens:
         return []
 
-    matched = []
+    scored = []
     for doc in documents:
-        normalized_filename = _normalize_filename_for_matching(doc["filename"])
-        if not normalized_filename:
-            continue
-        if normalized_instruction in normalized_filename or normalized_filename in normalized_instruction:
-            matched.append(doc)
+        haystack = _normalize_library_search_text(" ".join([
+            doc["filename"], doc.get("folder") or "", doc.get("customer_name") or "", doc.get("project_name") or "",
+        ]))
+        score = sum(1 for tok in tokens if tok in haystack)
+        if score > 0:
+            scored.append((doc, score))
 
-    return matched
+    if not scored:
+        return []
+
+    top_score = max(score for _, score in scored)
+    return [doc for doc, score in scored if score == top_score]
 
 
 def _is_label_cell_formula(original_bytes: bytes, label_info: dict) -> bool:

@@ -430,12 +430,21 @@ document.addEventListener("keydown", (e) => {
 // แผงไฟล์ในแชท (ขวา) — แสดงไฟล์ Excel ที่กำลังเปิดอยู่ในแชทปัจจุบัน (จาก GET /api/chats/{id}/state)
 // ซ่อนทั้งหมดถ้าไม่ได้ login (ดู loadChatFilesPanel) เปิด/ปิดด้วยปุ่มมุมขวาบน (เหมือนปุ่ม ☰ ซ้าย)
 // =====================================================================
+// ปุ่มเปิด/ปิดแผง (มุมขวาบน) ต้องไม่โชว์ตอนแผงเปิดอยู่ — ไม่งั้นมันจะทับหัวแผงที่มีปุ่มปิด (✕) อยู่แล้ว
+// (บั๊กจริงที่เคยเจอ) ซ่อนไว้เฉพาะตอนแผงเปิด+login เท่านั้น เหมือนกับที่ #sidebarToggle ทำกับแผงซ้ายทุกประการ
+// เรียกจุดเดียวนี้เสมอหลังเปิด/ปิดแผง หรือหลัง login/logout เปลี่ยนสถานะ — ไม่ตั้ง toggle.hidden ตรงๆ ที่อื่นเลย
+function updateFilesPanelToggleVisibility() {
+    const isOpen = document.getElementById("filesPanel").classList.contains("open");
+    document.getElementById("filesPanelToggle").hidden = !currentUser || isOpen;
+}
+
 function openFilesPanel() {
     document.getElementById("filesPanel").classList.add("open");
     document.getElementById("filesPanel").setAttribute("aria-hidden", "false");
     document.getElementById("filesPanelToggle").setAttribute("aria-expanded", "true");
     // backdrop (พื้นหลังมืด) โชว์เฉพาะจอแคบ (<768px — ดู @media ใน style.css ที่ซ่อนไว้บนจอกว้างเสมอ)
     document.getElementById("filesPanelBackdrop").hidden = false;
+    updateFilesPanelToggleVisibility();
     loadChatFilesPanel(); // รีเฟรชสถานะล่าสุดทุกครั้งที่เปิดแผง กันข้อมูลค้างจากตอนปิดแผงไว้นาน
 }
 
@@ -444,6 +453,7 @@ function closeFilesPanel() {
     document.getElementById("filesPanel").setAttribute("aria-hidden", "true");
     document.getElementById("filesPanelToggle").setAttribute("aria-expanded", "false");
     document.getElementById("filesPanelBackdrop").hidden = true;
+    updateFilesPanelToggleVisibility();
 }
 
 function toggleFilesPanel() {
@@ -479,14 +489,12 @@ function requestNewDocumentFromTemplate() {
 // โหลด/แสดงสถานะไฟล์ล่าสุดของแชทที่กำลังดูอยู่ (currentChatId) — เรียกหลังได้คำตอบทุกครั้ง, หลังแนบไฟล์,
 // หลังสลับแชท, หลังกดปุ่มในแผง, และตอนเปิดแผง (ดูจุดเรียกทั้งหมดในไฟล์นี้) ซ่อนปุ่มเปิด+ปิดแผงทิ้งถ้าไม่ได้ login
 async function loadChatFilesPanel() {
-    const toggle = document.getElementById("filesPanelToggle");
+    updateFilesPanelToggleVisibility();
 
     if (!currentUser) {
-        toggle.hidden = true;
         closeFilesPanel();
         return;
     }
-    toggle.hidden = false;
 
     // แชทใหม่ที่ยังไม่มี chat_id จริง (ยังไม่เคยถามอะไรเลย) -> ไม่มีอะไรให้โหลด แสดงสถานะว่างตรงๆ
     if (!currentChatId) {
