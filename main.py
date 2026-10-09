@@ -65,9 +65,13 @@ from db import (
     create_user_document,
     create_editable_document,
     get_editable_document,
+    get_editable_document_raw,
     get_editable_document_by_chat,
     list_active_editable_documents_by_chat,
-    update_editable_document_label_map,
+    get_latest_document_version,
+    create_document_version,
+    link_edit_log_to_version,
+    delete_latest_document_version,
     StorageNotConfiguredError,
     is_storage_configured,
     storage_get,
@@ -101,7 +105,6 @@ from db import (
     log_document_edit,
     get_recent_document_edits,
     get_document_edit_count,
-    pop_last_document_edit,
 )
 
 import os
@@ -114,12 +117,15 @@ import string
 import random
 import difflib
 import datetime
+import tempfile
+import concurrent.futures
 import urllib.parse
 import bcrypt
 import pandas as pd
 import openpyxl
 import xlrd
 from openpyxl.styles.numbers import is_date_format
+from pycel import ExcelCompiler
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
 from fastapi.staticfiles import StaticFiles
@@ -1450,12 +1456,13 @@ def build_chat_state(chat_id: int, user_id: int) -> dict:
     documents = []
     for doc in enriched_docs:
         edits = get_recent_document_edits(doc["id"], limit=5)
+        working_bytes, _ = get_working_copy(doc)
         documents.append({
             "document_id": doc["id"],
             "filename": doc["filename"],
             "folder": doc["folder"],
             "document_no": doc["document_no"],
-            "has_macros": _is_macro_workbook(doc["original_bytes"]),
+            "has_macros": _is_macro_workbook(working_bytes),
             "is_focused": doc["id"] == focus_id,
             "download_url": f"/api/excel-editor/{doc['id']}/download",
             "edit_count": get_document_edit_count(doc["id"]),
@@ -1522,7 +1529,7 @@ def execute_list_chat_documents(user_id: int, chat_id: int) -> dict:
             {
                 "document_id": doc["id"],
                 "filename": doc["filename"],
-                "has_macros": _is_macro_workbook(doc["original_bytes"]),
+                "has_macros": _is_macro_workbook(get_working_copy(doc)[0]),
                 "is_focused": doc["id"] == focus_id,
             }
             for doc in active_docs
@@ -1564,37 +1571,50 @@ def execute_get_document_download_link(tool_input: dict, user_id: int, chat_id: 
 
 
 def undo_last_edit(document_id: int, user_id: int) -> dict:
-    """ย้อนการแก้ล่าสุดของไฟล์นี้กลับ (คืนค่า old_value เข้า label_map แล้วลบแถวประวัตินั้นทิ้งผ่าน
-    pop_last_document_edit — atomic) คืน dict เสมอ ไม่ raise เลย รูปแบบเดียวกับ _match_and_apply_excel_edit
+    """ย้อนการแก้ล่าสุดของไฟล์นี้กลับ — ลบเวอร์ชันล่าสุดทิ้ง (พร้อมประวัติการแก้ของเวอร์ชันนั้น ดู
+    delete_latest_document_version) ไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้าโดยอัตโนมัติ (หรือต้นฉบับถ้าไม่มีเวอร์ชัน
+    เหลือเลย — ดู get_working_copy) สูตรในไฟล์กลับมาเหมือนเดิมทุกตัวอักษร เพราะเราไม่เคยแก้ bytes ของเวอร์ชัน
+    เก่าเลยสักไบต์เดียว คืน dict เสมอ ไม่ raise เลย รูปแบบเดียวกับ _match_and_apply_excel_edit
     ({"matched": True/False, "message": ...}) ตรวจ ownership ผ่าน get_editable_document() ก่อนเสมอ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
 
-    popped = pop_last_document_edit(document_id)
-    if popped is None:
+    deleted = delete_latest_document_version(document_id)
+    if deleted is None:
         return {"matched": False, "message": f"ไม่มีประวัติการแก้ไขของไฟล์ '{doc['filename']}' ให้ย้อนกลับครับ"}
 
-    label = popped["label"]
-    old_value = popped["old_value"]
-    label_map = doc["label_map"]
-    if label not in label_map:
-        return {
-            "matched": False,
-            "message": f"ย้อนการแก้ไม่สำเร็จ ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}' แล้ว",
-        }
-
-    label_map[label]["current_value"] = old_value
-    update_editable_document_label_map(document_id, label_map)
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
+    edit_logs = deleted["edit_logs"]
+    if not edit_logs:
+        # เวอร์ชันที่ลบไปไม่มีประวัติ document_edit_log ผูกอยู่เลย (เช่น เวอร์ชันที่สร้างจาก migration อัตโนมัติ
+        # ของไฟล์เก่า — ดู get_working_copy) ยังถือว่าย้อนสำเร็จ (ไฟล์กลับเวอร์ชันก่อนหน้าแล้วจริง) แค่ไม่มี
+        # รายละเอียดระดับ label ให้บอก
+        return {
+            "matched": True,
+            "label": None,
+            "old_value": None,
+            "new_value": None,
+            "message": f"ย้อนไฟล์ '{doc['filename']}' กลับเวอร์ชันก่อนหน้าแล้วครับ",
+        }
+
+    # เวอร์ชันหนึ่งอาจมีหลาย label เปลี่ยน (label หลักที่แก้ตรงๆ + label สูตรอื่นที่เปลี่ยนตาม — ดู
+    # _match_and_apply_excel_edit) บอกรายละเอียดไม่เกิน 3 รายการเหมือนข้อความยืนยันตอนแก้
+    primary = edit_logs[0]
+    message = f"ย้อนการแก้ '{primary['label']}' ในไฟล์ '{doc['filename']}' กลับเป็น '{primary['old_value']}' แล้ว"
+    extra_logs = edit_logs[1:4]
+    if extra_logs:
+        extra_lines = [f"{e['label']}กลับเป็น {e['old_value']}" for e in extra_logs]
+        message += "\n\n" + " / ".join(extra_lines)
+
     return {
         "matched": True,
-        "label": label,
-        "old_value": popped["new_value"],
-        "new_value": old_value,
-        "message": f"ย้อนการแก้ '{label}' ในไฟล์ '{doc['filename']}' กลับเป็น '{old_value}' แล้ว",
+        "label": primary["label"],
+        "old_value": primary["new_value"],
+        "new_value": primary["old_value"],
+        "message": message,
     }
 
 
@@ -2781,7 +2801,8 @@ async def ask_question(
 
         if len(active_docs) == 1:
             editable_doc = active_docs[0]
-            intent = _classify_excel_editor_intent(editable_doc["label_map"], query)
+            _, editable_doc_label_map = get_working_copy(editable_doc)
+            intent = _classify_excel_editor_intent(editable_doc_label_map, query)
 
             if intent == "edit":
                 result = _match_and_apply_excel_edit(editable_doc["id"], user_id, query)
@@ -4590,7 +4611,7 @@ def _route_multi_file_instruction(
     (match_documents_by_name) ก่อนเรียกฟังก์ชันนี้ — ถ้าไม่ None แปลว่าโค้ดเจอไฟล์ตรงตัวเดียวชัดเจนแล้ว
     ให้ LLM ใช้ document_id นี้เสมอสำหรับ action ที่เกี่ยวกับไฟล์เดียว ไม่ต้องเดาใหม่"""
     files_context = [
-        {"document_id": doc["id"], "filename": doc["filename"], "label_map": doc["label_map"]}
+        {"document_id": doc["id"], "filename": doc["filename"], "label_map": get_working_copy(doc)[1]}
         for doc in documents
     ]
 
@@ -4774,12 +4795,14 @@ def _build_comparison_table(label_map_a: dict, label_map_b: dict, filename_a: st
 
 
 def _compare_editable_documents(doc_a: dict, doc_b: dict) -> str:
-    """สร้างตารางเปรียบเทียบ label ทั้งหมดระหว่างสองไฟล์ด้วยโค้ดล้วนๆ (ไม่เรียก Claude เลย — ดู
-    _build_comparison_table) ใช้ผลเดียวกันนี้ทั้งเส้นทาง compare_chat_documents (tool) และเส้นทาง
-    compare เดิมของ Excel editor ที่มี 2 ไฟล์ active พร้อมกันใน /ask"""
-    if not doc_a["label_map"] and not doc_b["label_map"]:
+    """สร้างตารางเปรียบเทียบ label ทั้งหมดระหว่างสองไฟล์ (สำเนาทำงานปัจจุบันของแต่ละไฟล์ — ดู get_working_copy)
+    ด้วยโค้ดล้วนๆ (ไม่เรียก Claude เลย — ดู _build_comparison_table) ใช้ผลเดียวกันนี้ทั้งเส้นทาง
+    compare_chat_documents (tool) และเส้นทาง compare เดิมของ Excel editor ที่มี 2 ไฟล์ active พร้อมกันใน /ask"""
+    _, label_map_a = get_working_copy(doc_a)
+    _, label_map_b = get_working_copy(doc_b)
+    if not label_map_a and not label_map_b:
         return f"ไม่พบ label ในไฟล์ '{doc_a['filename']}' และ '{doc_b['filename']}' เลย ไม่สามารถเปรียบเทียบได้"
-    return _build_comparison_table(doc_a["label_map"], doc_b["label_map"], doc_a["filename"], doc_b["filename"])
+    return _build_comparison_table(label_map_a, label_map_b, doc_a["filename"], doc_b["filename"])
 
 
 EXCEL_EDITOR_UPLOAD_INTENT_SYSTEM_PROMPT = (
@@ -4907,13 +4930,15 @@ def match_documents_by_name(instruction: str, documents: list[dict]) -> list[dic
     return [doc for doc, score in scored if score == top_score]
 
 
-def _is_label_cell_formula(original_bytes: bytes, label_info: dict) -> bool:
-    """เช็คว่าเซลล์ของ label นี้ในไฟล์ต้นฉบับ (original_bytes — ไม่แตะค่าที่แก้ระหว่างคุยเลย) เดิมเป็นสูตร
-    คำนวณ (ขึ้นต้นด้วย "=") หรือไม่ เปิดด้วย data_only=False (อ่านสูตรดิบ ไม่ใช่ค่าที่คำนวณแล้ว) อ่านอย่างเดียว
-    ไม่เคย save จึงไม่ต้องผ่าน _load_workbook_preserving_macros คืน False เสมอถ้าอ่านไม่ได้ (fail-safe —
-    ไม่บล็อกการแก้ไฟล์ปกติแค่เพราะเช็คเพิ่มเติมนี้พลาด)"""
+def _is_label_cell_formula(file_bytes: bytes, label_info: dict) -> bool:
+    """เช็คว่าเซลล์ของ label นี้ในไฟล์ (file_bytes — ไม่แตะ/ไม่แก้อะไรเลย) เป็นสูตรคำนวณ (ขึ้นต้นด้วย "=")
+    หรือไม่ เปิดด้วย data_only=False (อ่านสูตรดิบ ไม่ใช่ค่าที่คำนวณแล้ว) อ่านอย่างเดียว ไม่เคย save จึงไม่ต้อง
+    ผ่าน _load_workbook_preserving_macros คืน False เสมอถ้าอ่านไม่ได้ (fail-safe — ไม่บล็อกการแก้ไฟล์ปกติแค่
+    เพราะเช็คเพิ่มเติมนี้พลาด) เรียกด้วย bytes ของสำเนาทำงานปัจจุบัน (ดู get_working_copy) ไม่ใช่ต้นฉบับเสมอไป
+    — เซลล์ที่เคยเป็นสูตรแล้วถูกแก้ไปแล้วครั้งหนึ่งจะไม่ถือเป็นสูตรอีกต่อไปในการแก้ครั้งถัดไป (ถูกต้องแล้ว
+    เพราะเซลล์นั้นในสำเนาทำงานปัจจุบันไม่ใช่สูตรจริงๆ — ย้อนการแก้กลับไปจะทำให้กลับมาเป็นสูตรอีกครั้ง)"""
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(original_bytes), data_only=False)
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
         ws = wb[label_info["sheet"]]
         cell_value = ws.cell(row=label_info["row"], column=label_info["col"]).value
         return isinstance(cell_value, str) and cell_value.startswith("=")
@@ -4926,18 +4951,198 @@ FORMULA_EDIT_WARNING_NOTICE = (
     'ถ้าต้องการให้คำนวณอัตโนมัติเหมือนเดิม พิมพ์ "ย้อนการแก้")'
 )
 
+FORMULA_RECALC_TIMEOUT_SECONDS = 5  # จำกัดเวลาคำนวณสูตรทั้งไฟล์ต่อครั้ง (pycel) กันไฟล์ซับซ้อน/circular ค้างคำขอ
+
+
+def _cell_ref(sheet: str, row: int, col: int) -> str:
+    """แปลงพิกัด (ชื่อชีต, แถว, คอลัมน์) ของ label ให้เป็น cell reference แบบที่ pycel ใช้ เช่น
+    ("Sheet1", 3, 2) -> "Sheet1!B2" ครอบชื่อชีตด้วยเครื่องหมายคำพูดเดี่ยวเสมอ (ปลอดภัยแม้ชื่อชีตมีช่องว่าง
+    เช่น "My Sheet" -> 'My Sheet'!B2 — ไม่ครอบก็ parse ได้ปกติถ้าไม่มีช่องว่าง ครอบไว้เผื่อไว้เสมอไม่เสียหาย)"""
+    return f"'{sheet}'!{openpyxl.utils.get_column_letter(col)}{row}"
+
+
+def _recalculate_formula_values(file_bytes: bytes, label_map: dict, fallback_label_map: Optional[dict]) -> dict:
+    """คำนวณค่าปัจจุบันจริงของทุก label ที่เซลล์เป็นสูตรใหม่ด้วย pycel แล้วคืน label_map ใหม่ (ไม่แก้ label_map
+    เดิม) — label ที่ไม่ใช่สูตรผ่านตรงๆ ไม่แตะเลย
+
+    เหตุผลที่ต้องมีฟังก์ชันนี้: _extract_excel_labels() อ่านค่าเซลล์สูตรแบบ data_only=True ซึ่งได้แค่ค่า
+    "cache" ที่ Excel/LibreOffice เคยคำนวณไว้ครั้งล่าสุด (หรือ None ถ้าไฟล์สร้าง/แก้ด้วย openpyxl ที่ไม่เคย
+    คำนวณสูตรเองเลย) เมื่อเราแก้เซลล์ input (เช่น "จำนวน") แล้วบันทึกไฟล์ใหม่ด้วย openpyxl ค่า cache ของสูตรที่
+    อ้างอิงเซลล์นั้น (เช่น "รวม") จะไม่ถูกอัปเดตอัตโนมัติเลย (openpyxl ไม่คำนวณสูตรให้) ต้องคำนวณเองด้วย pycel
+    แล้วเขียนทับ current_value ของ label สูตรเหล่านั้นใน label_map
+
+    - ฟังก์ชันที่ pycel ไม่รองรับ (เช่น BAHTTEXT) หรือ error อื่นๆ ต่อ label เดียว -> current_value เป็น None
+      เฉพาะ label นั้น (ไม่ทำให้ label อื่นพัง) log เป็น ASCII (ไม่พิมพ์ชื่อ label เพราะอาจเป็นภาษาไทย)
+    - คำนวณทั้งไฟล์ไม่สำเร็จเลย (เช่น parse ไฟล์ไม่ได้) หรือเกินเวลาที่กำหนด (FORMULA_RECALC_TIMEOUT_SECONDS
+      วินาที — รันในเธรดแยกกันค้าง ไม่ใช้ signal.alarm เพราะต้องรันได้ทั้ง Windows และ Linux) -> label ที่เป็น
+      สูตรทุกตัวใช้ current_value จาก fallback_label_map แทน (ค่าของเวอร์ชันก่อนหน้า ถ้ามี label นั้นอยู่ —
+      ไม่มีก็ปล่อยเป็นค่าที่ _extract_excel_labels อ่านได้ตามเดิม ดีกว่าไม่มีค่าอะไรเลย) ไม่ raise ออกไปเด็ดขาด
+      ไม่ทำให้การแก้ล้มทั้งที"""
+    try:
+        wb_check = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+        formula_labels = []
+        for label, info in label_map.items():
+            cell_value = wb_check[info["sheet"]].cell(row=info["row"], column=info["col"]).value
+            if isinstance(cell_value, str) and cell_value.startswith("="):
+                formula_labels.append(label)
+    except Exception as e:
+        print(f"[FormulaRecalc] scan_failed exception_type={type(e).__name__}")
+        formula_labels = []
+
+    if not formula_labels:
+        return dict(label_map)
+
+    result = dict(label_map)
+
+    def _apply_fallback_to_formula_labels():
+        if not fallback_label_map:
+            return
+        for label in formula_labels:
+            if label in fallback_label_map:
+                result[label] = {**result[label], "current_value": fallback_label_map[label]["current_value"]}
+
+    tmp_path = None
+    pool = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        def _run():
+            excel = ExcelCompiler(tmp_path)
+            values = {}
+            for label in formula_labels:
+                info = label_map[label]
+                try:
+                    values[label] = excel.evaluate(_cell_ref(info["sheet"], info["row"], info["col"]))
+                except Exception as e:
+                    print(f"[FormulaRecalc] label_eval_failed exception_type={type(e).__name__}")
+                    values[label] = None
+            return values
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_run)
+        values = future.result(timeout=FORMULA_RECALC_TIMEOUT_SECONDS)
+        for label, value in values.items():
+            result[label] = {**result[label], "current_value": value}
+    except Exception as e:
+        print(f"[FormulaRecalc] whole_file_failed exception_type={type(e).__name__}")
+        _apply_fallback_to_formula_labels()
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False)  # ไม่รอเธรดที่ timeout ไปแล้ว (อาจยังรันค้างอยู่เบื้องหลัง ปล่อยทิ้งไป)
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass  # เธรดที่ timeout อาจยังเปิดไฟล์นี้ค้างอยู่ (ไม่ error บน Linux, อาจ error เงียบๆ บน Windows)
+
+    return result
+
+
+def _build_document_version(base_bytes: bytes, base_label_map: dict, mutate_fn) -> tuple[bytes, dict]:
+    """เปิดสำเนา base_bytes (ผ่าน _load_workbook_preserving_macros กันมาโครหาย) เรียก mutate_fn(workbook) ให้
+    แก้เซลล์ที่ต้องการ บันทึกเป็น bytes ใหม่ แล้วคำนวณ label_map ใหม่โดยใช้ "ตำแหน่งเดิม" ของทุก label ใน
+    base_label_map ตรงๆ (เฟส 1 นี้ตำแหน่ง label ไม่เปลี่ยนเลย — เพิ่ม/ลบแถวเป็นหน้าที่ของเฟส 2) คืน (bytes ใหม่,
+    label_map ใหม่) เสมอ ไม่บันทึกลง DB เอง — ใช้ร่วมกันทั้งการแก้ปกติ (create_new_version) และการย้ายไฟล์เก่า
+    เข้าระบบเวอร์ชันแบบ lazy (get_working_copy)
+
+    จงใจไม่เรียก _extract_excel_labels() สกัดโครงสร้างใหม่จาก new_bytes เหมือนที่อื่นในไฟล์นี้ทำ เพราะฟังก์ชัน
+    นั้นอ่านค่าเซลล์แบบ data_only=True (ต้องพึ่งค่า cache ที่ Excel/LibreOffice เคยคำนวณไว้) — ไฟล์ที่ไม่เคยถูก
+    เปิดด้วยโปรแกรมที่คำนวณสูตรจริงเลย (เช่น สร้างด้วย openpyxl ล้วนๆ) จะไม่มีค่า cache ของสูตรเลย ทำให้อ่านได้
+    None แล้ว _extract_excel_labels เข้าใจผิดว่าทั้งแถวมีแค่เซลล์เดียวไม่ว่าง (ตีความเป็น "หัวข้อหมวด") จน label
+    ทั้งแถวหายไปจาก label_map ทั้งที่จริงๆ เซลล์นั้นมีสูตรอยู่ — อ่านค่าเซลล์ตรงๆ ด้วย data_only=False แทนเสมอ
+    (ได้ค่าจริงถูกต้องสำหรับเซลล์ที่ไม่ใช่สูตร ส่วนเซลล์สูตรคำนวณค่าจริงทับอีกทีด้วย _recalculate_formula_values
+    ด้านล่างอยู่แล้ว ไม่ต้องพึ่งค่าจาก data_only=True เลยสักเซลล์เดียว)"""
+    wb = _load_workbook_preserving_macros(base_bytes)
+    mutate_fn(wb)
+    buf = io.BytesIO()
+    wb.save(buf)
+    new_bytes = buf.getvalue()
+
+    wb_read = openpyxl.load_workbook(io.BytesIO(new_bytes), data_only=False)
+    fresh_label_map = {}
+    for label, info in base_label_map.items():
+        cell = wb_read[info["sheet"]].cell(row=info["row"], column=info["col"])
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            # สูตร — current_value ตอนนี้ยังเป็นค่าเก่า รอ _recalculate_formula_values ด้านล่างคำนวณทับให้
+            fresh_label_map[label] = dict(info)
+        else:
+            fresh_label_map[label] = {
+                **info,
+                "current_value": _json_safe_cell_value(cell.value),
+                "number_format": cell.number_format,
+            }
+
+    new_label_map = _recalculate_formula_values(new_bytes, fresh_label_map, base_label_map)
+    return new_bytes, new_label_map
+
+
+def get_working_copy(document: dict) -> tuple[bytes, dict]:
+    """คืน (bytes, label_map) ของ "สำเนาทำงานปัจจุบัน" ของไฟล์นี้ — เวอร์ชันล่าสุดถ้าเคยแก้มาก่อน หรือต้นฉบับ
+    (original_bytes/label_map ของ EditableDocument) ถ้ายังไม่เคยแก้เลย เป็นจุดเดียวที่ควรใช้อ่าน "ค่าปัจจุบัน"
+    ของไฟล์ทุกจุดในระบบจากนี้ไป (เปรียบเทียบ/สถานะแชท/แผง/สรุป/ตัวจับคู่คำสั่ง) แทนการอ่าน
+    document["label_map"]/document["original_bytes"] ตรงๆ (ค่าเหล่านั้นคือต้นฉบับตายตัวเสมอ ไม่อัปเดตอีก
+    ต่อไปตั้งแต่ PR นี้)
+
+    migration แบบ lazy (ตอนเข้าถึงครั้งแรก): ไฟล์ที่สร้างก่อน PR นี้อาจมีการแก้ค้างอยู่ใน
+    EditableDocument.label_map แล้ว (เขียนทับ current_value ตรงๆ แบบเดิม) แต่ยังไม่เคยมีแถวใน
+    document_versions เลย — ตรวจด้วย _filter_labels_actually_edited (เทียบกับต้นฉบับจริง) ถ้ามี label ที่
+    ต่างจากต้นฉบับจริง ให้สร้างเวอร์ชัน 1 จากต้นฉบับ + เฉพาะ label ที่ต่างเหล่านั้นทันที (คำนวณสูตรใหม่ให้ด้วย)
+    แล้วใช้ระบบเวอร์ชันต่อจากนี้ไป ไม่มี label ค้างเลย -> ไม่ต้อง migrate อะไร ใช้ต้นฉบับตรงๆ"""
+    latest = get_latest_document_version(document["id"])
+    if latest is not None:
+        return latest["file_bytes"], latest["label_map"]
+
+    changed_labels = _filter_labels_actually_edited(document["original_bytes"], document["label_map"])
+    if not changed_labels:
+        return document["original_bytes"], document["label_map"]
+
+    def _apply_legacy_edits(wb):
+        for label, info in changed_labels.items():
+            ok, value, _ = _coerce_value_for_cell(info["current_value"], info.get("number_format"))
+            if ok:
+                wb[info["sheet"]].cell(row=info["row"], column=info["col"], value=value)
+
+    new_bytes, new_label_map = _build_document_version(
+        document["original_bytes"], document["label_map"], _apply_legacy_edits
+    )
+    create_document_version(
+        document["id"], new_bytes, new_label_map,
+        change_summary="ย้ายเข้าระบบเวอร์ชันอัตโนมัติจากไฟล์เก่า (ก่อนมีระบบเวอร์ชัน)",
+    )
+    return new_bytes, new_label_map
+
+
+def create_new_version(document_id: int, mutate_fn, change_summary: Optional[str] = None) -> dict:
+    """เปิดสำเนาทำงานล่าสุดของไฟล์นี้ (ดู get_working_copy) เรียก mutate_fn(workbook) ให้แก้เซลล์ที่ต้องการ
+    บันทึกเป็นเวอร์ชันใหม่ (ผ่าน _build_document_version — คำนวณสูตรใหม่ให้ด้วย) ลง DB แล้วคืน
+    {"label_map": label_map ใหม่, "version_id": id ของเวอร์ชันใหม่}
+
+    เป็นจุดเดียวที่ควรใช้ "แก้ไฟล์จริง" จากนี้ไปทุกแบบ (เฟส 1 นี้ใช้กับการแก้ค่า label เดียวใน
+    _match_and_apply_excel_edit เท่านั้น — เฟส 2 จะใช้ฟังก์ชันนี้กับการแก้ทุกชนิด เช่น เปลี่ยนสูตร เพิ่ม/ลบแถว)
+    change_summary: ข้อความสั้นๆ อธิบายการแก้นี้ เก็บไว้ในเวอร์ชันโดยตรง (ดู DocumentVersion.change_summary) —
+    ไม่ได้ใช้แสดงผลที่ไหนในเฟส 1 นี้ (ดู document_edit_log/get_recent_document_edits สำหรับประวัติที่แสดงจริง)
+    ต้องเรียกโดยที่ caller เช็ค ownership ของ document_id นี้มาแล้วเท่านั้น (ฟังก์ชันนี้ไม่เช็คเอง)"""
+    document = get_editable_document_raw(document_id)
+    base_bytes, base_label_map = get_working_copy(document)
+    new_bytes, new_label_map = _build_document_version(base_bytes, base_label_map, mutate_fn)
+    version_id = create_document_version(document_id, new_bytes, new_label_map, change_summary=change_summary)
+    return {"label_map": new_label_map, "version_id": version_id}
+
 
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
-    """เรียก Claude จับคู่คำสั่งกับ label ใน label_map แล้วอัปเดต current_value ถ้าจับคู่ได้ (ไม่แตะ original_bytes)
-    คืน dict เสมอ ไม่ raise เลย (ใช้ทั้งตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask
-    ซึ่งทั้งคู่ต้องได้ข้อความคำตอบกลับไปแสดงในแชทเสมอ ไม่ใช่ error response)
+    """เรียก Claude จับคู่คำสั่งกับ label ใน label_map (ของสำเนาทำงานปัจจุบัน — ดู get_working_copy) แล้วเขียน
+    ค่าใหม่ลงเซลล์จริงผ่าน create_new_version() (ไม่แตะ original_bytes เลย) คืน dict เสมอ ไม่ raise เลย (ใช้ทั้ง
+    ตอนอัปโหลดครั้งแรกที่มีคำสั่งมาด้วย และตอนคุยแก้ต่อใน /ask ซึ่งทั้งคู่ต้องได้ข้อความคำตอบกลับไปแสดงในแชทเสมอ
+    ไม่ใช่ error response)
 
     รับแค่ document_id + user_id แล้ว fetch label_map สดใหม่จาก DB เองเสมอ (ไม่รับ label_map จาก caller
     ตรงๆ) กัน caller ถือ label_map เก่าค้างไว้แล้วเขียนทับการแก้ก่อนหน้าที่คนอื่น/รอบอื่นเพิ่งบันทึกไป (lost update)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว กรุณาอัปโหลดไฟล์ใหม่อีกครั้ง"}
-    label_map = doc["label_map"]
+    base_bytes, label_map = get_working_copy(doc)
 
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
@@ -4987,14 +5192,47 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
             "message": f"คำสั่งนี้ไม่ได้ระบุค่าใหม่ที่ชัดเจนสำหรับ '{label}' ในไฟล์ '{doc['filename']}' กรุณาระบุค่าที่ต้องการแก้ครับ",
         }
 
-    # เช็คว่าเซลล์เดิม (ในไฟล์ต้นฉบับ) เป็นสูตรคำนวณไหม "ก่อน" เขียนทับ — ยังแก้ได้ตามปกติเสมอ แค่เตือนต่อท้าย
-    # ข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรหลังแก้ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะย้อนการแก้)
-    was_formula = _is_label_cell_formula(doc["original_bytes"], label_map[label])
+    target_info = label_map[label]
+    ok, coerced_value, coerce_error = _coerce_value_for_cell(new_value, target_info.get("number_format"))
+    if not ok:
+        return {
+            "matched": False,
+            "message": f"'{label}': {coerce_error} — กรุณาระบุค่าที่ถูกต้องสำหรับช่องนี้ครับ",
+        }
 
-    old_value = label_map[label]["current_value"]
-    label_map[label]["current_value"] = new_value
-    update_editable_document_label_map(document_id, label_map)
-    log_document_edit(document_id, label, old_value, new_value, was_formula=was_formula)
+    # เช็คว่าเซลล์เดิม (ในสำเนาทำงานปัจจุบัน) เป็นสูตรคำนวณไหม "ก่อน" เขียนทับ — ยังแก้ได้ตามปกติเสมอ แค่เตือน
+    # ต่อท้ายข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรในเวอร์ชันใหม่ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะ
+    # ย้อนการแก้กลับไปเวอร์ชันก่อนหน้า)
+    was_formula = _is_label_cell_formula(base_bytes, target_info)
+    old_value = target_info["current_value"]
+
+    def _apply_edit(wb):
+        ws = wb[target_info["sheet"]]
+        ws.cell(row=target_info["row"], column=target_info["col"], value=coerced_value)
+
+    version_result = create_new_version(document_id, _apply_edit, change_summary=f"แก้ '{label}'")
+    new_label_map = version_result["label_map"]
+    version_id = version_result["version_id"]
+
+    # ช่องสูตรอื่นที่ไม่ใช่ label ที่แก้ตรงๆ แต่ค่าเปลี่ยนไปเพราะผลของการแก้นี้ (เขียนเซลล์แค่ช่องเดียวใน
+    # _apply_edit ด้านบน ช่องอื่นที่ค่าต่างไปจากเดิมจึงเป็นผลจากสูตรคำนวณใหม่เสมอ ไม่ใช่การเขียนตรงๆ)
+    side_effect_labels = [
+        other_label for other_label, other_info in new_label_map.items()
+        if other_label != label and other_label in label_map
+        and not _cell_values_equal(label_map[other_label]["current_value"], other_info["current_value"])
+    ]
+
+    new_value_actual = new_label_map.get(label, {}).get("current_value", coerced_value)
+    edit_log_ids = [log_document_edit(document_id, label, old_value, new_value_actual, was_formula=was_formula)]
+    for side_label in side_effect_labels:
+        edit_log_ids.append(log_document_edit(
+            document_id, side_label,
+            label_map[side_label]["current_value"], new_label_map[side_label]["current_value"],
+            was_formula=True,
+        ))
+    for edit_log_id in edit_log_ids:
+        if edit_log_id is not None:
+            link_edit_log_to_version(edit_log_id, version_id)
 
     # แก้สำเร็จ = ไฟล์นี้กลายเป็นไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (ถ้ามี chat_id ผูกอยู่จริง — อัปโหลดบางเส้นทาง
     # อาจยังไม่มี chat_id ตอนเรียกครั้งแรกสุด แต่ไม่เคยเกิดในทางปฏิบัติเพราะ _resolve_chat_id เรียกมาก่อนเสมอ)
@@ -5002,15 +5240,21 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
         set_chat_document_focus(doc["chat_id"], document_id)
 
     # สร้างข้อความยืนยันเองด้วยโค้ดเสมอ ห้ามใช้ parsed["reason"] (ข้อความภายในของตัวจับคู่)
-    message = f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value}' แล้ว"
+    message = f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value_actual}' แล้ว"
     if was_formula:
         message += FORMULA_EDIT_WARNING_NOTICE
+    if side_effect_labels:
+        side_effect_lines = [
+            f"{side_label}เปลี่ยนจาก {label_map[side_label]['current_value']} เป็น {new_label_map[side_label]['current_value']}"
+            for side_label in side_effect_labels[:3]
+        ]
+        message += "\n\n" + " / ".join(side_effect_lines)
 
     return {
         "matched": True,
         "label": label,
         "old_value": old_value,
-        "new_value": new_value,
+        "new_value": new_value_actual,
         "was_formula": was_formula,
         "message": message,
     }
@@ -5097,12 +5341,13 @@ async def upload_excel_editor_document(
 def _filter_labels_actually_edited(original_bytes: bytes, label_map: dict) -> dict:
     """คืน label_map เฉพาะ label ที่ current_value 'ต่างจริง' จากค่าต้นฉบับ (สกัดสดจาก original_bytes ด้วย
     _extract_excel_labels ทุกครั้ง — ไม่แคชไว้ เพราะ original_bytes ไม่เคยเปลี่ยนอยู่แล้ว) เทียบด้วย
-    _cell_values_equal เดียวกับตารางเปรียบเทียบไฟล์ — ใช้ก่อนเขียนไฟล์ทุกจุดที่สร้างไฟล์จริงจาก label_map
-    (ตอนนี้มีจุดเดียวคือ download_excel_editor_document ด้านล่าง)
+    _cell_values_equal เดียวกับตารางเปรียบเทียบไฟล์
 
-    ป้องกันบั๊กที่เคยเกิดจริง: เดิมเขียนทับทุกเซลล์ของทุก label เสมอไม่ว่าจะถูกแก้หรือไม่ ทำให้เซลล์ที่เดิมเป็น
-    สูตร (เช่น 'รวมเงิน'/'ภาษีมูลค่าเพิ่ม 7%' ในไฟล์ใบเสนอราคาจริง) กลายเป็นค่าคงที่ถาวรทุกครั้งที่ดาวน์โหลด
-    ทั้งที่ไม่เคยถูกแก้เลย และทำให้ undo คืนสูตรกลับไม่ได้ (ดาวน์โหลดรอบถัดไปเขียนค่าคงที่ทับสูตรซ้ำอีก)
+    ใช้โดย get_working_copy() เท่านั้น (ตั้งแต่เปลี่ยนมาเก็บเป็นเวอร์ชันจริงแล้ว) สำหรับ migrate ไฟล์เก่าที่
+    สร้างก่อนระบบเวอร์ชันนี้: ไฟล์พวกนั้นมีการแก้ค้างเขียนทับ current_value ตรงๆ ใน EditableDocument.label_map
+    (ไม่เคยผ่าน DocumentVersion เลย) ตอนเข้าถึงครั้งแรกหลัง PR นี้ ต้องรู้ว่า label ไหนที่ "ถูกแก้จริง" ก่อน
+    มาสร้างเป็นเวอร์ชัน 1 (เขียนเฉพาะ label เหล่านั้นลงเซลล์ ไม่ใช่ทุก label — ไม่งั้นจะเขียนทับเซลล์สูตรที่ไม่
+    เคยถูกแก้เลยด้วยเช่นกัน)
 
     label ที่หาไม่เจอในค่าต้นฉบับ (ไม่ควรเกิดในทางปฏิบัติ — label_map มาจาก _extract_excel_labels ของไฟล์
     เดียวกันนี้ตั้งแต่ตอนอัปโหลด) ถือว่า "ต่าง" เสมอ (fail-safe เขียนไปก่อน ดีกว่าข้ามแล้วข้อมูลหาย)"""
@@ -5117,13 +5362,11 @@ def _filter_labels_actually_edited(original_bytes: bytes, label_map: dict) -> di
 
 @app.get("/api/excel-editor/{document_id}/download")
 def download_excel_editor_document(document_id: int, user_id: int = Depends(require_user)):
-    """คำนวณไฟล์ล่าสุดจาก original_bytes+label_map ปัจจุบันทุกครั้งที่เรียก (ไม่เก็บผลลัพธ์ไว้) ไม่แก้ไฟล์/
-    label_map เลย จึงเรียกซ้ำได้ปลอดภัย — เป็น GET ธรรมดาให้ลิงก์ในแชทกดดาวน์โหลดได้ตรงๆ (side effect เดียว
-    คือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ — idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)
-
-    เขียนทับเซลล์เฉพาะ label ที่ถูกแก้จริง (ดู _filter_labels_actually_edited) — label ที่ไม่ถูกแก้เลย
-    (รวมถึง label ที่เซลล์เดิมเป็นสูตรคำนวณ) ไม่ถูกแตะเลย ไฟล์ผลลัพธ์จึงยังมีสูตรเดิมอยู่ครบสำหรับ label
-    ที่ไม่เคยแก้ ไม่ว่าจะดาวน์โหลดซ้ำกี่ครั้งก็ตาม"""
+    """คืน bytes ของสำเนาทำงานล่าสุด (ดู get_working_copy) ตรงๆ — ไม่ประกอบไฟล์จาก label_map อีกต่อไป
+    (ต่างจากเดิม) เพราะ label_map ของทุกเวอร์ชันถูกคำนวณ+บันทึกไว้เป็น bytes จริงตั้งแต่ตอนแก้แล้ว (ดู
+    create_new_version/_build_document_version) ไม่มีเวอร์ชันเลย (ยังไม่เคยแก้) = bytes ต้นฉบับตรงๆ
+    เรียกซ้ำได้ปลอดภัยเสมอ ไม่แก้อะไรเลย (side effect เดียวคือตั้งไฟล์นี้เป็นไฟล์ที่กำลังโฟกัสของแชทนี้ —
+    idempotent เรียกซ้ำกี่ครั้งก็ได้ผลเหมือนเดิม)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
@@ -5131,30 +5374,8 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
-    labels_to_write = _filter_labels_actually_edited(doc["original_bytes"], doc["label_map"])
-
-    # ตรวจสอบให้ผ่านทุก label ที่ "จะเขียนจริง" ก่อน ค่อยเริ่มเขียนไฟล์ — กันเขียนไฟล์ไปครึ่งหนึ่งแล้วพังกลางคัน
-    resolved = {}
-    for label, info in labels_to_write.items():
-        ok, value, error = _coerce_value_for_cell(info["current_value"], info.get("number_format"))
-        if not ok:
-            raise HTTPException(
-                status_code=422,
-                detail=f"'{label}': {error} — กรุณาแก้ไขค่านี้ก่อนดาวน์โหลดอีกครั้ง",
-            )
-        resolved[label] = value
-
-    # ไม่ใช้ data_only=True กันสูตรที่ไม่ได้แตะถูกทับด้วยค่าตายตัว — ผ่าน helper นี้แทน load_workbook ตรงๆ
-    # เพื่อส่ง keep_vba=True อัตโนมัติถ้าไฟล์มีมาโคร กันมาโครหายตอน wb.save() ด้านล่าง
-    wb = _load_workbook_preserving_macros(doc["original_bytes"])
-    for label, info in labels_to_write.items():
-        ws = wb[info["sheet"]]
-        ws.cell(row=info["row"], column=info["col"], value=resolved[label])
-
-    buf = io.BytesIO()
-    wb.save(buf)
-    output_bytes = buf.getvalue()  # เช็คจากเนื้อไฟล์ที่ save ออกมาจริง ไม่ใช่เดาจากชื่อ/นามสกุลเดิม
-    buf.seek(0)
+    output_bytes, _ = get_working_copy(doc)
+    buf = io.BytesIO(output_bytes)
 
     has_macros = _is_macro_workbook(output_bytes)
     media_type = MACRO_ENABLED_MEDIA_TYPE if has_macros else XLSX_MEDIA_TYPE
