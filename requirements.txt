@@ -1,6 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi
 uvicorn
 anthropic
+torch==2.14.1+cpu
 sentence-transformers
 rank_bm25
 pythainlp
