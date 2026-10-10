@@ -10,6 +10,7 @@ import ast
 import io
 import os
 import re
+import json
 import zipfile
 import difflib
 import datetime
@@ -24,6 +25,7 @@ from openpyxl.cell.cell import MergedCell
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.workbook.properties import CalcProperties
 from pycel import ExcelCompiler
+from pythainlp.tokenize import word_tokenize
 
 MAIN_PY = Path(__file__).parent.parent / "main.py"
 DB_PY = Path(__file__).parent.parent / "db.py"
@@ -46,19 +48,23 @@ WANTED_MAIN_FUNCS = {
     "_table_has_non_formula_amount_value",
     "undo_last_edit",
     "_is_document_reading_question", "_has_legal_keyword", "_answer_document_reading_question",
+    "_is_structural_edit_command",
     "_has_explicit_finalize_word", "_is_confirm_command", "_is_cancel_command",
     "_is_pending_action_fresh", "_get_document_version_marker", "_execute_pending_action",
     "_label_position", "_find_label_by_position",
     "_get_active_chat_document", "execute_open_library_file", "_normalize_filename_for_matching",
+    "_match_and_apply_excel_edit", "_parse_json_response",
 }
 
 WANTED_MAIN_CONSTS = {
     "EXCEL_LABEL_SECTION_HEADING_LOOKBACK", "_ITEM_TABLE_HEADER_WORDS", "_ITEM_TABLE_COLUMN_MAP",
     "_ITEM_TABLE_STOP_PREFIXES", "_ITEM_TABLE_MAX_ROWS", "_ITEM_TABLE_EMPTY_STREAK_LIMIT",
     "FORMULA_RECALC_TIMEOUT_SECONDS", "_RATE_FORMULA_PATTERNS", "_PERCENT_IN_TEXT_RE", "_TABLE_INPUT_FIELDS",
-    "_DOCUMENT_READING_QUESTION_WORDS", "_LEGAL_KNOWLEDGE_KEYWORDS", "_FINALIZE_EXPLICIT_WORDS",
+    "_DOCUMENT_READING_QUESTION_WORDS", "_DOCUMENT_EDIT_COMMAND_WORDS", "_STRUCTURAL_ITEM_NO_RE",
+    "_LEGAL_KNOWLEDGE_KEYWORDS", "_FINALIZE_EXPLICIT_WORDS",
     "_CONFIRM_COMMAND_TEXTS", "_CANCEL_COMMAND_TEXTS", "PENDING_ACTION_TTL_SECONDS",
     "_LABEL_TRAILING_PUNCTUATION", "_TABLE_NON_FORMULA_AMOUNT_ERROR",
+    "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
 }
 
 WANTED_DB_FUNCS = {"_is_macro_workbook"}
@@ -206,16 +212,20 @@ class _FakeAnthropicMessages:
 
     def create(self, **kwargs):
         self._client.last_call_kwargs = kwargs
+        if self._client.raise_on_create is not None:
+            raise self._client.raise_on_create
         return _FakeAnthropicResponse(self._client.response_text)
 
 
 class _FakeAnthropicClient:
     """ตัวแทน anthropic.Client — คืนข้อความคงที่ (ตั้งค่าได้) เสมอ ไม่เรียก API จริงเลย เก็บ kwargs ของการเรียก
-    ล่าสุดไว้ด้วย (last_call_kwargs) ให้เทสต์ตรวจสอบได้ว่าส่ง system/messages อะไรเข้าไป"""
+    ล่าสุดไว้ด้วย (last_call_kwargs) ให้เทสต์ตรวจสอบได้ว่าส่ง system/messages อะไรเข้าไป ตั้ง raise_on_create
+    เป็น Exception instance เพื่อจำลอง API ล้ม/timeout ได้"""
 
     def __init__(self, response_text: str = "คำตอบจำลองจาก LLM"):
         self.response_text = response_text
         self.last_call_kwargs = None
+        self.raise_on_create: Exception | None = None
         self.messages = _FakeAnthropicMessages(self)
 
 
@@ -246,10 +256,11 @@ def build_namespace() -> dict:
     fake_client = _FakeAnthropicClient()
 
     ns = {
-        "io": io, "os": os, "re": re, "zipfile": zipfile, "difflib": difflib, "datetime": datetime,
+        "io": io, "os": os, "re": re, "json": json, "zipfile": zipfile, "difflib": difflib, "datetime": datetime,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
+        "word_tokenize": word_tokenize,
         "client": fake_client,
         "StorageNotConfiguredError": StorageNotConfiguredError,
         "get_editable_document_raw": fake_db.get_editable_document_raw,

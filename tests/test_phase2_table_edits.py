@@ -329,3 +329,59 @@ def test_add_rejected_when_amount_not_formula(ns):
     result = ns["propose_add_table_item"](4, 1, 1, {"description": "New", "qty": 1, "unit": "ชิ้น", "unit_price": 1})
     assert result["proposed"] is False
     assert result["message"] == ns["_TABLE_NON_FORMULA_AMOUNT_ERROR"]
+
+
+# ---------- Review fix: โครงสร้างต้องไปทาง agent ไม่ใช่ _match_and_apply_excel_edit ----------
+
+@pytest.mark.parametrize("query", [
+    "เปลี่ยน VAT เป็น 10%",
+    "เปลี่ยนอัตราภาษีเป็น 10 เปอร์เซ็นต์",
+])
+def test_structural_command_detects_rate_change_wording(ns, query):
+    assert ns["_is_structural_edit_command"](query) is True
+
+
+@pytest.mark.parametrize("query", [
+    "ลบรายการที่ 3",
+    "เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท",
+])
+def test_structural_command_detects_table_item_wording(ns, query):
+    assert ns["_is_structural_edit_command"](query) is True
+
+
+def test_edit_command_with_question_word_is_not_reading_question(ns):
+    # มี "แก้" (คำสั่งแก้) ปนกับ "ไหม" (คำเชิงคำถาม) — ต้องไม่ใช่ reading question เด็ดขาด
+    assert ns["_is_document_reading_question"]("แก้ชื่อลูกค้าเป็น บริษัท ดูดี จำกัด ได้ไหม") is False
+
+
+def test_match_and_apply_excel_edit_refuses_percent_on_formula_cell(ns, doc1):
+    """safety net: เซลล์เป้าหมายเป็นสูตร + ค่าใหม่มี "%" -> ห้ามเขียนทับ ต้องบอกให้ใช้ change_rate แทน"""
+    ns["_fake_client"].response_text = '{"matched": true, "label": "ภาษีมูลค่าเพิ่ม 7%", "new_value": "10%"}'
+    result = ns["_match_and_apply_excel_edit"](1, 1, "เปลี่ยน VAT เป็น 10%")
+    assert result["matched"] is False
+    assert "change_rate" in result["message"] or "เปลี่ยนอัตรา" in result["message"]
+
+    # ไม่มีเวอร์ชันใหม่ถูกสร้างเลย (ไม่ได้แก้จริง) สูตรเดิมยังอยู่ในสำเนาต้นฉบับ
+    assert ns["_fake_db"].versions.get(1, []) == []
+    vat_info = doc1["label_map"]["ภาษีมูลค่าเพิ่ม 7%"]
+    wb_raw = openpyxl.load_workbook(io.BytesIO(doc1["original_bytes"]), data_only=False)
+    cell_value = wb_raw[vat_info["sheet"]].cell(row=vat_info["row"], column=vat_info["col"]).value
+    assert isinstance(cell_value, str) and cell_value.startswith("=")
+
+
+def test_match_and_apply_excel_edit_still_works_for_plain_values(ns, doc1):
+    """ยืนยันว่า safety net ไม่กระทบการแก้ค่าปกติ (ไม่ใช่สูตร หรือไม่มี "%" ในค่าใหม่)"""
+    ns["_fake_client"].response_text = '{"matched": true, "label": "รวมเงิน", "new_value": "99999"}'
+    result = ns["_match_and_apply_excel_edit"](1, 1, "เปลี่ยนรวมเงินเป็น 99999")
+    assert result["matched"] is True
+
+
+def test_document_reading_question_fallback_when_client_fails(ns, doc1):
+    """client.messages.create ล้ม -> ตอบ _format_document_values_text(data) ตรงๆ แทน ไม่ raise ออกไป"""
+    ns["_fake_client"].raise_on_create = RuntimeError("simulated API failure")
+    active_docs = [doc1]
+    answer, used_doc_id = ns["_answer_document_reading_question"]("มีรายการอะไรบ้าง", active_docs, 1, 1)
+    assert used_doc_id == 1
+
+    expected = ns["_format_document_values_text"](ns["read_document_values"](doc1))
+    assert answer == expected

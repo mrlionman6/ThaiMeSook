@@ -1834,7 +1834,12 @@ def _is_undo_command(query: str) -> bool:
 # คำที่บ่งบอกว่าข้อความนี้เป็นคำถามเกี่ยวกับเนื้อหาไฟล์ ไม่ใช่คำสั่งแก้/จบงาน — ใช้ดักก่อนส่งเข้า
 # _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close เท่านั้น ไม่มีหมวด "ถาม") ดู
 # docstring ของ _is_document_reading_question
-_DOCUMENT_READING_QUESTION_WORDS = ("อะไร", "เท่าไร", "บ้าง", "ไหม", "กี่", "แสดง", "ดู", "สรุป")
+# "ดู" ไม่อยู่ในชุดนี้โดยตั้งใจ — เช็คแยกต่างหากใน _is_document_reading_question (ต้องเป็นคำขึ้นต้นหรือ
+# "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring เช่น "ดูดี" ในชื่อบริษัท)
+_DOCUMENT_READING_QUESTION_WORDS = ("อะไร", "เท่าไร", "บ้าง", "ไหม", "กี่", "แสดง", "สรุป")
+
+
+_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน")
 
 
 def _is_document_reading_question(query: str) -> bool:
@@ -1843,8 +1848,21 @@ def _is_document_reading_question(query: str) -> bool:
     เหตุการณ์จริงที่แก้: _classify_excel_editor_intent มีแค่ 4 หมวด (edit/finalize/compare/close) ไม่มีหมวด
     "ถาม" เลย คำถามแบบนี้เคยถูกเดาเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งหาค่าใหม่ที่จะแก้ไม่เจอ
     ตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ — คำถามแบบนี้ควรปล่อยผ่าน flow ปกติ
-    (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เองแทน"""
-    return "?" in query or any(word in query for word in _DOCUMENT_READING_QUESTION_WORDS)
+    (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เองแทน
+
+    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำเชิงคำถามปน
+    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มี "ไหม" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถาม
+    อ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี
+    "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
+    stripped = query.strip()
+    if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
+        return False
+    if "?" in stripped or any(word in stripped for word in _DOCUMENT_READING_QUESTION_WORDS):
+        return True
+    if "ขอดู" in stripped or "ดูรายการ" in stripped:
+        return True
+    tokens = word_tokenize(stripped, engine="newmm")
+    return bool(tokens) and tokens[0] == "ดู"
 
 
 # คำที่บ่งบอกว่าคำถามนี้เป็นคำถามเชิงความรู้กฎหมาย/ธุรกิจ (ต้องไปทาง RAG/ฐานความรู้) ไม่ใช่คำถามเรื่องเนื้อหา
@@ -1858,6 +1876,33 @@ def _has_legal_keyword(query: str) -> bool:
     เนื้อหาไฟล์ (ตอบด้วย read_document_values ตรงๆ ไม่ผ่าน RAG) ออกจากคำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา
     ด้วย (เช่น "ธุรกิจบัญชีสามมีอะไรบ้าง" ต้องไปทาง RAG ไม่ใช่ไปอ่านไฟล์)"""
     return any(kw in query.lower() for kw in _LEGAL_KNOWLEDGE_KEYWORDS)
+
+
+# regex จับ "รายการที่ N" (เช่น "รายการที่ 3") — ส่วนหนึ่งของ _is_structural_edit_command ด้านล่าง
+_STRUCTURAL_ITEM_NO_RE = re.compile(r"รายการที่\s*\d+")
+
+
+def _is_structural_edit_command(query: str) -> bool:
+    """ด่านกันด้วยโค้ด (ก่อนเรียก _classify_excel_editor_intent/_route_multi_file_instruction เสมอ ไม่พึ่ง LLM
+    อย่างเดียว) เช็คว่าข้อความนี้ดูเหมือนคำสั่งแก้โครงสร้างไฟล์ (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ไหม — ถ้าใช่
+    ให้ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/
+    delete_table_item/add_table_item) โดยไม่ต้องผ่าน classifier เลย ประหยัด API call และกันพลาด
+
+    เหตุการณ์จริงที่แก้: "เปลี่ยน VAT เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียว
+    เปิดอยู่ ถูก _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียน
+    ค่าทับเซลล์สูตรตรงๆ ได้ (สูตร VAT กลายเป็นค่าคงที่ถาวร) โดยไม่มี preview/ยืนยันเลย — ตัวจับคู่ label:value
+    แบบนั้นไม่รู้จักแนวคิด "เปลี่ยนอัตรา"/"ลบ-เพิ่มรายการในตาราง" เลยสักนิด
+
+    นี่เป็นแค่ชั้นกรองหยาบๆ จับเคสที่ชัดเจนเท่านั้น (มี "%"/"อัตรา", พิมพ์ "รายการที่ N" ตรงๆ, หรือมีทั้งคำว่า
+    "ลบ"/"เพิ่ม" และ "รายการ") เคสที่กำกวมกว่านี้ (เช่น "เปลี่ยน Box 4x4 เป็น 7x7" ไม่มีคำไหนในนี้เลย) ยังต้องพึ่ง
+    intent "structural" จาก classifier (LLM) แทน — ดู EXCEL_EDITOR_INTENT_SYSTEM_PROMPT"""
+    if "%" in query or "อัตรา" in query:
+        return True
+    if _STRUCTURAL_ITEM_NO_RE.search(query):
+        return True
+    if ("ลบ" in query or "เพิ่ม" in query) and "รายการ" in query:
+        return True
+    return False
 
 
 def _answer_document_reading_question(query: str, active_docs: list, user_id: int, chat_id: int) -> tuple[str, Optional[int]]:
@@ -1879,17 +1924,24 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
     data = read_document_values(target_doc)
     tool_text = _format_document_values_text(data)
 
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=800,
-        system=(
-            "คุณจะได้รับค่าปัจจุบันของไฟล์ Excel (จัดรูปจากโค้ดแล้ว ถูกต้องเป๊ะ ไม่ต้องคำนวณซ้ำ) และคำถามของ"
-            "ผู้ใช้ ตอบคำถามโดยใช้ข้อมูลนี้เท่านั้น ห้ามใช้ความรู้อื่นใดๆ นอกเหนือจากนี้ ห้ามคำนวณหรือเดาค่าเอง "
-            "ถ้าข้อมูลที่ให้มาไม่พอตอบคำถาม ให้บอกตรงๆ ว่าไม่มีข้อมูลนี้ในไฟล์ ตอบเป็นภาษาไทย ลงท้ายด้วย \"ครับ\""
-        ),
-        messages=[{"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"}],
-    )
-    return response.content[0].text.strip(), target_doc["id"]
+    # ถ้าเรียก Claude จัดรูปคำตอบล้ม (เช่น API ล่ม/timeout) ให้ตอบ tool_text ที่โค้ดจัดไว้แล้วตรงๆ แทน — ข้อมูล
+    # ยังถูกต้องครบถ้วนเป๊ะเหมือนเดิม (มาจาก read_document_values ตรงๆ) แค่ไม่ได้เรียบเรียงเป็นประโยคให้สวยงาม
+    # เท่านั้น ดีกว่าโยน error ทั้งที่ข้อมูลที่ต้องการตอบมีอยู่ในมือแล้ว
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            system=(
+                "คุณจะได้รับค่าปัจจุบันของไฟล์ Excel (จัดรูปจากโค้ดแล้ว ถูกต้องเป๊ะ ไม่ต้องคำนวณซ้ำ) และคำถามของ"
+                "ผู้ใช้ ตอบคำถามโดยใช้ข้อมูลนี้เท่านั้น ห้ามใช้ความรู้อื่นใดๆ นอกเหนือจากนี้ ห้ามคำนวณหรือเดาค่าเอง "
+                "ถ้าข้อมูลที่ให้มาไม่พอตอบคำถาม ให้บอกตรงๆ ว่าไม่มีข้อมูลนี้ในไฟล์ ตอบเป็นภาษาไทย ลงท้ายด้วย \"ครับ\""
+            ),
+            messages=[{"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"}],
+        )
+        return response.content[0].text.strip(), target_doc["id"]
+    except Exception as e:
+        print(f"[DocumentReadingQuestion] format_failed exception_type={type(e).__name__}")
+        return tool_text, target_doc["id"]
 
 
 # คำที่ถือเป็น "ขอไฟล์ชัดเจน" เท่านั้นที่ยอม finalize (ส่งลิงก์ดาวน์โหลด) — ดู docstring ของ
@@ -3486,11 +3538,27 @@ async def ask_question(
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
 
-        if len(active_docs) == 1 and not reading_question:
+        # ด่านกันด้วยโค้ดก่อนเรียก classifier เลย (ไม่พึ่ง LLM อย่างเดียว) — เหตุการณ์จริงที่แก้: "เปลี่ยน VAT
+        # เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียวเปิดอยู่ ถูก
+        # _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียนค่า
+        # ทับเซลล์สูตรตรงๆ (สูตร VAT กลายเป็นค่าคงที่) โดยไม่มี preview/ยืนยันเลย ดู _is_structural_edit_command
+        structural_command = bool(active_docs) and _is_structural_edit_command(query)
+        if structural_command:
+            focus_doc = get_chat_document_focus(chat_id, user_id)
+            log_doc_id = focus_doc["id"] if focus_doc else (active_docs[0]["id"] if len(active_docs) == 1 else None)
+            print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
+
+        if len(active_docs) == 1 and not reading_question and not structural_command:
             editable_doc = active_docs[0]
             print(f"[Route] chat={chat_id} branch=single_doc_classifier active_doc={editable_doc['id']}")
             _, editable_doc_label_map = get_working_copy(editable_doc)
             intent = _classify_excel_editor_intent(editable_doc_label_map, query)
+
+            if intent == "structural":
+                print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={editable_doc['id']}")
+                # ไม่ return ที่นี่ (เหมือน unrelated) ปล่อยให้ตกไปทำงาน flow ปกติด้านล่าง (rag_answer ->
+                # run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+                # add_table_item รองรับอยู่แล้ว)
 
             if intent == "edit":
                 result = _match_and_apply_excel_edit(editable_doc["id"], user_id, query)
@@ -3542,7 +3610,7 @@ async def ask_question(
 
             # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
 
-        elif len(active_docs) >= 2 and not reading_question:
+        elif len(active_docs) >= 2 and not reading_question and not structural_command:
             print(f"[Route] chat={chat_id} branch=multi_doc_classifier active_doc=None")
             valid_ids = {doc["id"] for doc in active_docs}
             docs_by_id = {doc["id"]: doc for doc in active_docs}
@@ -3563,6 +3631,13 @@ async def ask_question(
                 code_matched_document_id=code_matched_document_id,
             )
             action = route.get("action")
+
+            if action == "structural":
+                log_doc_id = code_matched_document_id or route.get("document_id")
+                print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
+                # ไม่ return ที่นี่ (เหมือน unrelated) ปล่อยให้ตกไปทำงาน flow ปกติด้านล่าง (rag_answer ->
+                # run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+                # add_table_item รองรับอยู่แล้ว)
 
             if action == "edit":
                 # โค้ดจับคู่ชื่อไฟล์ได้ชัดเจนแล้ว ใช้ตรงนี้เสมอ (authoritative กว่า LLM) ไม่งั้นค่อยใช้ของตัวจัดเส้นทาง
@@ -5470,8 +5545,13 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในบทสนทนานี้เกี่ยวข้องกับการแก้ไฟล์ Excel ที่กำลังทำอยู่หรือไม่ "
     "ผู้ใช้กำลังแก้ไฟล์ excel อยู่ โดยมี label ที่แก้ได้ในไฟล์นี้ (JSON) ให้ดูประกอบการตัดสินใจ\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
-    '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "unrelated"}\n\n'
-    "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
+    '{"intent": "edit" หรือ "structural" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "unrelated"}\n\n'
+    "- edit: ผู้ใช้กำลังสั่งแก้ค่าของช่อง (label) เดียวตรงๆ ให้เป็นค่าใหม่ค่าหนึ่ง (เช่น แก้ชื่อลูกค้า แก้วันที่)\n"
+    "- structural: คำสั่งเปลี่ยนโครงสร้างของไฟล์ ไม่ใช่แค่แก้ค่าช่องเดียว ได้แก่ (ก) เปลี่ยนอัตรา/เปอร์เซ็นต์ "
+    "ที่เป็นสูตรคำนวณ เช่น \"เปลี่ยน VAT เป็น 10%\" (ข) ลบหรือเพิ่มรายการในตารางรายการ เช่น \"ลบรายการที่ 3\", "
+    "\"เพิ่มรายการ Box 2x2\" (ค) แก้ค่าของรายการที่มีอยู่แล้วในตารางรายการ (ชื่อสินค้า/จำนวน/ราคา/หน่วย) เช่น "
+    "\"เปลี่ยน Box 4x4 เป็น 7x7\" ถ้าไม่แน่ใจว่าเป็น edit ธรรมดาหรือ structural แต่คำสั่งพูดถึงอัตรา/เปอร์เซ็นต์/"
+    "รายการในตาราง ให้ตอบ structural ไว้ก่อนเสมอ (ปลอดภัยกว่า — ไม่ทับสูตรเงียบๆ)\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้)\n"
     "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่นที่ 'แนบเข้ามาในแชทแล้ว' เท่านั้น (ไม่ใช่ไฟล์จากคลังเอกสารที่ยังไม่ได้เปิด)\n"
     "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์นี้ไปเลย ไม่เอาไฟล์นี้ในแชทอีกต่อไป (เช่น \"เลิกใช้ไฟล์นี้\", "
@@ -5484,8 +5564,11 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
 
 def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     """ตัดสินใจว่าข้อความล่าสุด (ไม่มีไฟล์แนบ) ในแชทที่มี EditableDocument ผูกอยู่ เกี่ยวกับการแก้ไฟล์
-    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'finalize' | 'compare' | 'unrelated' เสมอ — parse ไม่ได้ถือว่า
-    'unrelated' (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้ตั้งใจ)"""
+    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'structural' | 'finalize' | 'compare' | 'close' | 'unrelated' เสมอ —
+    parse ไม่ได้ถือว่า 'unrelated' (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้
+    ตั้งใจ) 'structural' เช่นเดียวกับ 'unrelated' ไม่ถูกจัดการใน branch ของฟังก์ชันนี้เลย (ดู ask_question) —
+    ปล่อยให้ตกไปที่ run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+    add_table_item รองรับอยู่แล้ว (ดูเหตุผลใน docstring ของ _is_structural_edit_command)"""
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
         f"ข้อความล่าสุดของผู้ใช้: {query}"
@@ -5498,7 +5581,8 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     intent = (parsed or {}).get("intent")
-    return intent if intent in ("edit", "finalize", "compare", "close", "unrelated") else "unrelated"
+    valid_intents = ("edit", "structural", "finalize", "compare", "close", "unrelated")
+    return intent if intent in valid_intents else "unrelated"
 
 
 EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
@@ -5506,16 +5590,22 @@ EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON) "
     "ไฟล์ที่กำลังโฟกัสอยู่ล่าสุด (ถ้ามี) และข้อความ 4 เทิร์นล่าสุดในบทสนทนานี้ (ถ้ามี)\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
-    '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "clarify" หรือ "unrelated", '
-    '"document_id": <เลข document_id ถ้า action เป็น edit, finalize หรือ close ไม่งั้นใส่ null>, '
+    '{"action": "edit" หรือ "structural" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "clarify" หรือ '
+    '"unrelated", '
+    '"document_id": <เลข document_id ถ้า action เป็น edit, structural, finalize หรือ close ไม่งั้นใส่ null>, '
     '"document_id_a": <เลข document_id ไฟล์แรกถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"document_id_b": <เลข document_id ไฟล์ที่สองถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
-    "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
+    "- edit: คำสั่งแก้ค่าของช่อง (label) เดียวตรงๆ ให้เป็นค่าใหม่ค่าหนึ่ง ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
     "ตัดสินใจว่าเป็นไฟล์ไหนตามลำดับนี้: 1) เอ่ยชื่อไฟล์หรือ label ที่ตรงกับไฟล์เดียวในรายการชัดเจน ให้ใช้ไฟล์นั้น "
     "2) ถ้าไม่ได้ระบุไฟล์เลยแต่มีไฟล์ที่กำลังโฟกัสอยู่ ให้ใช้ไฟล์ที่โฟกัส 3) ถ้าคำสั่งอ้างอิงบทสนทนาก่อนหน้า "
     "(เช่น 'ไฟล์ที่แก้ไปเมื่อกี้') ให้ดูจากข้อความล่าสุดหรือไฟล์โฟกัสประกอบกัน ถ้ายังกำกวมจริงๆ (ไม่มีโฟกัสและ "
     "ตัดสินไม่ได้จากขั้นตอนข้างต้นเลย) ให้ตอบ clarify แทน ห้ามเดา\n"
+    "- structural: คำสั่งเปลี่ยนโครงสร้างของไฟล์ ไม่ใช่แค่แก้ค่าช่องเดียว ได้แก่ (ก) เปลี่ยนอัตรา/เปอร์เซ็นต์ที่"
+    "เป็นสูตรคำนวณ เช่น \"เปลี่ยน VAT เป็น 10%\" (ข) ลบหรือเพิ่มรายการในตารางรายการ เช่น \"ลบรายการที่ 3\" (ค) "
+    "แก้ค่าของรายการที่มีอยู่แล้วในตารางรายการ (ชื่อสินค้า/จำนวน/ราคา/หน่วย) ต้องระบุ document_id ด้วยลำดับ"
+    "เดียวกับ edit ถ้าไม่แน่ใจว่าเป็น edit ธรรมดาหรือ structural แต่คำสั่งพูดถึงอัตรา/เปอร์เซ็นต์/รายการในตาราง "
+    "ให้ตอบ structural ไว้ก่อนเสมอ (ปลอดภัยกว่า — ไม่ทับสูตรเงียบๆ)\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้ "
     "เฉพาะไฟล์ในรายการนี้) ตัดสินใจว่าเป็นไฟล์ไหนด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ\n"
     "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์ใดไฟล์หนึ่งในรายการนี้ไปเลย ไม่เอาไฟล์นั้นในแชทอีกต่อไป "
@@ -5582,7 +5672,8 @@ def _route_multi_file_instruction(
         messages=[{"role": "user", "content": prompt}],
     )
     parsed = _parse_json_response(response.content[0].text, dict)
-    if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "close", "clarify", "unrelated"):
+    valid_actions = ("edit", "structural", "finalize", "compare", "close", "clarify", "unrelated")
+    if parsed is None or parsed.get("action") not in valid_actions:
         return {"action": "clarify", "document_id": None, "document_id_a": None, "document_id_b": None, "message": None}
     return {
         "action": parsed.get("action"),
@@ -6812,6 +6903,17 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
     # ต่อท้ายข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรในเวอร์ชันใหม่ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะ
     # ย้อนการแก้กลับไปเวอร์ชันก่อนหน้า)
     was_formula = _is_label_cell_formula(base_bytes, target_info)
+
+    # ด่านป้องกันสุดท้าย (safety net) — ถ้าเซลล์เป้าหมายเป็นสูตรคำนวณอยู่แล้ว และค่าใหม่ที่จะเขียนมี "%" ปนมา
+    # (ดูเหมือนคำสั่งเปลี่ยนอัตรา เช่น "10%") ห้ามเขียนทับเงียบๆ เด็ดขาด ต้องใช้ change_rate แทน (ซึ่งมี preview/
+    # ยืนยันและปรับเฉพาะตัวเลขอัตราในสูตรจริงๆ ไม่ใช่ทับทั้งเซลล์เป็นค่าคงที่) — กันเคสหลุดจากด่านกรองโค้ด/
+    # classifier ชั้นก่อนหน้า (_is_structural_edit_command / intent="structural") มาถึงจุดนี้โดยบังเอิญ
+    if was_formula and isinstance(new_value, str) and "%" in new_value:
+        return {
+            "matched": False,
+            "message": f"'{label}' เป็นสูตรคำนวณอัตราอยู่ กรุณาใช้คำสั่งเปลี่ยนอัตราแทน (change_rate) ครับ",
+        }
+
     old_value = target_info["current_value"]
 
     def _apply_edit(wb):
