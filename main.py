@@ -630,6 +630,7 @@ LIBRARY_TOOLS = [
 _LIBRARY_QUERY_STOPWORDS = {
     "เปิด", "ดู", "อ่าน", "ไฟล์", "ของ", "ด้วย", "และ", "ให้", "หน่อย", "ขอ", "แล้ว", "เปรียบเทียบ", "แก้",
     "ปิด", "ใช้", "ลบ", "เลิก",
+    "ใน", "ที่", "ได้", "ทำ", "จะ", "เป็น", "มี",
 }
 
 # วรรณยุกต์ไทย (่ ้ ๊ ๋) และไม้ไต่คู้ (็) — ตัดออกก่อนเทียบกันคีย์คำค้นหา/ชื่อไฟล์ต่างกันแค่พิมพ์ผิดวรรณยุกต์
@@ -1671,6 +1672,12 @@ def _is_undo_command(query: str) -> bool:
 
 _OPEN_COMMAND_PREFIXES = ("เปิดไฟล์", "เปิด")  # "เปิดไฟล์" ก่อนเสมอ (ยาวกว่า เฉพาะเจาะจงกว่า) ค่อย "เปิด" เฉยๆ
 _OPEN_COMMAND_MULTI_STEP_WORDS = ("แล้ว", "และ", "กับ", "เปรียบเทียบ", "แก้", "ด้วย")
+# คำ/เครื่องหมายที่บ่งบอกว่าข้อความนี้เป็น "คำถาม" ไม่ใช่คำสั่งเปิดไฟล์ — เหตุการณ์จริงที่แก้: "เปิดบริษัทต่างชาติ
+# ในไทยต้องทำอะไรบ้าง" ขึ้นต้นด้วย "เปิด" (พูดถึงการเปิดบริษัท ไม่ใช่เปิดไฟล์) แต่ถูกทางลัดนี้ดักไปค้นคลังเอกสาร
+# แล้วได้รายการไฟล์มาแทนที่จะตอบคำถามจริงๆ
+_OPEN_COMMAND_QUESTION_WORDS = (
+    "อะไร", "ไหม", "มั้ย", "อย่างไร", "ยังไง", "บ้าง", "ต้อง", "เท่าไร", "เท่าไหร่", "หรือไม่", "ทำไม", "เมื่อไร",
+)
 
 
 def parse_open_command(text: str) -> Optional[str]:
@@ -1679,9 +1686,11 @@ def parse_open_command(text: str) -> Optional[str]:
     เอง (เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์ "เปิดใบประเมินป่าไม้เขียว" Claude ตอบว่าเปิดไฟล์แล้วทั้งที่ไม่ได้เรียก
     tool เลยสักครั้ง — ไม่มี log ยืนยัน แผงด้านขวาว่างเปล่า)
 
-    ปฏิเสธ (คืน None) สองกรณี:
+    ปฏิเสธ (คืน None) สามกรณี:
     - ส่วนที่เหลือมีคำบ่งบอกคำสั่งหลายขั้นตอนปนมา (_OPEN_COMMAND_MULTI_STEP_WORDS เช่น "แล้ว"/"เปรียบเทียบ")
       เช่น "เปิด A แล้วเปรียบเทียบกับ B" — ปล่อยให้ Claude จัดการทั้งหมดเองแทน ไม่เดาเฉพาะส่วนเปิด
+    - ส่วนที่เหลือมีคำบอกคำถามปนมา (_OPEN_COMMAND_QUESTION_WORDS) หรือมีเครื่องหมาย "?" — ข้อความนี้เป็นคำถาม
+      ไม่ใช่คำสั่งเปิดไฟล์ (เหตุการณ์จริง: "เปิดบริษัทต่างชาติในไทยต้องทำอะไรบ้าง" ไม่ใช่คำสั่งเปิดไฟล์เลย)
     - ส่วนที่เหลือ parse_list_selection() อ่านเป็นการเลือกข้อได้ (เช่น "เปิดข้อ 2") — ไม่ใช่คำสั่งเปิดไฟล์ด้วย
       ชื่อ แต่เป็นการเลือกจากรายการค้างอยู่ ซึ่งมีทางลัดของตัวเองทำงานก่อนฟังก์ชันนี้อยู่แล้วเสมอใน ask_question()
       (กันไว้สองชั้นเผื่อฟังก์ชันนี้ถูกเรียกจากที่อื่นในอนาคต)
@@ -1703,10 +1712,34 @@ def parse_open_command(text: str) -> Optional[str]:
     if any(word in remainder for word in _OPEN_COMMAND_MULTI_STEP_WORDS):
         return None
 
+    if "?" in remainder or any(word in remainder for word in _OPEN_COMMAND_QUESTION_WORDS):
+        return None
+
     if parse_list_selection(remainder, item_count=1) is not None:
         return None
 
     return remainder
+
+
+OPEN_SHORTCUT_MIN_MATCH_RATIO = 0.6  # ไฟล์ที่ชนะต้องมีคำตรงกับคำค้นอย่างน้อยสัดส่วนนี้ ไม่งั้นปล่อยไปทาง AI แทน
+
+
+def _open_shortcut_match_ratio(query_text: str, document: dict) -> float:
+    """คำนวณสัดส่วนคำค้น (หลังตัดคำทั่วไปด้วย _tokenize_library_query) ที่ "ตรง" กับไฟล์ที่ search_library_files
+    ตัดสินว่าชนะ (ใช้สูตรเทียบเดียวกับที่ search_library_files ใช้ตัดสินใจอยู่แล้ว: filename+folder+
+    customer_name+project_name+document_no หลัง normalize) ใช้เฉพาะในทางลัดเปิดไฟล์ด้วยโค้ดของ ask_question()
+    เป็นเกณฑ์เพิ่มเติมเท่านั้น (ไม่แก้ตรรกะการเลือกไฟล์ใน search_library_files/execute_open_library_file ของ
+    AI เองเลย) กันเคสที่ชนะเพราะคะแนนสูงสุดในกลุ่มที่คะแนนต่ำทั้งหมด (เช่น "เปิดร้านกาแฟ" ไม่ควรเปิดไฟล์ไหนเลย
+    ทั้งที่อาจมีคำบางคำไปตรงกับไฟล์ใดไฟล์หนึ่งโดยบังเอิญ) คืน 0.0 ถ้าไม่มีคำให้เทียบเลย (กันหารด้วยศูนย์)"""
+    tokens = _tokenize_library_query(query_text)
+    if not tokens:
+        return 0.0
+    haystack = _normalize_library_search_text(" ".join([
+        document["filename"], document["folder"], document["customer_name"] or "",
+        document["project_name"] or "", document["document_no"] or "",
+    ]))
+    score = sum(1 for tok in tokens if tok in haystack)
+    return score / len(tokens)
 
 
 _CLOSE_COMMAND_PREFIXES_ATTACHED_OK = ("ปิดไฟล์",)  # ชื่อไฟล์ต่อท้ายได้เลยไม่ต้องมีช่องว่าง เช่น "ปิดไฟล์ป่าไม้เขียว"
@@ -2851,6 +2884,20 @@ async def ask_question(
 ):
     user_id = get_active_user_id(request)
 
+    # สร้างแชทใหม่ตรงนี้เลยถ้าเป็นข้อความแรกสุด (ยังไม่มี chat_id มา) และไม่มีภาพแนบมา — ย้ายมาจากเดิมที่อยู่
+    # หลังสุด (ก่อนเรียก rag_answer) เพราะทางลัดทั้งหมดด้านล่าง (เลือกข้อ/ย้อน/ปิด/เปิด) เช็ค
+    # "if user_id and chat_id and ..." ทุกตัว ถ้า chat_id ยังเป็น None (ข้อความแรกสุดของแชทใหม่) ทางลัดทั้งหมด
+    # จะถูกข้ามไปหมดเสมอ (บั๊กจริงที่เจอ: "เปิดใบประเมินป่าไม้เขียว" เป็นข้อความแรกของแชทใหม่ไม่เข้าทางลัดเปิดไฟล์
+    # ทั้งที่ข้อความเดียวกันในแชทที่มีอยู่แล้วทำงานถูกต้อง) ใช้วิธีตั้งชื่อแชทเดิมทุกประการ (ตัดเหลือ 50 ตัวอักษร
+    # ว่างเปล่า -> "แชทใหม่") แค่ใช้ query ตรงๆ แทน saved_query เพราะยังไม่มีภาพแนบในเคสนี้ (image is None) ค่า
+    # จะเหมือนกันเป๊ะอยู่แล้ว (_build_saved_query คืน query ตรงๆ เมื่อไม่มีภาพ) ไม่ต้องรอ _parse_and_validate_ask_input
+    # ตรวจสอบภาพก่อน (เคสนี้ไม่มีภาพอยู่แล้ว) ข้อความที่มีภาพแนบมาไม่เข้าทางลัดไหนเลยสักอัน (ทุกทางลัดเช็ค
+    # image is None) จึงปล่อยให้สร้างแชททีหลังตามโค้ดเดิมด้านล่าง (หลัง _parse_and_validate_ask_input ตรวจสอบ
+    # ภาพผ่านแล้ว) เหมือนเดิมทุกประการ กันสร้างแชทค้างไว้ถ้าภาพถูกปฏิเสธ/อ่านไม่ได้ทีหลัง
+    if user_id and chat_id is None and image is None and query.strip():
+        title = query.strip()[:50] or "แชทใหม่"
+        chat_id = create_chat_session(user_id, title=title)
+
     # ทางลัดการเลือกจากรายการค้างอยู่ด้วยโค้ดล้วนๆ (ก่อน branch Excel editor ด้านล่าง และก่อนเรียก AI เสมอ) —
     # ถ้ารายการล่าสุดถูกแสดงไปในเทิร์นผู้ช่วยที่เพิ่งจบพอดี (is_listing_fresh) และข้อความผู้ใช้เป็นการเลือก
     # ล้วนๆ (parse_list_selection ไม่ใช่ None) ให้เรียก select_list_item ตรงๆ ไม่ต้องเรียก AI ไม่ต้องค้นฐาน
@@ -2885,6 +2932,15 @@ async def ask_question(
         if open_remainder is not None:
             search_result = search_library_files(text=open_remainder)
             matched_files = search_result["files"]
+
+            # ไฟล์ที่ชนะต้องตรงกับคำค้นอย่างน้อย OPEN_SHORTCUT_MIN_MATCH_RATIO ของจำนวนคำ (หลังตัดคำทั่วไป)
+            # ไม่งั้นปล่อยไปทาง AI เหมือนไม่พบไฟล์เลย (เกณฑ์นี้ใช้เฉพาะทางลัดนี้ ไม่แก้ตรรกะของ
+            # search_library_files/execute_open_library_file เอง) — เหตุการณ์จริงที่กัน: "เปิดร้านกาแฟ" ไม่ควร
+            # ถูกตีความเป็นคำสั่งเปิดไฟล์ทั้งที่อาจมีคำบางคำไปตรงกับไฟล์ใดไฟล์หนึ่งโดยบังเอิญ ไฟล์ที่เสมอกันทุกไฟล์
+            # มีคะแนนเท่ากันอยู่แล้ว (search_library_files คัดเฉพาะกลุ่มคะแนนสูงสุด) เช็คจากไฟล์แรกพอ
+            if matched_files and _open_shortcut_match_ratio(open_remainder, matched_files[0]) < OPEN_SHORTCUT_MIN_MATCH_RATIO:
+                matched_files = []
+
             answer = None
 
             if len(matched_files) == 1:
