@@ -1296,11 +1296,23 @@ def execute_open_library_file(tool_input: dict, user_id: int, chat_id: int) -> d
     except Exception:
         return {"error": "ดึงไฟล์จากคลังไม่สำเร็จ ลองใหม่อีกครั้ง"}
 
+    # สกัด label_map สดใหม่จาก bytes จริงที่เพิ่งดึงมาเสมอ ไม่ใช้ file_row["label_map"] ที่บันทึกไว้ตอน import
+    # ตรงๆ — ไฟล์ในคลังทุกไฟล์ถูก import ก่อนตัวอ่านป้ายแบบขยาย (รองรับหลายคู่ต่อแถว/ตารางรายการ) จะมีผล label_map
+    # ที่บันทึกไว้จึงไม่มี label ใหม่พวกนี้เลย แม้เปิดไฟล์นี้ในแชทใหม่หลัง PR ที่ขยายตัวอ่านแล้วก็ตาม (เหตุการณ์จริง
+    # ที่แก้: ใบเสนอราคาที่เปิดจากคลังไม่มี label ส่วนหัวเอกสาร/รวมราคาทั้งสิ้น ทั้งที่อ่านจากไฟล์ตรงๆ ได้ปกติ)
+    # อ่านไฟล์ล้ม (เช่นไฟล์เสีย) -> fallback ไปใช้ค่าที่เก็บไว้แทน ดีกว่าเปิดไฟล์ไม่ได้เลย ไม่เขียนอะไรกลับ
+    # library_files ไม่ว่าทางไหน (ต้นฉบับในคลังห้ามแก้)
+    try:
+        label_map = _extract_excel_labels(raw)
+    except Exception as e:
+        print(f"[OpenLibraryFile] label_extract_failed exception_type={type(e).__name__}")
+        label_map = file_row["label_map"]
+
     document_id = create_editable_document(
         user_id=user_id,
         filename=file_row["filename"],
         original_bytes=raw,
-        label_map=file_row["label_map"],
+        label_map=label_map,
         chat_id=chat_id,
     )
     set_chat_document_focus(chat_id, document_id)
