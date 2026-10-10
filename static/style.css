@@ -1291,6 +1291,27 @@ button {
     color: #c0392b;
 }
 
+/* ตัวเลขจำนวนไฟล์ที่เปิดอยู่ในแชทนี้ — สไตล์เดียวกับ .files-panel-badge (สีพื้น/ตัวหนังสือ/รูปทรงกลม) แต่อยู่
+   "ในบรรทัด" เดียวกับชื่อแชท ไม่ใช่ position:absolute ลอยทับ (ไม่เหมาะกับรายการแชทที่เรียงต่อกันในแนวตั้ง) เป็น
+   sibling ของ .side-chat-title ไม่ใช่ลูก (ดู loadChatHistory ใน script.js) กัน white-space:nowrap/
+   text-overflow:ellipsis ของชื่อแชทที่ยาวบังตัวเลขนี้หายไป — flex-shrink:0 กันถูกบีบเวลาชื่อแชทยาวจนล้น */
+.side-chat-file-count {
+    flex-shrink: 0;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 5px;
+    border-radius: 8px;
+    background: var(--color-primary);
+    color: #fff;
+    font-size: 10px;
+    font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    line-height: 1;
+    box-sizing: border-box;
+}
+
 /* ---------- Loading indicator: spinner 6 จุดหมุนวงกลม ลอยด้านบนจอ ---------- */
 .top-loading-indicator {
     position: fixed;

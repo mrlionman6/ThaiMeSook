@@ -213,7 +213,6 @@ async function askQuestion() {
 
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
-        loadChatFilesPanel(); // สถานะไฟล์อาจเปลี่ยน (เปิด/แก้/ปิดไฟล์ผ่าน tool) หลังได้คำตอบทุกครั้ง
 
         // เช็คไว้ก่อน "ก่อน" ที่จะไป sync currentChatId ด้านล่าง — กันบั๊กที่การ sync
         // เปลี่ยนค่า currentChatId ไปแล้วทำให้เช็คซ้ำทีหลังผิดพลาด (เช่น null -> id จริงตอนแชทใหม่)
@@ -225,6 +224,11 @@ async function askQuestion() {
             }
             loadChatHistory(); // อัปเดต sidebar เสมอ แม้ทำงานอยู่เบื้องหลัง (ไม่ได้ดูแชทนี้ตอนนี้)
         }
+
+        // ต้องเรียก "หลัง" sync currentChatId ด้านบนเสมอ — เคยเป็นบั๊กจริง: เรียกก่อน sync ทำให้แชทใหม่ที่เพิ่ง
+        // ได้ chat_id จริง (เปลี่ยนจาก null) โหลดแผงด้วย chat_id เก่า (null) แสดงสถานะว่างทั้งที่ตอบมาพร้อมเปิด
+        // ไฟล์แล้วก็ตาม (เช่น ทางลัดเปิดไฟล์ทำงานตั้งแต่ข้อความแรกของแชทใหม่)
+        loadChatFilesPanel(); // สถานะไฟล์อาจเปลี่ยน (เปิด/แก้/ปิดไฟล์ผ่าน tool) หลังได้คำตอบทุกครั้ง
 
         // โชว์คำตอบแบบ "fake streaming" เฉพาะตอนยังอยู่แชทเดียวกับที่ถามไว้เท่านั้น
         // (คำตอบผ่านการเช็ค LanguageGuard มาครบแล้วตั้งแต่ backend ก่อนส่งมาถึงตรงนี้)
@@ -280,7 +284,6 @@ async function submitAttachmentUpload(endpoint, file, instruction = null) {
 
         markChatPending(requestChatId, false);
         updateLoadingIndicator();
-        loadChatFilesPanel(); // แนบไฟล์ (Excel Editor) อาจสร้าง/แก้ไฟล์ในแชทนี้ทันที — รีเฟรชแผงเสมอ
 
         // เช็คไว้ก่อน sync currentChatId เหมือน askQuestion() — กันเช็คซ้ำทีหลังผิดพลาดตอนเป็นแชทใหม่ (null -> id จริง)
         const stillSameChat = (currentChatId === requestChatId);
@@ -291,6 +294,9 @@ async function submitAttachmentUpload(endpoint, file, instruction = null) {
             }
             loadChatHistory(); // อัปเดต sidebar เสมอ แม้ทำงานอยู่เบื้องหลัง (ไม่ได้ดูแชทนี้ตอนนี้)
         }
+
+        // ต้องเรียก "หลัง" sync currentChatId ด้านบนเสมอ (เหตุผลเดียวกับ askQuestion())
+        loadChatFilesPanel(); // แนบไฟล์ (Excel Editor) อาจสร้าง/แก้ไฟล์ในแชทนี้ทันที — รีเฟรชแผงเสมอ
 
         if (stillSameChat) {
             appendChatMessage("assistant", data.summary_text);
@@ -502,18 +508,25 @@ async function loadChatFilesPanel(preserveMessage = false) {
         return;
     }
 
+    // ยึด chat_id ไว้ตอนเริ่มเรียก (เหมือน requestChatId ใน askQuestion/submitAttachmentUpload) กันคำตอบที่
+    // มาช้า: ถ้าผู้ใช้สลับไปแชทอื่นระหว่างรอ fetch อยู่ ผลที่ได้กลับมาเป็นของแชทเก่าแล้ว ไม่ใช่แชทที่กำลังดูอยู่
+    // ตอนนี้จริงๆ ต้องทิ้งผลนั้นไป ไม่แสดงทับแผงของแชทปัจจุบัน
+    const requestChatId = currentChatId;
+
     // แชทใหม่ที่ยังไม่มี chat_id จริง (ยังไม่เคยถามอะไรเลย) -> ไม่มีอะไรให้โหลด แสดงสถานะว่างตรงๆ
-    if (!currentChatId) {
+    if (!requestChatId) {
         renderFilesPanel({ documents: [] });
         return;
     }
 
     try {
-        const res = await fetch(`/api/chats/${currentChatId}/state`);
+        const res = await fetch(`/api/chats/${requestChatId}/state`);
         if (!res.ok) throw new Error("HTTP " + res.status);
         const data = await res.json();
+        if (currentChatId !== requestChatId) return; // สลับแชทไปแล้วระหว่างรอผล ทิ้งผลนี้ทิ้งไป
         renderFilesPanel(data);
     } catch (error) {
+        if (currentChatId !== requestChatId) return;
         renderFilesPanel({ documents: [], loadError: true });
     }
 }
@@ -1279,6 +1292,18 @@ async function loadChatHistory() {
             titleSpan.className = "side-chat-title";
             titleSpan.textContent = chat.title;
             titleSpan.onclick = () => loadChat(chat.id);
+            li.appendChild(titleSpan);
+
+            if (chat.open_file_count > 0) {
+                // ตัวเลขจำนวนไฟล์ที่เปิดอยู่ในแชทนี้ — สไตล์เดียวกับตัวเลขบนปุ่มแผงไฟล์ (ดู .files-panel-badge)
+                // เป็น sibling ของ titleSpan ไม่ใช่ลูก กัน white-space:nowrap/text-overflow:ellipsis ของ
+                // .side-chat-title บังตัวเลขนี้หายไปตอนชื่อแชทยาว
+                const fileCountBadge = document.createElement("span");
+                fileCountBadge.className = "side-chat-file-count";
+                fileCountBadge.textContent = String(chat.open_file_count);
+                fileCountBadge.title = `มีไฟล์เปิดอยู่ ${chat.open_file_count} ไฟล์`;
+                li.appendChild(fileCountBadge);
+            }
 
             const deleteBtn = document.createElement("button");
             deleteBtn.className = "side-chat-delete";
@@ -1289,7 +1314,6 @@ async function loadChatHistory() {
                 handleDeleteChat(chat.id);
             };
 
-            li.appendChild(titleSpan);
             li.appendChild(deleteBtn);
             list.appendChild(li);
         });
@@ -1322,8 +1346,15 @@ function handleDeleteChat(chatId) {
             if (!res.ok) throw new Error("HTTP " + res.status);
 
             if (currentChatId === chatId) {
+                // ลบแชทที่กำลังดูอยู่ -> ทำเหมือนกด "แชทใหม่" ทุกประการ (ดู startNewChat) รวมโหลดแผงไฟล์ใหม่
+                // ด้วยเสมอ — บั๊กจริงที่เคยเจอ: ลบแชทที่มีไฟล์เปิดอยู่ 2 ไฟล์ แผงด้านขวายังแสดงเลข 2 และไฟล์เดิม
+                // ค้างอยู่จนกว่าจะกดเปิดแผงใหม่เอง (ไม่เคยเรียก loadChatFilesPanel ตรงนี้เลยก่อนหน้านี้)
                 currentChatId = null;
                 document.getElementById("answerBox").innerHTML = "";
+                document.getElementById("questionInput").value = "";
+                updateTitleVisibility();
+                updateLoadingIndicator();
+                loadChatFilesPanel();
             }
             loadChatHistory();
         } catch (error) {
@@ -1359,6 +1390,28 @@ function escapeHtml(str) {
     div.textContent = str;
     return div.innerHTML;
 }
+
+// =====================================================================
+// แท็บ/หน้าต่างกลับมาแสดงผล — รีเฟรชแผงไฟล์ + รายการแชทใหม่เสมอ (เผื่อเปิดหลายแท็บ/หน้าต่างแล้วลบ/แก้ไฟล์ใน
+// อีกแท็บหนึ่ง แท็บนี้จะไม่รู้เลยจนกว่าจะมีการกระทำอะไรสักอย่างในแท็บนี้เอง) หน่วงกันยิงถี่เกินไปถ้า visible/focus
+// เด้งมาซ้อนกันใกล้ๆ กัน (เช่นสลับหน้าต่างไปมาเร็วๆ) ไม่เกินครั้งละ 2 วินาที
+// =====================================================================
+let lastTabRefocusRefreshAt = 0;
+const TAB_REFOCUS_REFRESH_THROTTLE_MS = 2000;
+
+function refreshOnTabRefocus() {
+    const now = Date.now();
+    if (now - lastTabRefocusRefreshAt < TAB_REFOCUS_REFRESH_THROTTLE_MS) return;
+    lastTabRefocusRefreshAt = now;
+    if (!currentUser) return;
+    loadChatFilesPanel();
+    loadChatHistory();
+}
+
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshOnTabRefocus();
+});
+window.addEventListener("focus", refreshOnTabRefocus);
 
 // =====================================================================
 // Init

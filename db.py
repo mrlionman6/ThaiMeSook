@@ -35,7 +35,7 @@ import datetime
 from typing import Optional
 
 from sqlalchemy import (
-    create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func,
+    create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func, or_,
     LargeBinary, Boolean,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -2056,8 +2056,33 @@ def touch_chat_session(session_id: int):
             session.commit()
 
 
+def get_open_file_counts_by_chat(user_id: int) -> dict[int, int]:
+    """นับจำนวนไฟล์ (EditableDocument) ที่ active อยู่ของ user คนนี้ กลุ่มตาม chat_id ด้วยคำสั่งเดียว (ไม่วน
+    เรียกทีละแชท) เงื่อนไข "active" เดียวกับ list_active_editable_documents_by_chat เป๊ะ: ยังไม่หมดอายุ
+    (expires_at เป็น NULL หรือยังไม่ถึง — เทียบแบบเดียวกับ _is_editable_document_expired) และยังไม่ถูกปิด
+    (ไม่มีแถวใน ClosedChatDocument) คืน {chat_id: count} เฉพาะแชทที่มีไฟล์ active อย่างน้อย 1 ไฟล์ — แชทที่ไม่มี
+    ไฟล์เลยไม่อยู่ใน dict นี้ (caller ใช้ .get(chat_id, 0)) ใช้โดย get_user_chats() เติม open_file_count ให้แต่ละ
+    แชทในรายการไซด์บาร์"""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        rows = (
+            session.query(EditableDocument.chat_id, func.count(EditableDocument.id))
+            .outerjoin(ClosedChatDocument, ClosedChatDocument.document_id == EditableDocument.id)
+            .filter(
+                EditableDocument.user_id == user_id,
+                EditableDocument.chat_id.isnot(None),
+                or_(EditableDocument.expires_at.is_(None), EditableDocument.expires_at >= now),
+                ClosedChatDocument.document_id.is_(None),
+            )
+            .group_by(EditableDocument.chat_id)
+            .all()
+        )
+        return {chat_id: count for chat_id, count in rows}
+
+
 def get_user_chats(user_id: int) -> list[dict]:
-    """คืนรายการแชทของ user เรียงล่าสุดก่อน — ใช้แสดงในไซด์บาร์"""
+    """คืนรายการแชทของ user เรียงล่าสุดก่อน — ใช้แสดงในไซด์บาร์ แต่ละแชทมี open_file_count (จำนวนไฟล์ Excel
+    ที่ยังเปิดอยู่จริงในแชทนั้น ดู get_open_file_counts_by_chat) ด้วย"""
     with SessionLocal() as session:
         rows = (
             session.query(ChatSession)
@@ -2065,8 +2090,13 @@ def get_user_chats(user_id: int) -> list[dict]:
             .order_by(ChatSession.updated_at.desc())
             .all()
         )
+        file_counts = get_open_file_counts_by_chat(user_id)
         return [
-            {"id": r.id, "title": r.title, "updated_at": r.updated_at.isoformat() if r.updated_at else None}
+            {
+                "id": r.id, "title": r.title,
+                "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                "open_file_count": file_counts.get(r.id, 0),
+            }
             for r in rows
         ]
 
