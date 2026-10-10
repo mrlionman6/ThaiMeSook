@@ -1404,6 +1404,27 @@ CHAT_DOCUMENT_TOOLS = [
             "required": ["document_id"],
         },
     },
+    {
+        "name": "read_document_values",
+        "description": (
+            "อ่านค่าปัจจุบันของช่อง (label) และตารางรายการในไฟล์ Excel ที่เปิดอยู่ในแชทนี้แล้ว (สำเนาทำงานล่าสุด "
+            "คำนวณสูตรใหม่ให้แล้วด้วยโค้ดจริง ไม่ใช่ค่าเก่าที่แคชไว้) ต้องเรียกเครื่องมือนี้ก่อนตอบทุกครั้งที่ "
+            "ผู้ใช้ถามเรื่องค่าหรือยอดในไฟล์ที่เปิดอยู่ ต้องเป็น document_id ที่ได้จาก list_chat_documents "
+            "หรือจากผลลัพธ์ของ open_library_file เท่านั้น ห้ามเดา document_id เอง"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะอ่านค่า"},
+                "labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "ชื่อ label เฉพาะที่ต้องการดูค่า (ไม่บังคับ — ไม่ระบุ = คืนทุก label และตารางทั้งหมดในไฟล์)",
+                },
+            },
+            "required": ["document_id"],
+        },
+    },
 ]
 
 
@@ -1658,6 +1679,19 @@ def execute_undo_last_edit(tool_input: dict, user_id: int, chat_id: int) -> dict
 
 def execute_close_chat_document(tool_input: dict, user_id: int, chat_id: int) -> dict:
     return close_chat_document(tool_input.get("document_id"), user_id, chat_id)
+
+
+def execute_read_document_values(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """ตรวจ ownership ผ่าน _get_active_chat_document เหมือน tool อื่นๆ ใน CHAT_DOCUMENT_TOOLS แล้วเรียก
+    read_document_values (นิยามอยู่ใกล้ get_working_copy — ใช้ตัวคำนวณสูตร pycel เดียวกับเฟส 1) คืนข้อความ
+    formatted ที่โค้ดจัดให้แล้วเท่านั้น (ดู _format_document_values_text) ไม่คืน dict ดิบของค่า/ตารางให้ Claude
+    จัดรูปแบบเอง กัน Claude แสดงตัวเลข/ตารางผิดเพี้ยนจากต้นฉบับ"""
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    data = read_document_values(doc)
+    text = _format_document_values_text(data, tool_input.get("labels"))
+    return {"text": text}
 
 
 _UNDO_COMMAND_TEXTS = ("ย้อนการแก้", "undo")
@@ -2011,7 +2045,7 @@ def run_agentic_tool_loop(
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
     - find_customers/list_customer_documents/list_project_documents/list_templates/open_library_file/
       list_chat_documents/compare_chat_documents/edit_chat_document/
-      get_document_download_link: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่) และ
+      get_document_download_link/read_document_values: เหมือนกัน แต่ส่งให้ Claude เห็นเฉพาะตอนมี user_id (ล็อกอินอยู่) และ
       chat_id (อยู่ในแชทจริง) เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request
       เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
       ไม่ใช่ None (ดูการแก้ไขใน ask_question())
@@ -2156,6 +2190,14 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "close_chat_document" and user_id and chat_id:
                 result = _safe_execute_tool("close_chat_document", execute_close_chat_document, block.input, user_id, chat_id)
                 _add_receipt("close_chat_document", result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "read_document_values" and user_id and chat_id:
+                # ไม่เปลี่ยนข้อมูลใดๆ (อ่านอย่างเดียว) — ไม่ต้องออกใบยืนยันจากโค้ดเหมือน tool ที่เปลี่ยนข้อมูลจริง
+                result = _safe_execute_tool("read_document_values", execute_read_document_values, block.input, user_id, chat_id)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2582,6 +2624,9 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
         "ให้บอกเฉพาะขั้นตอนถัดไปหรือข้อมูลอื่นที่เกี่ยวข้องแทน ถ้าต้องเปิดไฟล์ ต้องเรียกเครื่องมือเสมอ แม้เคยเห็น "
         "ข้อมูลไฟล์นั้นในประวัติแชทมาก่อนแล้วก็ตาม\n"
         "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
+        "- คำถามเรื่องค่าหรือยอดในไฟล์ที่เปิดอยู่ (เช่น ยอดรวมตอนนี้เท่าไร, ช่องนี้มีค่าอะไร) ให้เรียก "
+        "read_document_values ก่อนตอบเสมอ ห้ามคำนวณหรือเดาค่าเอง ถ้าผลลัพธ์บอกว่าช่องนั้นคำนวณไม่ได้ในระบบ "
+        "ให้บอกผู้ใช้ว่าต้องเปิดไฟล์ด้วย Excel จึงจะเห็นค่าได้\n"
         "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว\n"
         "- ถ้าได้ผลเปรียบเทียบไฟล์จากเครื่องมือ compare_chat_documents กลับมาเป็นตาราง markdown สำเร็จรูป "
         "ให้แสดงตารางทั้งหมดตามที่ได้รับทุกแถวเป๊ะๆ ห้ามย่อ ห้ามตัดแถว ห้ามแก้ตัวเลขหรือข้อความในตาราง "
@@ -4680,11 +4725,230 @@ def _parse_iso_datetime_like(text: str):
     return None
 
 
-def _extract_excel_labels(raw: bytes) -> dict:
-    """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ)
-    ไล่ทุกแถวทุกชีต ถ้าแถวมีเซลล์ไม่ว่างพอดี 2 เซลล์ ให้เซลล์แรก=label เซลล์หลัง=value+พิกัด
+_ITEM_TABLE_HEADER_WORDS = (
+    "ลำดับ", "รายละเอียด", "รายการ", "จำนวน", "หน่วย", "ราคา/หน่วย", "ราคาต่อหน่วย", "จำนวนเงิน", "รวม",
+)
+# "รวม" อยู่ในชุดคำหัวตารางสำหรับ "ตรวจจับแถวหัว" เท่านั้น (ไม่ map เป็นคอลัมน์ไหนใน 6 คอลัมน์ด้านล่าง)
+_ITEM_TABLE_COLUMN_MAP = {
+    "ลำดับ": "no",
+    "รายละเอียด": "description",
+    "รายการ": "description",
+    "จำนวน": "qty",
+    "หน่วย": "unit",
+    "ราคา/หน่วย": "unit_price",
+    "ราคาต่อหน่วย": "unit_price",
+    "จำนวนเงิน": "amount",
+}
+_ITEM_TABLE_STOP_PREFIXES = ("รวม", "ภาษี", "vat", "total")
+_ITEM_TABLE_MAX_ROWS = 200  # เพดานจำนวนแถวรายการที่จะไล่สแกนต่อหนึ่งตาราง กันไฟล์ผิดปกติสแกนไม่รู้จบ
+_ITEM_TABLE_EMPTY_STREAK_LIMIT = 3  # จำนวนแถวว่างติดกันที่ถือว่าตารางจบแล้ว
 
-    label ที่ซ้ำกัน:
+
+def _normalize_table_header_text(value) -> str:
+    """ตัดช่องว่างทุกชนิดออกทั้งหมด (ไม่ใช่แค่ strip หัวท้าย) ก่อนเทียบกับคำหัวตารางใน _ITEM_TABLE_HEADER_WORDS —
+    ต้องตรงทั้งเซลล์เป๊ะ ไม่ใช่แค่เป็นส่วนหนึ่งของข้อความที่ยาวกว่า"""
+    if value is None:
+        return ""
+    return re.sub(r"\s+", "", str(value).strip())
+
+
+def _merged_cell_top_left(ws, cell):
+    """ถ้าเซลล์นี้อยู่ในช่วงที่ถูกผสาน (merged) คืนเซลล์บนซ้ายสุดของช่วงนั้นแทน (เซลล์อื่นที่เหลือในช่วงผสานมีค่า
+    None เสมอใน openpyxl ถึงจะมีข้อความแสดงผลให้เห็นในหน้าตาไฟล์จริงก็ตาม) ไม่ได้ผสานอยู่ก็คืนเซลล์เดิมตรงๆ"""
+    for merged_range in ws.merged_cells.ranges:
+        if cell.coordinate in merged_range:
+            return ws.cell(row=merged_range.min_row, column=merged_range.min_col)
+    return cell
+
+
+def _is_item_table_row_blank(raw_values: dict) -> bool:
+    """เซลล์ว่าง = None หรือ string ว่างหลัง strip เท่านั้น เซลล์ที่เป็นสูตร (string ขึ้นต้นด้วย '=') ไม่ถือว่า
+    ว่างเด็ดขาด แม้ผลลัพธ์ที่คำนวณได้จะยังไม่รู้ก็ตาม (กันแถวที่มีสูตรรออยู่จริงถูกนับเป็นแถวว่างผิดๆ จนตาราง
+    ถูกตัดจบเร็วเกินไป)"""
+    return all(v is None or (isinstance(v, str) and v.strip() == "") for v in raw_values.values())
+
+
+def _detect_item_table(ws) -> Optional[dict]:
+    """หาแถวหัวตารางรายการในชีตนี้ด้วยคำหัวตารางที่รู้จัก (ดู _ITEM_TABLE_HEADER_WORDS — แถวหัวตาราง = แถวที่มี
+    เซลล์ข้อความตรงกับคำเหล่านี้ "ตรงทั้งเซลล์" หลัง normalize อย่างน้อย 3 คำ) แล้ว map ตำแหน่งคอลัมน์ no/
+    description/qty/unit/unit_price/amount จากข้อความหัวคอลัมน์ (ใช้เซลล์บนซ้ายของช่วงที่ผสานถ้าหัวคอลัมน์นั้น
+    ถูกผสานเซลล์ไว้ — ดู _merged_cell_top_left) คืน None ถ้าไม่พบแถวหัวตารางเลยในชีตนี้
+
+    ไล่แถวรายการถัดจากแถวหัวลงไปทีละแถว หยุดก่อนแถวแรกที่มีเซลล์ข้อความ (เซลล์ไหนก็ได้ในแถวนั้นของชีตนี้ ไม่ใช่
+    แค่คอลัมน์ของตาราง) ขึ้นต้นด้วย รวม/ภาษี/VAT/total (ไม่สนตัวพิมพ์เล็กใหญ่) หรือเจอแถวว่างทั้งแถว (เฉพาะ
+    คอลัมน์ที่ map ได้ของตารางนี้) ติดกันครบ _ITEM_TABLE_EMPTY_STREAK_LIMIT แถว (แถวว่างชุดนั้นไม่นับรวมอยู่ใน
+    ผลลัพธ์ — ถือเป็นขอบเขตจบตาราง) หรือครบ _ITEM_TABLE_MAX_ROWS แถว
+
+    แต่ละแถวรายการที่คืนมา: row (เลขแถว), values (ค่าตามคอลัมน์ที่ map ได้ — เซลล์ที่เป็นสูตรได้ค่า None ไว้ก่อน
+    รอ caller คำนวณเพิ่มด้วย pycel เอง เช่น read_document_values), is_empty (ว่างเมื่อคอลัมน์ description และ
+    qty ว่างทั้งคู่ — เซลล์ที่เป็นสูตรไม่ถือว่าว่าง), amount_is_formula (คอลัมน์ amount ของแถวนี้เป็นสูตรไหม)
+
+    คืน dict เสมอไม่ raise: {"sheet", "header_row", "columns", "first_row", "last_row", "rows"}"""
+    header_row_idx = None
+    columns: dict[str, int] = {}
+
+    for row in ws.iter_rows():
+        matched_words = 0
+        row_columns: dict[str, int] = {}
+        for cell in row:
+            if cell.value is None:
+                continue
+            top_left = _merged_cell_top_left(ws, cell)
+            text = _normalize_table_header_text(top_left.value)
+            if text in _ITEM_TABLE_HEADER_WORDS:
+                matched_words += 1
+            field = _ITEM_TABLE_COLUMN_MAP.get(text)
+            if field and field not in row_columns:
+                row_columns[field] = cell.column
+        if matched_words >= 3:
+            header_row_idx = row[0].row
+            columns = row_columns
+            break
+
+    if header_row_idx is None:
+        return None
+
+    rows: list[dict] = []
+    pending_empty_rows: list[int] = []
+    last_row = header_row_idx
+
+    def _flush_pending_empty():
+        nonlocal last_row
+        for empty_row_idx in pending_empty_rows:
+            rows.append({
+                "row": empty_row_idx,
+                "values": {field: None for field in columns},
+                "is_empty": True,
+                "amount_is_formula": False,
+            })
+            last_row = empty_row_idx
+        pending_empty_rows.clear()
+
+    for row_idx in range(header_row_idx + 1, header_row_idx + 1 + _ITEM_TABLE_MAX_ROWS):
+        stop = False
+        for cell in ws[row_idx]:
+            text = str(cell.value).strip() if cell.value is not None else ""
+            if not text:
+                continue
+            if text.lower().startswith(tuple(p.lower() for p in _ITEM_TABLE_STOP_PREFIXES)):
+                stop = True
+            break
+        if stop:
+            break
+
+        raw_values = {field: ws.cell(row=row_idx, column=col).value for field, col in columns.items()}
+
+        if _is_item_table_row_blank(raw_values):
+            pending_empty_rows.append(row_idx)
+            if len(pending_empty_rows) >= _ITEM_TABLE_EMPTY_STREAK_LIMIT:
+                pending_empty_rows.clear()  # แถวว่างชุดนี้คือขอบเขตจบตาราง ไม่นับรวมอยู่ในผลลัพธ์
+                break
+            continue
+
+        _flush_pending_empty()  # แถวว่างที่ค้างไว้ไม่ถึง 3 แถวติดกัน -> กลับเข้ามาเป็นแถวว่างธรรมดาในผลลัพธ์
+
+        amount_is_formula = isinstance(raw_values.get("amount"), str) and raw_values["amount"].startswith("=")
+        values = {
+            field: (None if isinstance(v, str) and v.startswith("=") else v)
+            for field, v in raw_values.items()
+        }
+        desc_blank = raw_values.get("description") is None or (
+            isinstance(raw_values.get("description"), str) and raw_values["description"].strip() == ""
+        )
+        qty_blank = raw_values.get("qty") is None or (
+            isinstance(raw_values.get("qty"), str) and raw_values["qty"].strip() == ""
+        )
+
+        rows.append({
+            "row": row_idx, "values": values, "is_empty": desc_blank and qty_blank,
+            "amount_is_formula": amount_is_formula,
+        })
+        last_row = row_idx
+    else:
+        _flush_pending_empty()  # ครบ MAX_ROWS พอดีโดยไม่เคย break ด้วยเงื่อนไขอื่น
+
+    return {
+        "sheet": ws.title,
+        "header_row": header_row_idx,
+        "columns": columns,
+        "first_row": header_row_idx + 1,
+        "last_row": last_row,
+        "rows": rows,
+    }
+
+
+def _is_formula_cell(wb_raw, sheet_name: str, row: int, col: int) -> bool:
+    """เช็คว่าเซลล์นี้ (จาก workbook ที่เปิดด้วย data_only=False) เป็นสูตรไหม — ใช้ตอนจับคู่ป้ายแบบหลายคู่ต่อแถว
+    (ดู _match_multi_pair_row) กันเคสสูตรที่ผลลัพธ์แคชไว้เป็นข้อความ (เช่น BAHTTEXT) ซึ่งเช็คด้วย 'เป็นตัวเลข'
+    อย่างเดียวไม่พอ"""
+    value = wb_raw[sheet_name].cell(row=row, column=col).value
+    return isinstance(value, str) and value.startswith("=")
+
+
+def _clean_multi_pair_label_text(raw_text: str) -> str:
+    """สร้างชื่อ label จากข้อความดิบของเซลล์ป้ายในแถวที่มี 3 ช่องขึ้นไป (ดู _match_multi_pair_row): strip
+    ช่องว่างหัวท้ายก่อน ตัด ':'/'：' ท้ายสุดออก (ถ้ามี — เป็นเครื่องหมายบอกว่า "นี่คือป้าย" ไม่ใช่ส่วนหนึ่งของ
+    ชื่อจริง) แล้วยุบช่องว่างทุกชนิดที่เหลือ (รวมขึ้นบรรทัดใหม่กลางข้อความ เช่น 'เลขอ้างอิง\\nโปรเจค') ให้เป็น
+    ช่องว่างเดียว"""
+    text = raw_text.strip()
+    if text and text[-1] in (":", "："):
+        text = text[:-1].strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def _match_multi_pair_row(non_empty: list, wb_raw, sheet_name: str) -> list:
+    """จับคู่ "เซลล์ข้อความ แล้วเซลล์ไม่ว่างถัดไปทางขวา" ในแถวที่มีเซลล์ไม่ว่างตั้งแต่ 3 เซลล์ขึ้นไป (ดู
+    docstring ของ _extract_excel_labels) รับเฉพาะ non_empty cells ของแถวนั้น (ไม่ใช่ทุกเซลล์ในแถว) เพราะ
+    "เซลล์ถัดไปทางขวา" หมายถึงเซลล์ไม่ว่างตัวถัดไปในแถว ไม่ใช่เซลล์ติดกันทางกายภาพ (อาจมีเซลล์ว่างคั่นกลาง)
+
+    เงื่อนไขรับคู่ (ก) ข้อความ label ลงท้ายด้วย ':' หรือ '：' หลัง strip หรือ (ข) เซลล์ถัดไปเป็นเซลล์ไม่ว่าง
+    สุดท้ายของแถวและเป็นตัวเลข (int/float ไม่นับ bool) หรือเป็นสูตร (เช็คจาก wb_raw ที่เปิดแบบ data_only=False —
+    กันเคสสูตรที่ผลลัพธ์แคชเป็นข้อความ เช่น BAHTTEXT แต่ยังถือเป็น "ค่า" ได้เพราะเป็นสูตรจริง) เฉพาะเซลล์ข้อความ
+    (string) เท่านั้นที่เป็น label candidate ได้ (ไม่ใช่ตัวเลข)
+
+    ไล่จากซ้ายไปขวา เซลล์ที่ถูกจับเป็นค่าของคู่ใดคู่หนึ่งแล้ว ข้ามไปเลยไม่นำมาพิจารณาเป็น label ของคู่ถัดไปอีก"""
+    pairs = []
+    n = len(non_empty)
+    i = 0
+    while i < n - 1:
+        label_cell = non_empty[i]
+        if not isinstance(label_cell.value, str):
+            i += 1
+            continue
+
+        label_text = label_cell.value.strip()
+        value_cell = non_empty[i + 1]
+        ends_with_colon = label_text.endswith(":") or label_text.endswith("：")
+        is_last_cell = (i + 1 == n - 1)
+        value = value_cell.value
+        is_numeric = isinstance(value, (int, float)) and not isinstance(value, bool)
+        is_formula = _is_formula_cell(wb_raw, sheet_name, value_cell.row, value_cell.column)
+
+        if ends_with_colon or (is_last_cell and (is_numeric or is_formula)):
+            pairs.append((label_cell, value_cell))
+            i += 2
+        else:
+            i += 1
+
+    return pairs
+
+
+def _extract_excel_labels(raw: bytes) -> dict:
+    """เปิดไฟล์ .xlsx ด้วย openpyxl (data_only=True อ่านค่าที่คำนวณแล้วของ formula ไม่ใช่สูตรดิบ) + อีกชุดด้วย
+    data_only=False (wb_raw — ใช้แค่เช็คว่าเซลล์ไหนเป็นสูตรตอนจับคู่ป้ายแบบหลายคู่ต่อแถว ดูด้านล่าง) ไล่ทุกแถว
+    ทุกชีต:
+    - แถวที่มีเซลล์ไม่ว่างพอดี 2 เซลล์: เซลล์แรก=label เซลล์หลัง=value+พิกัด (พฤติกรรมเดิมทุกประการ ไม่เปลี่ยน)
+    - แถวที่มีเซลล์ไม่ว่างตั้งแต่ 3 เซลล์ขึ้นไป และไม่อยู่ในช่วงตารางรายการ (ดู _detect_item_table — ตั้งแต่
+      แถวหัวตารางถึงแถวรายการสุดท้าย ไม่นำมาพิจารณาเป็น label เลยไม่ว่าจะมีกี่เซลล์ กันตารางรายการถูกอ่านเป็น
+      label ปนกับคู่ label:value จริงของหัวเอกสาร — เหตุการณ์จริงที่แก้: ใบเสนอราคาที่มีหัวเอกสารวางหลายคู่ใน
+      แถวเดียว เช่น "ชื่อลูกค้า :" ... "ชื่อโปรเจค:" ... "เลขอ้างอิงเอกสาร:" ... ซึ่งกฎเดิมจับเฉพาะแถวที่มีพอดี
+      2 ช่องมองไม่เห็นเลย): จับคู่ด้วย _match_multi_pair_row (ดู docstring ของฟังก์ชันนั้น) ชื่อ label ที่ได้
+      ผ่าน _clean_multi_pair_label_text ก่อนเสมอ (ตัด ':' ท้ายออก ยุบช่องว่าง/ขึ้นบรรทัดใหม่เป็นช่องเดียว)
+    ไฟล์ที่เปิดไว้ก่อน PR นี้ (label_map เก่าไม่มี label แบบหลายคู่ต่อแถวพวกนี้) ไม่ต้อง migrate อะไร — label
+    เดิมทั้งหมดยังอยู่ตำแหน่งเดิม _build_document_version อ่านตำแหน่งต่อได้ปกติ label ใหม่จะมีก็ต่อเมื่อเปิดไฟล์
+    ใหม่หรือมีการสร้างเวอร์ชันใหม่ (ซึ่งอ่านตำแหน่งจาก base_label_map เดิม ไม่ได้เรียกฟังก์ชันนี้ซ้ำ)
+
+    label ที่ซ้ำกัน (ใช้ร่วมกันทั้งแถว 2 เซลล์และแถวหลายคู่):
     - ซ้ำต่างชีต: เติม '(ชื่อชีต)' ต่อท้าย (ไม่เปลี่ยนจากเดิม)
     - ซ้ำในชีตเดียวกัน: ทำแบบ two-pass ต่อชีต — pass แรกเก็บทุก occurrence ของทุก label ในชีตนั้น
       พร้อม 'หัวข้อหมวด' ที่ใกล้ที่สุดก่อนหน้า (แถวที่มีเซลล์ไม่ว่างแค่ 1 เซลล์ ภายในระยะไม่เกิน
@@ -4694,6 +4958,7 @@ def _extract_excel_labels(raw: bytes) -> dict:
       ถ้าหาหัวข้อหมวดไม่เจอในระยะที่กำหนด fallback เป็นเลขแถวแบบเดิม '(แถว N)' — label ที่ไม่ซ้ำ
       เลยในชีตนั้นยังคงได้ key เดิมแบบไม่มี suffix เหมือนเดิมทุกประการ"""
     wb = openpyxl.load_workbook(io.BytesIO(raw), data_only=True)
+    wb_raw = openpyxl.load_workbook(io.BytesIO(raw), data_only=False)
 
     label_map = {}
     label_seen_in_sheets: dict[str, list[str]] = {}  # label -> ชื่อชีตที่เจอมาแล้ว (เรียงตามลำดับ) ใช้ตัดสิน cross-sheet tag
@@ -4701,11 +4966,20 @@ def _extract_excel_labels(raw: bytes) -> dict:
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
 
+        table_info = _detect_item_table(ws)
+        excluded_rows = (
+            set(range(table_info["header_row"], table_info["last_row"] + 1))
+            if table_info is not None else set()
+        )
+
         # ---- pass 1: เก็บทุก occurrence ของทุก label ในชีตนี้ พร้อมหัวข้อหมวดที่ใกล้ที่สุดก่อนหน้า ----
         occurrences_in_sheet = []  # [{"label":, "row":, "col":, "value":, "format":, "heading":}]
         last_section_heading = None  # (row_number, text) — reset ทุกชีต
 
         for row in ws.iter_rows():
+            if row[0].row in excluded_rows:
+                continue  # แถวในช่วงตารางรายการ — ไม่นำมาพิจารณาเป็น label เลยไม่ว่าจะมีกี่เซลล์
+
             non_empty = [c for c in row if c.value is not None and str(c.value).strip() != ""]
 
             if len(non_empty) == 1:
@@ -4714,26 +4988,33 @@ def _extract_excel_labels(raw: bytes) -> dict:
                 last_section_heading = (heading_cell.row, str(heading_cell.value).strip())
                 continue
 
-            if len(non_empty) != 2:
+            if len(non_empty) == 2:
+                pairs = [tuple(non_empty)]
+            elif len(non_empty) >= 3:
+                pairs = _match_multi_pair_row(non_empty, wb_raw, sheet_name)
+            else:
                 continue
 
-            label_cell, value_cell = non_empty
-            label_text = str(label_cell.value).strip()
+            for label_cell, value_cell in pairs:
+                label_text = (
+                    str(label_cell.value).strip() if len(non_empty) == 2
+                    else _clean_multi_pair_label_text(str(label_cell.value))
+                )
 
-            heading_text = None
-            if last_section_heading is not None:
-                heading_row, heading_value = last_section_heading
-                if value_cell.row - heading_row <= EXCEL_LABEL_SECTION_HEADING_LOOKBACK:
-                    heading_text = heading_value
+                heading_text = None
+                if last_section_heading is not None:
+                    heading_row, heading_value = last_section_heading
+                    if value_cell.row - heading_row <= EXCEL_LABEL_SECTION_HEADING_LOOKBACK:
+                        heading_text = heading_value
 
-            occurrences_in_sheet.append({
-                "label": label_text,
-                "row": value_cell.row,
-                "col": value_cell.column,
-                "value": _json_safe_cell_value(value_cell.value),
-                "format": value_cell.number_format,
-                "heading": heading_text,
-            })
+                occurrences_in_sheet.append({
+                    "label": label_text,
+                    "row": value_cell.row,
+                    "col": value_cell.column,
+                    "value": _json_safe_cell_value(value_cell.value),
+                    "format": value_cell.number_format,
+                    "heading": heading_text,
+                })
 
         # ---- pass 2: ตัดสินใจ key สุดท้ายของทุก occurrence ในชีตนี้ ----
         occurrences_by_label: dict[str, list[dict]] = {}
@@ -5416,6 +5697,128 @@ def create_new_version(document_id: int, mutate_fn, change_summary: Optional[str
     new_bytes, new_label_map = _build_document_version(base_bytes, base_label_map, mutate_fn)
     version_id = create_document_version(document_id, new_bytes, new_label_map, change_summary=change_summary)
     return {"label_map": new_label_map, "version_id": version_id}
+
+
+def _compute_table_amount_values(file_bytes: bytes, tables: list[dict]) -> None:
+    """เติมค่า amount ที่เป็นสูตร (amount_is_formula) ในแต่ละตารางด้วย pycel ตัวเดียวกับที่ _recalculate_
+    formula_values ใช้คำนวณ label (แก้ dict ใน tables ตรงๆ ไม่คืนค่าใหม่) ไม่มี fallback_label_map (ไม่มี
+    เวอร์ชันก่อนหน้าให้ใช้สำหรับเซลล์ตาราง — ต่างจาก label) คำนวณไม่ได้ (เช่น BAHTTEXT หรือ error อื่นๆ) ปล่อยเป็น
+    None ต่อแถวนั้นไป (ดู _recalculate_formula_values) ให้ caller (read_document_values) ตั้ง not_computable เอง"""
+    synthetic_map = {}
+    for table in tables:
+        for row in table["rows"]:
+            if row["amount_is_formula"]:
+                key = f"{table['sheet']}!{row['row']}!amount"
+                synthetic_map[key] = {
+                    "sheet": table["sheet"], "row": row["row"], "col": table["columns"]["amount"],
+                    "current_value": None, "number_format": None,
+                }
+    if not synthetic_map:
+        return
+
+    computed = _recalculate_formula_values(file_bytes, synthetic_map, None)
+    for table in tables:
+        for row in table["rows"]:
+            if row["amount_is_formula"]:
+                key = f"{table['sheet']}!{row['row']}!amount"
+                row["values"]["amount"] = computed[key]["current_value"]
+
+
+def read_document_values(document: dict) -> dict:
+    """คืนค่าปัจจุบันของทุก label และตารางรายการ (ถ้ามี) ของสำเนาทำงานปัจจุบัน (ดู get_working_copy) ใช้เป็น
+    แหล่งข้อมูลเดียวให้ tool read_document_values ของ AI (ดู execute_read_document_values) label ที่เซลล์เป็น
+    สูตรและคำนวณไม่ได้ (เช่น BAHTTEXT ที่ pycel ไม่รองรับ — ดู _recalculate_formula_values) ได้ value เป็น None
+    พร้อม not_computable=True แทนที่จะ error หรือปล่อยค่าที่ผิดเงียบๆ ออกไป
+
+    labels: list [{"label":, "value":, "is_formula":, "not_computable":}, ...] ตามลำดับใน label_map
+    tables: list [{"sheet":, "header_row":, "first_row":, "last_row":, "capacity":, "empty_row_count":,
+    "rows": [{"row":, "values": {no,description,qty,unit,unit_price,amount}, "amount_is_formula":,
+    "not_computable":}]}] เฉพาะชีตที่มีตารางรายการจริง (ดู _detect_item_table) — rows ไม่รวมแถวที่ is_empty
+    (กรองออกให้แล้ว นับจำนวนแยกไว้ที่ empty_row_count) capacity = last_row - first_row + 1 (ความจุทั้งหมดของ
+    ตาราง ไม่ใช่แค่แถวที่มีเนื้อหา)"""
+    base_bytes, label_map = get_working_copy(document)
+
+    labels = []
+    for label, info in label_map.items():
+        is_formula = _is_label_cell_formula(base_bytes, info)
+        value = info["current_value"]
+        labels.append({
+            "label": label,
+            "value": value,
+            "is_formula": is_formula,
+            "not_computable": is_formula and value is None,
+        })
+
+    wb = openpyxl.load_workbook(io.BytesIO(base_bytes), data_only=False)
+    tables = [
+        detected for sheet_name in wb.sheetnames
+        if (detected := _detect_item_table(wb[sheet_name])) is not None
+    ]
+    _compute_table_amount_values(base_bytes, tables)
+
+    table_results = []
+    for table in tables:
+        filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+        formatted_rows = [
+            {
+                "row": r["row"],
+                "values": r["values"],
+                "amount_is_formula": r["amount_is_formula"],
+                "not_computable": r["amount_is_formula"] and r["values"].get("amount") is None,
+            }
+            for r in filled_rows
+        ]
+        table_results.append({
+            "sheet": table["sheet"],
+            "header_row": table["header_row"],
+            "first_row": table["first_row"],
+            "last_row": table["last_row"],
+            "capacity": table["last_row"] - table["first_row"] + 1,
+            "empty_row_count": len(table["rows"]) - len(filled_rows),
+            "rows": formatted_rows,
+        })
+
+    return {"labels": labels, "tables": table_results}
+
+
+def _format_document_values_text(data: dict, filter_labels: Optional[list[str]] = None) -> str:
+    """แปลงผลจาก read_document_values เป็นข้อความที่ส่งให้ Claude ตรงๆ (ตารางเป็น markdown สำเร็จรูป) ไม่คืน
+    dict ดิบให้ Claude จัดรูปแบบเอง — กันตัวเลข/โครงสร้างผิดเพี้ยนระหว่างทาง (เหตุผลเดียวกับ _build_comparison_
+    table) filter_labels: ถ้าระบุมา (จาก parameter 'labels' ของ tool) แสดงเฉพาะ label ที่ชื่อตรงกับรายการนี้
+    เป๊ะ ไม่งั้นแสดงทุก label — ตารางแสดงทุกตารางเสมอไม่ว่าจะกรองหรือไม่ (ตารางไม่มีชื่อให้กรองเป็นรายช่อง)"""
+    lines = []
+    labels = data["labels"]
+    if filter_labels:
+        wanted = set(filter_labels)
+        labels = [l for l in labels if l["label"] in wanted]
+
+    if labels:
+        lines.append("ค่าปัจจุบันในไฟล์:")
+        for l in labels:
+            if l["not_computable"]:
+                lines.append(f"- {l['label']}: คำนวณไม่ได้ในระบบ (ดูได้เมื่อเปิดไฟล์ด้วย Excel)")
+            else:
+                lines.append(f"- {l['label']}: {l['value']}")
+    else:
+        lines.append("ไม่พบ label ที่ระบุในไฟล์นี้" if filter_labels else "ไม่มี label ในไฟล์นี้")
+
+    for table in data["tables"]:
+        lines.append("")
+        lines.append(f"ตารางรายการ (ชีต {table['sheet']}):")
+        lines.append("| ลำดับ | รายละเอียด | จำนวน | หน่วย | ราคา/หน่วย | จำนวนเงิน |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for row in table["rows"]:
+            v = row["values"]
+            amount_text = "คำนวณไม่ได้" if row["not_computable"] else _escape_table_cell(v.get("amount"))
+            lines.append(
+                f"| {_escape_table_cell(v.get('no'))} | {_escape_table_cell(v.get('description'))} | "
+                f"{_escape_table_cell(v.get('qty'))} | {_escape_table_cell(v.get('unit'))} | "
+                f"{_escape_table_cell(v.get('unit_price'))} | {amount_text} |"
+            )
+        if table["empty_row_count"]:
+            lines.append(f"(มีแถวว่างเหลืออีก {table['empty_row_count']} แถวในตารางนี้ ความจุทั้งหมด {table['capacity']} แถว)")
+
+    return "\n".join(lines)
 
 
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
