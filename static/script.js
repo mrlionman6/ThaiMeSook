@@ -488,7 +488,13 @@ function requestNewDocumentFromTemplate() {
 
 // โหลด/แสดงสถานะไฟล์ล่าสุดของแชทที่กำลังดูอยู่ (currentChatId) — เรียกหลังได้คำตอบทุกครั้ง, หลังแนบไฟล์,
 // หลังสลับแชท, หลังกดปุ่มในแผง, และตอนเปิดแผง (ดูจุดเรียกทั้งหมดในไฟล์นี้) ซ่อนปุ่มเปิด+ปิดแผงทิ้งถ้าไม่ได้ login
-async function loadChatFilesPanel() {
+//
+// preserveMessage: true เฉพาะตอนเรียกจากปุ่มในแผงเอง (ย้อนการแก้/ปิดไฟล์ — ดู handleUndoFromPanel/
+// handleCloseFromPanel) ที่เพิ่งเซ็ตข้อความผลลัพธ์ไว้เองก่อนหน้านี้ ไม่ให้ถูกล้างทิ้งทันที ทุกจุดเรียกอื่น
+// (หลังได้คำตอบ, หลังแนบไฟล์, หลังสลับแชท, ตอนเปิดแผง, login/logout) ถือเป็น "เหตุการณ์ใหม่ไม่เกี่ยวกับข้อความ
+// เดิม" ต้องล้างทิ้งเสมอ (ค่า default)
+async function loadChatFilesPanel(preserveMessage = false) {
+    if (!preserveMessage) clearFilesPanelMessage();
     updateFilesPanelToggleVisibility();
 
     if (!currentUser) {
@@ -512,10 +518,27 @@ async function loadChatFilesPanel() {
     }
 }
 
+// จับเวลาซ่อนข้อความผลลัพธ์ในแผงอัตโนมัติ (ดู showFilesPanelMessage) — เก็บ handle ไว้ยกเลิกถ้ามีข้อความใหม่
+// มาทับก่อนครบเวลา หรือถ้าแผงโหลดสถานะใหม่จากเหตุการณ์อื่น (ดู loadChatFilesPanel) กันตั้งเวลาซ้อนหลายอัน
+let filesPanelMessageTimer = null;
+const FILES_PANEL_MESSAGE_TIMEOUT_MS = 6000;
+
+function clearFilesPanelMessage() {
+    const el = document.getElementById("filesPanelMessage");
+    el.textContent = "";
+    el.hidden = true;
+    if (filesPanelMessageTimer !== null) {
+        clearTimeout(filesPanelMessageTimer);
+        filesPanelMessageTimer = null;
+    }
+}
+
 function showFilesPanelMessage(text) {
     const el = document.getElementById("filesPanelMessage");
     el.textContent = text;
     el.hidden = false;
+    if (filesPanelMessageTimer !== null) clearTimeout(filesPanelMessageTimer);
+    filesPanelMessageTimer = setTimeout(clearFilesPanelMessage, FILES_PANEL_MESSAGE_TIMEOUT_MS);
 }
 
 function updateFilesPanelBadge(count) {
@@ -654,7 +677,7 @@ async function handleUndoFromPanel(documentId) {
     } catch (error) {
         showFilesPanelMessage("⚠️ " + error);
     }
-    loadChatFilesPanel();
+    loadChatFilesPanel(true); // preserveMessage — เพิ่งเซ็ตข้อความผลลัพธ์ไว้เองด้านบน ไม่ให้ loadChatFilesPanel ล้างทิ้ง
 }
 
 function handleCloseFromPanel(documentId, filename) {
@@ -669,7 +692,7 @@ function handleCloseFromPanel(documentId, filename) {
             } catch (error) {
                 showFilesPanelMessage("⚠️ " + error);
             }
-            loadChatFilesPanel();
+            loadChatFilesPanel(true); // preserveMessage — เพิ่งเซ็ตข้อความผลลัพธ์ไว้เองด้านบน
         },
         { confirmText: "ปิดไฟล์" }
     );

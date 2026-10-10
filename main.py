@@ -1669,6 +1669,46 @@ def _is_undo_command(query: str) -> bool:
     return query.strip().lower() in _UNDO_COMMAND_TEXTS
 
 
+_OPEN_COMMAND_PREFIXES = ("เปิดไฟล์", "เปิด")  # "เปิดไฟล์" ก่อนเสมอ (ยาวกว่า เฉพาะเจาะจงกว่า) ค่อย "เปิด" เฉยๆ
+_OPEN_COMMAND_MULTI_STEP_WORDS = ("แล้ว", "และ", "กับ", "เปรียบเทียบ", "แก้", "ด้วย")
+
+
+def parse_open_command(text: str) -> Optional[str]:
+    """เช็คว่าข้อความนี้เป็นคำสั่งเปิดไฟล์เดี่ยวๆ ตรงๆ ไหม ("เปิด" ตามด้วย "ไฟล์" ได้ไม่บังคับ) คืนส่วนที่เหลือ
+    (ชื่อ/คำค้นไฟล์ที่ผู้ใช้ระบุมา) หรือ None ถ้าไม่ใช่ — ใช้ดักก่อนปล่อยให้ Claude ตัดสินใจเรียก open_library_file
+    เอง (เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์ "เปิดใบประเมินป่าไม้เขียว" Claude ตอบว่าเปิดไฟล์แล้วทั้งที่ไม่ได้เรียก
+    tool เลยสักครั้ง — ไม่มี log ยืนยัน แผงด้านขวาว่างเปล่า)
+
+    ปฏิเสธ (คืน None) สองกรณี:
+    - ส่วนที่เหลือมีคำบ่งบอกคำสั่งหลายขั้นตอนปนมา (_OPEN_COMMAND_MULTI_STEP_WORDS เช่น "แล้ว"/"เปรียบเทียบ")
+      เช่น "เปิด A แล้วเปรียบเทียบกับ B" — ปล่อยให้ Claude จัดการทั้งหมดเองแทน ไม่เดาเฉพาะส่วนเปิด
+    - ส่วนที่เหลือ parse_list_selection() อ่านเป็นการเลือกข้อได้ (เช่น "เปิดข้อ 2") — ไม่ใช่คำสั่งเปิดไฟล์ด้วย
+      ชื่อ แต่เป็นการเลือกจากรายการค้างอยู่ ซึ่งมีทางลัดของตัวเองทำงานก่อนฟังก์ชันนี้อยู่แล้วเสมอใน ask_question()
+      (กันไว้สองชั้นเผื่อฟังก์ชันนี้ถูกเรียกจากที่อื่นในอนาคต)
+
+    ไม่พยายามตัดสินว่า "เปิดเผยข้อมูลบริษัท" ไม่ใช่คำสั่งเปิดไฟล์ตรงนี้ (ยังคืนส่วนที่เหลือ "เผยข้อมูลบริษัท"
+    ตามปกติ) — ปล่อยให้ชั้นค้นคลัง (search_library_files) เป็นคนตัดสินแทนด้วยการหาไฟล์ไม่เจอเลย แล้วปล่อยผ่าน
+    ไปให้ AI ตอบตามปกติ (ดู caller ใน ask_question)"""
+    stripped = text.strip()
+    for prefix in _OPEN_COMMAND_PREFIXES:
+        if stripped.startswith(prefix):
+            remainder = stripped[len(prefix):].strip()
+            break
+    else:
+        return None
+
+    if not remainder:
+        return None
+
+    if any(word in remainder for word in _OPEN_COMMAND_MULTI_STEP_WORDS):
+        return None
+
+    if parse_list_selection(remainder, item_count=1) is not None:
+        return None
+
+    return remainder
+
+
 _CLOSE_COMMAND_PREFIXES_ATTACHED_OK = ("ปิดไฟล์",)  # ชื่อไฟล์ต่อท้ายได้เลยไม่ต้องมีช่องว่าง เช่น "ปิดไฟล์ป่าไม้เขียว"
 _CLOSE_COMMAND_PREFIXES_SPACE_REQUIRED = ("ปิด",)   # เสี่ยงชนกับคำอื่น ("ปิดท้าย"/"ปิดบัง") ต้องมีช่องว่างคั่น
                                                      # หรือไม่มีอะไรต่อท้ายเลย ถึงจะถือว่าเป็นคำสั่งปิดไฟล์จริง
@@ -1873,17 +1913,66 @@ def _safe_execute_tool(tool_name: str, fn, *args) -> dict:
     """เรียก executor ของ tool หนึ่งตัวแบบปลอดภัย — ถ้า fn ล้ม (exception ใดๆ ก็ตาม เช่น Claude ส่ง input
     แปลกๆ มา หรือบั๊กที่ยังไม่เจอในโค้ด tool เอง) log ชื่อ tool กับชนิด exception เป็น ASCII ล้วน (กัน log
     เพี้ยนถ้ามีข้อความภาษาไทยปนมาใน exception message) แล้วคืน {"error": ...} ให้ Claude แทน ไม่ปล่อยให้
-    exception ลอยขึ้นไปทำให้ทั้ง request ล้มเป็น 500 — ต้องครอบทุก custom tool ใน run_agentic_tool_loop เสมอ"""
+    exception ลอยขึ้นไปทำให้ทั้ง request ล้มเป็น 500 — ต้องครอบทุก custom tool ใน run_agentic_tool_loop เสมอ
+
+    พิมพ์บรรทัด ASCII ล้วน "[ToolCall] name=<ชื่อ> ok=<True/False>" ทุกครั้งที่เรียก (ไม่พิมพ์ input/ผลลัพธ์
+    เลย กันข้อมูลผู้ใช้หลุดเข้า log) ok=False ถ้า fn raise exception หรือผลลัพธ์มี key "error" — ใช้ยืนยันว่า
+    มีการเรียกเครื่องมือจริงไหม (เหตุการณ์จริงที่เจอ: Claude ตอบว่าเปิดไฟล์สำเร็จทั้งที่ไม่ได้เรียก
+    open_library_file เลยสักครั้ง ไม่มีบรรทัดนี้ยืนยันในที่ไหนเลย)"""
     try:
-        return fn(*args)
+        result = fn(*args)
+        ok = not (isinstance(result, dict) and "error" in result)
+        print(f"[ToolCall] name={tool_name} ok={ok}")
+        return result
     except Exception as e:
         print(f"[ToolExecError] tool={tool_name} exception_type={type(e).__name__}")
+        print(f"[ToolCall] name={tool_name} ok=False")
         return {"error": "เครื่องมือทำงานไม่สำเร็จ ลองใหม่อีกครั้ง"}
+
+
+def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
+    """สร้างบรรทัดใบยืนยันจากโค้ด ("✓ "/"✗ " + ข้อความ) จากผลของเครื่องมือที่ "เปลี่ยนข้อมูลจริง" เท่านั้น —
+    ให้ผู้ใช้เห็นเองว่าเกิดอะไรขึ้นจริง แทนที่จะพึ่งคำบรรยายของ Claude (เหตุการณ์จริงที่แก้: Claude บอกว่าเปิด
+    เอกสารสำเร็จทั้งที่ไม่ได้เรียก tool เลย) คืน None ถ้าผลลัพธ์นี้ยังไม่ถือเป็น "การกระทำ" ที่ควรมีใบยืนยัน
+    (เช่น open_library_file เจอหลายไฟล์ ยังไม่ได้เปิดไฟล์ไหนเลย แค่ถามกลับ)
+
+    แต่ละ tool มีฟิลด์บอกความสำเร็จคนละชื่อกัน (ไม่ได้มี schema กลางเดียว):
+    - open_library_file/select_list_item (ตอนเปิดไฟล์): สำเร็จดูจาก "opened" เป็น True
+    - close_chat_document: สำเร็จดูจาก "closed" เป็น True
+    - edit_chat_document/undo_last_edit: สำเร็จดูจาก "matched" เป็น True ("matched": False ไม่ใช่ exception
+      แต่เป็นความล้มเหลวทางตรรกะ (เช่น หา label ไม่เจอ) ข้อความอธิบายอยู่ใน "message" ไม่ใช่ "error")
+    ทุก tool ล้มเหลวแบบ exception/error ตรงๆ ดูจาก key "error" เสมอ"""
+    if tool_name in ("open_library_file", "select_list_item"):
+        if result.get("opened") is True:
+            message = result.get("message") or ""
+            return f"✓ {message.splitlines()[0]}" if message else None
+        if "error" in result:
+            return f"✗ {result['error']}"
+        return None  # เช่น matched_multiple — ยังไม่เกิดการกระทำจริง ไม่ต้องออกใบยืนยัน
+
+    if tool_name == "close_chat_document":
+        if result.get("closed") is True:
+            message = result.get("message") or ""
+            return f"✓ {message.splitlines()[0]}" if message else None
+        if "error" in result:
+            return f"✗ {result['error']}"
+        return None
+
+    if tool_name in ("edit_chat_document", "undo_last_edit"):
+        message = result.get("message") or ""
+        first_line = message.splitlines()[0] if message else ""
+        if result.get("matched") is True:
+            return f"✓ {first_line}" if first_line else None
+        if "error" in result:
+            return f"✗ {result['error']}"
+        return f"✗ {first_line}" if first_line else None
+
+    return None
 
 
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None
-) -> str:
+) -> tuple[str, list[str]]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
@@ -1893,9 +1982,21 @@ def run_agentic_tool_loop(
       chat_id (อยู่ในแชทจริง) เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request
       เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
       ไม่ใช่ None (ดูการแก้ไขใน ask_question())
-    วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ MAX_TOOL_ITERATIONS (กันวนไม่รู้จบ)"""
+    วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ MAX_TOOL_ITERATIONS (กันวนไม่รู้จบ)
+
+    คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด) เสมอ — รายการใบยืนยันมาจาก _build_action_receipt() เฉพาะ tool
+    ที่เปลี่ยนข้อมูลจริง (open_library_file, select_list_item ตอนเปิดไฟล์, edit_chat_document,
+    close_chat_document, undo_last_edit) เรียงตามลำดับที่เกิดขึ้นจริง ไม่ซ้ำบรรทัดเดิม (เผื่อ tool เดียวกันถูก
+    เรียกซ้ำด้วยผลเหมือนกันในหลายรอบของ loop นี้) caller (rag_answer) เป็นคนต่อท้ายคำตอบสุดท้ายเอง ไม่ทำในนี้
+    เพราะฟังก์ชันนี้ไม่รู้ว่าคำตอบรอบนี้จะผ่าน LanguageGuard retry หรือถูกทิ้งแล้วลองใหม่"""
     messages = [dict(m) for m in initial_messages]  # copy กันแก้ list เดิมโดยไม่ตั้งใจ
     response = None
+    action_receipts: list[str] = []
+
+    def _add_receipt(tool_name: str, result: dict) -> None:
+        receipt = _build_action_receipt(tool_name, result)
+        if receipt and receipt not in action_receipts:
+            action_receipts.append(receipt)
 
     tools_for_this_call = (
         AVAILABLE_TOOLS + LIBRARY_TOOLS + CHAT_DOCUMENT_TOOLS if (user_id and chat_id) else AVAILABLE_TOOLS
@@ -1962,13 +2063,21 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "open_library_file" and user_id and chat_id:
                 result = _safe_execute_tool("open_library_file", execute_open_library_file, block.input, user_id, chat_id)
+                _add_receipt("open_library_file", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "select_list_item" and user_id and chat_id:
+                # ใบยืนยันเฉพาะตอนรายการค้างอยู่เป็น "documents" เท่านั้น (เลือกแล้วเปิดไฟล์จริง) ไม่ใช่
+                # "customers" (เลือกแล้วแค่โชว์รายการเอกสารของบริษัทนั้นต่อ ยังไม่เปิดไฟล์ไหนเลย) เช็คจากรายการ
+                # "ก่อน" เรียก tool เพราะ tool นี้จะบันทึกทับรายการใหม่ทันทีถ้าเป็น kind customers
+                listing_before = get_chat_last_listing(chat_id)
+                is_document_selection = bool(listing_before and listing_before.get("kind") == "documents")
                 result = _safe_execute_tool("select_list_item", execute_select_list_item, block.input, user_id, chat_id)
+                if is_document_selection:
+                    _add_receipt("select_list_item", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1990,6 +2099,7 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "edit_chat_document" and user_id and chat_id:
                 result = _safe_execute_tool("edit_chat_document", execute_edit_chat_document, block.input, user_id, chat_id)
+                _add_receipt("edit_chat_document", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2004,6 +2114,7 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "undo_last_edit" and user_id and chat_id:
                 result = _safe_execute_tool("undo_last_edit", execute_undo_last_edit, block.input, user_id, chat_id)
+                _add_receipt("undo_last_edit", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2011,6 +2122,7 @@ def run_agentic_tool_loop(
                 })
             elif block.type == "tool_use" and block.name == "close_chat_document" and user_id and chat_id:
                 result = _safe_execute_tool("close_chat_document", execute_close_chat_document, block.input, user_id, chat_id)
+                _add_receipt("close_chat_document", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2026,15 +2138,15 @@ def run_agentic_tool_loop(
         # ล่าสุดยังเป็น tool_use อยู่ (ไม่ได้บังเอิญจบพอดีที่รอบสุดท้าย) ต้องบอกผู้ใช้ตรงๆ ไม่ปล่อยคำตอบว่าง/
         # ขาดกลางคัน (response ล่าสุดมักมีแต่ tool_use block ไม่มี text block เลย -> text_parts จะว่างเปล่า)
         if response.stop_reason == "tool_use":
-            return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
+            return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts
 
     text_parts = [block.text for block in response.content if block.type == "text"]
     final_text = "\n\n".join(text_parts).strip()
     if not final_text:
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
-        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
-    return final_text
+        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts
+    return final_text, action_receipts
 
 
 # ---------- ระยะ 3: AI Agent สำหรับจัดการ KB (เสนอ tag / ยุบรวม chunk) ----------
@@ -2418,7 +2530,14 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
         "\n- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
         "- ถ้าไฟล์ (จากคลังหรือที่แนบมาเอง) มีมาโคร (has_macros เป็น true) ให้บอกผู้ใช้ว่าไฟล์นี้มีมาโคร "
         "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์\n"
-        "- ห้ามบอกว่าเปิด แก้ เปรียบเทียบ หรือส่งไฟล์แล้ว ถ้าไม่มีผลจาก tool ยืนยันในเทิร์นนี้\n"
+        # เดิม: "ห้ามบอกว่าเปิด แก้ เปรียบเทียบ หรือส่งไฟล์แล้ว ถ้าไม่มีผลจาก tool ยืนยันในเทิร์นนี้" — แก้เป็นข้อ
+        # นี้แทน เข้มกว่าเดิม: ห้ามพูดว่าทำสำเร็จด้วยคำพูดตัวเองเลยไม่ว่ากรณีใด เพราะระบบมีใบยืนยันจากโค้ดต่อท้าย
+        # คำตอบให้เองแล้วเสมอ (ดู run_agentic_tool_loop/_build_action_receipt) กันเหตุการณ์จริงที่เคยเจอ: บอกว่า
+        # เปิดไฟล์สำเร็จทั้งที่ไม่ได้เรียก tool เลยสักครั้ง
+        "- ระบบจะแสดงผลการเปิด แก้ ปิด หรือย้อนไฟล์ให้ผู้ใช้เห็นเองเสมอ (เป็นใบยืนยันจากโค้ด ไม่ใช่คำตอบของคุณ) "
+        "ห้ามบอกว่าทำสำเร็จ (เปิด/แก้/ปิด/ย้อนไฟล์) ด้วยคำพูดของตัวเองเด็ดขาด ไม่ว่าจะมีผลจาก tool หรือไม่ก็ตาม "
+        "ให้บอกเฉพาะขั้นตอนถัดไปหรือข้อมูลอื่นที่เกี่ยวข้องแทน ถ้าต้องเปิดไฟล์ ต้องเรียกเครื่องมือเสมอ แม้เคยเห็น "
+        "ข้อมูลไฟล์นั้นในประวัติแชทมาก่อนแล้วก็ตาม\n"
         "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
         "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว\n"
         "- ถ้าได้ผลเปรียบเทียบไฟล์จากเครื่องมือ compare_chat_documents กลับมาเป็นตาราง markdown สำเร็จรูป "
@@ -2506,8 +2625,11 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None)
         return ctx["message"], []
 
     raw_answer = ""
+    action_receipts: list[str] = []
     for attempt in range(1, MAX_ANSWER_RETRIES + 2):  # ลองครั้งแรก + retry อีก MAX_ANSWER_RETRIES ครั้ง
-        raw_answer = run_agentic_tool_loop(ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id)
+        raw_answer, action_receipts = run_agentic_tool_loop(
+            ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id
+        )
 
         if not contains_unexpected_script(raw_answer):
             break  # ปกติดี ไม่ต้องลองใหม่
@@ -2515,8 +2637,14 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None)
     else:
         print("[LanguageGuard] ลองใหม่ครบจำนวนแล้วแต่ยังเจอปัญหา — ส่งคำตอบล่าสุดกลับไปทั้งที่ยังมีปัญหา")
 
+    # log confidence ด้วยคำตอบดิบของ Claude เท่านั้น (ไม่ปนใบยืนยันจากโค้ด) กันตัวชี้วัดความมั่นใจเพี้ยน
+    _log_if_low_confidence(query, raw_answer, ctx["top_chunks"], ctx["scores"])
+
     answer = raw_answer  # เก็บคำตอบดิบสะอาดๆ ไม่ปน disclaimer แล้ว (ย้ายไปแสดงถาวรใต้กล่องแชทแทน กันปนเข้า KB ตอน admin approve)
-    _log_if_low_confidence(query, answer, ctx["top_chunks"], ctx["scores"])
+    if action_receipts:
+        # ต่อท้ายด้วยใบยืนยันจากโค้ด (ดู run_agentic_tool_loop/_build_action_receipt) — ไม่ใช่สิ่งที่ Claude
+        # เขียนเอง กันเหตุการณ์จริงที่เคยเจอ: Claude บอกว่าเปิดไฟล์สำเร็จทั้งที่ไม่ได้เรียก tool เลย
+        answer = answer + "\n\n" + "\n".join(action_receipts)
     return answer, ctx["top_chunks"]
 
 
@@ -2747,6 +2875,38 @@ async def ask_question(
         user_id and chat_id and query.strip() and image is None
         and _is_list_selection_without_fresh_listing(query, chat_id)
     )
+
+    # ทางลัดคำสั่งเปิดไฟล์ด้วยโค้ดล้วนๆ (parse_open_command) — เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์
+    # "เปิดใบประเมินป่าไม้เขียว" Claude ตอบว่าเปิดไฟล์แล้วทั้งที่ไม่ได้เรียก open_library_file เลยสักครั้ง (ไม่มี
+    # log ยืนยัน แผงด้านขวาว่างเปล่า) ใช้ตัวค้นคลัง (search_library_files) และตัวตัดสินใจเดียวกับที่
+    # execute_open_library_file ใช้ทุกประการ ไม่เขียนตรรกะการเลือกไฟล์ใหม่เลย
+    if user_id and chat_id and query.strip() and image is None:
+        open_remainder = parse_open_command(query)
+        if open_remainder is not None:
+            search_result = search_library_files(text=open_remainder)
+            matched_files = search_result["files"]
+            answer = None
+
+            if len(matched_files) == 1:
+                tool_result = _safe_execute_tool(
+                    "open_library_file", execute_open_library_file,
+                    {"file_id": matched_files[0]["file_id"]}, user_id, chat_id,
+                )
+                answer = tool_result.get("message") or tool_result.get("error") or "เปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
+            elif len(matched_files) > 1:
+                _record_chat_document_listing(chat_id, matched_files)
+                listing_text = _format_library_document_list(
+                    "พบเอกสารที่ตรงกับคำค้นนี้หลายรายการ:", matched_files
+                )
+                answer = listing_text + "\n\nต้องการเปิดข้อไหนครับ"
+            # ไม่พบไฟล์เลย -> answer ยังเป็น None ปล่อยผ่านไป flow ปกติด้านล่าง (ให้ AI ตอบแทน เช่น
+            # "เปิดเผยข้อมูลบริษัท" ที่ขึ้นต้นด้วย "เปิด" แต่จริงๆ ไม่ใช่คำสั่งเปิดไฟล์เลย)
+
+            if answer is not None:
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
     # ถ้าแชทนี้มี EditableDocument (Excel Editor) ที่ยังไม่หมดอายุผูกอยู่ และข้อความนี้ไม่มีไฟล์แนบมาด้วย
     # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize/compare) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
