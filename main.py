@@ -1917,11 +1917,19 @@ _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE = (
     "ยังไม่ได้แก้ไขไฟล์ครับ กรุณาระบุให้ชัดขึ้น เช่น 'เปลี่ยน Box 4x4 เป็น 7x7' หรือ 'ลบรายการที่ 3'"
 )
 
-# คำที่บ่งบอกว่าคำตอบอ้างว่า "ทำสำเร็จแล้ว" ตรงๆ (ลบ/แก้/เปลี่ยน/เพิ่ม ...แล้ว — อาจมีข้อความอื่นคั่นกลางได้ เช่น
-# "ลบรายการที่ 3 แล้วครับ" ไม่ใช่แค่ "ลบแล้ว" ติดกันเป๊ะ — ดู _looks_like_fabricated_edit_claim) หรือ "แก้ไขเรียบร้อย"
-# — เช็คได้ทุกเส้นทางที่มีเอกสารเปิดอยู่ ไม่ต้องรอ structural_route เพราะเป็นการอ้างว่าสำเร็จแล้วตรงๆ ไม่ใช่คำทั่วไป
-# ที่ปนในคำตอบกฎหมายปกติได้ง่ายเหมือน "ยืนยัน"/"preview"/"✓"
-_FABRICATED_EDIT_CLAIM_RE = re.compile(r"(แก้|เปลี่ยน|ลบ|เพิ่ม)[^\n]*?แล้ว|แก้ไขเรียบร้อย")
+# คำที่บ่งบอกว่าคำตอบอ้างว่า "ทำสำเร็จแล้ว" กับสิ่งของในเอกสารโดยเฉพาะ (ไม่ใช่แค่กริยาลอยๆ — เวอร์ชันแรกกว้างไป
+# จับคำตอบกฎหมายปกติที่บังเอิญมีกริยา+"แล้ว" ห่างกันในประโยคด้วย เช่น "ต้องยื่นคำขอแล้วรออนุมัติ"/"หากแก้ไขหนังสือ
+# บริคณห์สนธิแล้ว ต้องแจ้ง..."/"เปลี่ยนสัญชาติผู้ถือหุ้นแล้วต้องตรวจ FBA" — ตอนนี้ต้องมีคำนามของสิ่งที่ถูกแก้ติดกับ
+# กริยา (รายการ/ค่า/ช่อง/ไฟล์/ตาราง/ชื่อลูกค้า/VAT/ภาษีมูลค่าเพิ่ม/ราคา/จำนวน) และ "แล้ว" ต้องอยู่ไม่ไกลจากกริยานั้น
+# (ไม่เกิน 40 ตัวอักษรถัดไป) หรือพูดถึง "ไฟล์"/"เอกสาร" ถูกแก้ไขตรงๆ หรือ "แก้ไขเรียบร้อย" — เช็คได้ทุกเส้นทางที่มี
+# เอกสารเปิดอยู่ (แต่ rag_answer ยังข้าม guard นี้ไปเลยถ้าเป็นคำถามเชิงกฎหมายหรือคำตอบมาจาก RAG จริง เป็นอีกชั้น
+# ป้องกันเพิ่ม ไม่ใช่พึ่ง regex นี้แก้ทุกเคสเอง)
+_FABRICATED_EDIT_CLAIM_RE = re.compile(
+    r"(แก้ไข|แก้|เปลี่ยน|ลบ|เพิ่ม)\s*(รายการ|ค่า|ช่อง|ไฟล์|ตาราง|ชื่อลูกค้า|VAT|ภาษีมูลค่าเพิ่ม|ราคา|จำนวน)"
+    r"[^\n]{0,40}?(ให้)?แล้ว"
+    r"|แก้ไขเรียบร้อย"
+    r"|(ไฟล์|เอกสาร)[^\n]{0,20}(ถูก)?แก้ไข(แล้ว|เรียบร้อย)"
+)
 
 # คำ/สัญลักษณ์ที่เช็คเฉพาะตอน structural_route=True เท่านั้น (ข้อความทั่วไปที่ไม่ได้อ้างว่าแก้สำเร็จโดยตรง แต่เกิด
 # ขึ้นบ่อยในคำตอบกฎหมายปกติที่ไม่เกี่ยวกับการแก้ไฟล์เลย เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี" — เช็คเฉพาะตอนรู้แน่ชัด
@@ -1930,10 +1938,12 @@ _FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS = ("ยืนยัน", "previe
 
 
 def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = False) -> bool:
-    """เช็คว่าคำตอบดิบของ Claude (ก่อนต่อใบยืนยันจากโค้ด) ดูเหมือนอ้างว่าได้เสนอ/แก้ไฟล์ไปแล้วไหม ใช้ร่วมกับเช็ค
-    ว่า "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer) เพื่อจับเคส Claude เขียน preview/คำยืนยันปลอมขึ้นเอง
-    โดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่มเงื่อนไข "ยืนยัน"/"preview"/"✓" เข้ามาด้วย (ใช้
-    ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำพวกนี้ที่เป็นคำปกติในคำตอบกฎหมายทั่วไปโดนบล็อกผิด)"""
+    """เช็คว่าคำตอบดิบของ Claude (ก่อนต่อใบยืนยันจากโค้ด) ดูเหมือนอ้างว่าได้เสนอ/แก้ไฟล์ไปแล้วไหม (ดู
+    _FABRICATED_EDIT_CLAIM_RE) ใช้ร่วมกับเช็คว่า "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer) เพื่อจับ
+    เคส Claude เขียน preview/คำยืนยันปลอมขึ้นเองโดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่ม
+    เงื่อนไข "ยืนยัน"/"preview"/"✓" เข้ามาด้วย (ใช้ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำ
+    พวกนี้ที่เป็นคำปกติในคำตอบกฎหมายทั่วไปโดนบล็อกผิด — ดู rag_answer สำหรับการข้าม guard นี้ไปเลยตอนเป็นคำถาม
+    เชิงกฎหมาย/คำตอบมาจาก RAG จริง ซึ่งเป็นอีกชั้นที่ไม่ได้อยู่ในฟังก์ชันนี้)"""
     if _FABRICATED_EDIT_CLAIM_RE.search(raw_answer):
         return True
     if structural_route:
@@ -3227,9 +3237,19 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
         has_active_docs = bool(
             user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
         )
-        if has_active_docs and not action_receipts and _looks_like_fabricated_edit_claim(raw_answer, structural_route=structural_route):
-            print(f"[Guard] fabricated_edit_claim_blocked chat={chat_id}")
-            raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
+        if has_active_docs and not action_receipts:
+            if structural_route:
+                should_block = _looks_like_fabricated_edit_claim(raw_answer, structural_route=True)
+            else:
+                # เส้นทางทั่วไป (ไม่ใช่คำสั่งแก้โครงสร้าง): คำตอบกฎหมายปกติมักมีกริยา "แก้/เปลี่ยน/ลบ/เพิ่ม" กับ
+                # "แล้ว" ปนอยู่ในประโยคโดยไม่เกี่ยวกับการแก้ไฟล์เลย (เช่น "ต้องยื่นคำขอแล้วรออนุมัติ") — ถ้าคำถาม
+                # เป็นคำถามเชิงกฎหมาย (ดู _has_legal_keyword) หรือคำตอบมาจากฐานความรู้จริง (มี source จาก RAG —
+                # ctx["top_chunks"] ไม่ว่าง) ให้ข้าม guard นี้ไปเลย ไม่เสี่ยงบล็อกคำตอบกฎหมายที่ถูกต้องผิดๆ
+                is_legal_answer = _has_legal_keyword(query) or bool(ctx["top_chunks"])
+                should_block = not is_legal_answer and _looks_like_fabricated_edit_claim(raw_answer, structural_route=False)
+            if should_block:
+                print(f"[Guard] fabricated_edit_claim_blocked chat={chat_id}")
+                raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
 
     # log confidence ด้วยคำตอบดิบของ Claude เท่านั้น (ไม่ปนใบยืนยันจากโค้ด) กันตัวชี้วัดความมั่นใจเพี้ยน
     _log_if_low_confidence(query, raw_answer, ctx["top_chunks"], ctx["scores"])

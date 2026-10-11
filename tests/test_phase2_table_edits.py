@@ -600,6 +600,35 @@ def test_rag_answer_does_not_block_legal_confirm_word_even_with_active_docs(ns, 
     assert "ยืนยันตัวตน" in answer
 
 
+@pytest.mark.parametrize("query,answer_text", [
+    ("เพิ่มทุนจดทะเบียนต้องทำอย่างไร", "ถ้าต้องการเพิ่มทุนจดทะเบียน ต้องยื่นคำขอแล้วรออนุมัติ"),
+    ("แก้ไขหนังสือบริคณห์สนธิต้องทำอย่างไร", "หากแก้ไขหนังสือบริคณห์สนธิแล้ว ต้องแจ้งกรมพัฒน์ภายใน 14 วัน"),
+    ("ผู้ถือหุ้นต่างด้าวเปลี่ยนสัญชาติต้องตรวจอะไรบ้าง", "บริษัทที่เปลี่ยนสัญชาติผู้ถือหุ้นแล้วต้องตรวจ FBA"),
+])
+def test_rag_answer_does_not_block_normal_legal_sentences_with_active_docs(ns, doc1, query, answer_text):
+    """review PR #28 รอบ 2: ประโยคกฎหมายปกติที่มีกริยา (เพิ่ม/แก้ไข/เปลี่ยน) + "แล้ว" ปนอยู่ในประโยคเดียวกัน แต่
+    กริยาไม่ได้ติดกับคำนามของสิ่งที่ถูกแก้ในเอกสารเลย (เช่น "เพิ่มทุน" ไม่ใช่ "เพิ่มรายการ", "แก้ไขหนังสือบริคณห์
+    สนธิ" ไม่ใช่ "แก้ไขไฟล์") ต้องไม่ถูก guard บล็อก แม้มีเอกสารเปิดอยู่ในแชทจริงก็ตาม (เดิม regex กว้างไปจับ
+    กริยา+แล้ว ทั้งประโยคโดยไม่สนว่าติดกับคำนามอะไร)"""
+    ns["_fake_agentic_loop"].set_response(answer_text, [], False)
+    answer, sources = ns["rag_answer"](query, user_id=1, chat_id=1, structural_route=False)
+    assert answer != ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
+@pytest.mark.parametrize("answer_text", [
+    "เปลี่ยน VAT เป็น 10% ให้แล้วครับ",
+    "แก้ไขเรียบร้อยครับ",
+    "ไฟล์ถูกแก้ไขแล้วครับ",
+    "แก้ชื่อลูกค้าเป็น บริษัท ทดสอบ แล้วครับ",
+])
+def test_rag_answer_blocks_additional_fabricated_claim_phrasings(ns, doc1, answer_text):
+    """review PR #28 รอบ 2: วลีอ้างว่าแก้สำเร็จแล้วอีกหลายแบบ (กริยาติดกับคำนามของสิ่งที่ถูกแก้ในเอกสารจริง หรือ
+    พูดถึงไฟล์/เอกสารถูกแก้ไขตรงๆ หรือ "แก้ไขเรียบร้อย") ต้องยังถูก block เหมือนเดิมหลังจากทำ regex ให้แคบลง"""
+    ns["_fake_agentic_loop"].set_response(answer_text, [], False)
+    answer, sources = ns["rag_answer"]("แก้ไฟล์ให้หน่อย", user_id=1, chat_id=1, structural_route=False)
+    assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
 def test_rag_answer_does_not_block_normal_legal_answer_without_active_docs(ns):
     """คำตอบกฎหมายปกติที่บังเอิญมีคำว่า "ยืนยัน" ปนอยู่ (เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี") แต่ไม่มีเอกสารเปิดอยู่
     เลย -> ไม่ควรถูก guard บล็อก (กันคำว่า "ยืนยัน" ที่เป็นคำปกติถูกเหมาเข่งผิดๆ)"""
