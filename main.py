@@ -109,6 +109,7 @@ from db import (
     get_chat_pending_actions,
     delete_chat_pending_action,
     clear_chat_pending_actions,
+    update_chat_pending_action_version,
 )
 
 import os
@@ -1916,19 +1917,29 @@ _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE = (
     "ยังไม่ได้แก้ไขไฟล์ครับ กรุณาระบุให้ชัดขึ้น เช่น 'เปลี่ยน Box 4x4 เป็น 7x7' หรือ 'ลบรายการที่ 3'"
 )
 
-# คำ/สัญลักษณ์ที่บ่งบอกว่าคำตอบอ้างว่าได้แก้ไฟล์/เสนอ preview ไปแล้ว — ใช้ตรวจจับคำตอบที่ Claude "แต่ง" เอง
-# (ไม่ได้มาจาก tool) เช็คแบบไม่สนตัวพิมพ์เล็กใหญ่สำหรับ "preview" ภาษาอังกฤษ
-_FABRICATED_EDIT_CLAIM_PATTERNS = (
-    "ยืนยัน", "preview", "แก้แล้ว", "เปลี่ยนแล้ว", "ลบแล้ว", "เพิ่มแล้ว", "✓",
-)
+# คำที่บ่งบอกว่าคำตอบอ้างว่า "ทำสำเร็จแล้ว" ตรงๆ (ลบ/แก้/เปลี่ยน/เพิ่ม ...แล้ว — อาจมีข้อความอื่นคั่นกลางได้ เช่น
+# "ลบรายการที่ 3 แล้วครับ" ไม่ใช่แค่ "ลบแล้ว" ติดกันเป๊ะ — ดู _looks_like_fabricated_edit_claim) หรือ "แก้ไขเรียบร้อย"
+# — เช็คได้ทุกเส้นทางที่มีเอกสารเปิดอยู่ ไม่ต้องรอ structural_route เพราะเป็นการอ้างว่าสำเร็จแล้วตรงๆ ไม่ใช่คำทั่วไป
+# ที่ปนในคำตอบกฎหมายปกติได้ง่ายเหมือน "ยืนยัน"/"preview"/"✓"
+_FABRICATED_EDIT_CLAIM_RE = re.compile(r"(แก้|เปลี่ยน|ลบ|เพิ่ม)[^\n]*?แล้ว|แก้ไขเรียบร้อย")
+
+# คำ/สัญลักษณ์ที่เช็คเฉพาะตอน structural_route=True เท่านั้น (ข้อความทั่วไปที่ไม่ได้อ้างว่าแก้สำเร็จโดยตรง แต่เกิด
+# ขึ้นบ่อยในคำตอบกฎหมายปกติที่ไม่เกี่ยวกับการแก้ไฟล์เลย เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี" — เช็คเฉพาะตอนรู้แน่ชัด
+# แล้วว่าข้อความนี้ถูกจัดเป็นคำสั่งแก้โครงสร้างเท่านั้น กันเหมาเข่งผิดในเส้นทางทั่วไป)
+_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS = ("ยืนยัน", "preview", "✓")
 
 
-def _looks_like_fabricated_edit_claim(raw_answer: str) -> bool:
-    """เช็คว่าคำตอบดิบของ Claude (ก่อนต่อใบยืนยันจากโค้ด) ดูเหมือนอ้างว่าได้เสนอ/แก้ไฟล์ไปแล้วไหม (ดู
-    _FABRICATED_EDIT_CLAIM_PATTERNS) ใช้ร่วมกับเช็คว่า "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer)
-    เพื่อจับเคส Claude เขียน preview/คำยืนยันปลอมขึ้นเองโดยไม่ได้เรียก tool จริงสักครั้ง"""
-    lowered = raw_answer.lower()
-    return any(p.lower() in lowered for p in _FABRICATED_EDIT_CLAIM_PATTERNS)
+def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = False) -> bool:
+    """เช็คว่าคำตอบดิบของ Claude (ก่อนต่อใบยืนยันจากโค้ด) ดูเหมือนอ้างว่าได้เสนอ/แก้ไฟล์ไปแล้วไหม ใช้ร่วมกับเช็ค
+    ว่า "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer) เพื่อจับเคส Claude เขียน preview/คำยืนยันปลอมขึ้นเอง
+    โดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่มเงื่อนไข "ยืนยัน"/"preview"/"✓" เข้ามาด้วย (ใช้
+    ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำพวกนี้ที่เป็นคำปกติในคำตอบกฎหมายทั่วไปโดนบล็อกผิด)"""
+    if _FABRICATED_EDIT_CLAIM_RE.search(raw_answer):
+        return True
+    if structural_route:
+        lowered = raw_answer.lower()
+        return any(p.lower() in lowered for p in _FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS)
+    return False
 
 
 def _answer_document_reading_question(query: str, active_docs: list, user_id: int, chat_id: int) -> tuple[str, Optional[int]]:
@@ -3216,7 +3227,7 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
         has_active_docs = bool(
             user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
         )
-        if has_active_docs and not action_receipts and _looks_like_fabricated_edit_claim(raw_answer):
+        if has_active_docs and not action_receipts and _looks_like_fabricated_edit_claim(raw_answer, structural_route=structural_route):
             print(f"[Guard] fabricated_edit_claim_blocked chat={chat_id}")
             raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
 
@@ -6995,13 +7006,20 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
     return {"matched": True, "message": message}
 
 
-def _apply_pending_queue(items: list[dict], user_id: int) -> str:
+def _apply_pending_queue(items: list[dict], user_id: int, chat_id: int) -> str:
     """apply รายการในคิวตามลำดับ (เก่า->ใหม่) ทีละรายการเป็นเวอร์ชันของตัวเอง (undo ทีละขั้นได้) ลบออกจากคิว
     ทันทีไม่ว่าจะสำเร็จหรือไม่ (ไม่ค้างให้พยายามซ้ำ) คืนข้อความสรุปทุกบรรทัด (✓/✗ จากโค้ดล้วนๆ) + ยอดล่าสุด
-    (label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ) หลังทำครบทุกรายการ"""
+    (label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ) หลังทำครบทุกรายการ
+
+    items อาจเป็นแค่ "บางส่วน" ของคิวทั้งหมด (เช่น confirm_latest ที่ apply แค่รายการสุดท้าย) — รายการอื่นที่เหลือ
+    ค้างอยู่ในคิวของแชทนี้ (ไม่ได้อยู่ใน items) ต้องขยับ version_id_at_propose ของมันตามไปด้วยทุกครั้งที่ apply
+    สำเร็จจริง (เอกสารขยับเวอร์ชัน) ไม่งั้น _pending_queue_baseline_valid รอบถัดไปจะเข้าใจผิดว่ามีการแก้นอกคิว
+    แทรกเข้ามา ทั้งที่จริงคือ apply รายการอื่นในคิวเดียวกันตามปกติ (บั๊กจริงที่เจอจาก review: confirm_latest แล้ว
+    confirm_single รายการที่เหลือไม่ได้เลย คิวถูกล้างทิ้งทั้งที่ไม่มีอะไรแทรกจากนอกคิวเลย)"""
     if not items:
         return "ไม่มีรายการรอยืนยันแล้วครับ"
 
+    applying_ids = {item["id"] for item in items}
     lines = []
     last_document_id = None
     for item in items:
@@ -7012,6 +7030,18 @@ def _apply_pending_queue(items: list[dict], user_id: int) -> str:
         mark = "✓" if result.get("matched") else "✗"
         first_line = (result.get("message") or "").splitlines()[0] if result.get("message") else ""
         lines.append(f"{mark} {first_line}")
+
+        if result.get("matched"):
+            current_doc = get_editable_document_raw(last_document_id)
+            new_marker = _get_document_version_marker(current_doc) if current_doc is not None else None
+            if new_marker is not None:
+                for remaining in get_chat_pending_actions(chat_id):
+                    if remaining["id"] in applying_ids:
+                        continue  # รายการอื่นในชุด apply เดียวกันนี้ จะถูกจัดการ/ลบในลูปนี้เองอยู่แล้ว
+                    if remaining["action"].get("document_id") != last_document_id:
+                        continue
+                    if remaining["action"].get("version_id_at_propose") != new_marker:
+                        update_chat_pending_action_version(remaining["id"], new_marker)
 
     if last_document_id is not None:
         final_doc = get_editable_document_raw(last_document_id)
@@ -7063,14 +7093,14 @@ def _handle_pending_queue_command(command: str, pending_queue: list[dict], user_
 
     if command == "confirm_single":
         if len(pending_queue) == 1:
-            return _apply_pending_queue(pending_queue, user_id)
+            return _apply_pending_queue(pending_queue, user_id, chat_id)
         return _describe_pending_queue(pending_queue)
 
     if command == "confirm_latest":
-        return _apply_pending_queue([pending_queue[-1]], user_id)
+        return _apply_pending_queue([pending_queue[-1]], user_id, chat_id)
 
     if command == "confirm_all":
-        return _apply_pending_queue(pending_queue, user_id)
+        return _apply_pending_queue(pending_queue, user_id, chat_id)
 
     return "คำสั่งนี้ไม่รองรับแล้ว กรุณาลองสั่งใหม่อีกครั้งครับ"
 

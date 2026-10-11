@@ -36,7 +36,7 @@ from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func, or_,
-    LargeBinary, Boolean,
+    LargeBinary, Boolean, inspect,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
@@ -415,9 +415,17 @@ def init_db():
     # (id auto-increment เป็น primary key แทน) — create_all ไม่ alter ตารางเดิมที่มี schema ไม่ตรงกันเลย (แค่ข้าม
     # ถ้าชื่อตารางมีอยู่แล้ว) ต้อง DROP ทิ้งก่อนให้ create_all สร้างใหม่ด้วย schema ล่าสุด ปลอดภัยเพราะข้อมูลในนี้
     # เป็นของชั่วคราวอายุสั้นเสมอ (หมดอายุ 10 นาที) เสียทิ้งไปตอน deploy ไม่กระทบอะไร
-    with engine.connect() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS chat_pending_actions"))
-        conn.commit()
+    #
+    # แต่ต้อง DROP แค่ "ครั้งเดียวตอนย้าย schema เก่า->ใหม่" เท่านั้น ห้ามรันทุก startup เฉยๆ ไม่งั้นคิวของผู้ใช้
+    # ที่ยังค้างอยู่จริง (แม้จะอายุสั้นก็ตาม) จะหายทุกครั้งที่ redeploy/restart โดยไม่จำเป็น — เช็คก่อนว่าตารางนี้
+    # มีอยู่แล้วหรือยัง และถ้ามี ยังเป็น schema เก่า (ไม่มีคอลัมน์ "id") อยู่ไหม ก่อนจะ DROP
+    inspector = inspect(engine)
+    if inspector.has_table("chat_pending_actions"):
+        existing_columns = {col["name"] for col in inspector.get_columns("chat_pending_actions")}
+        if "id" not in existing_columns:
+            with engine.connect() as conn:
+                conn.execute(text("DROP TABLE IF EXISTS chat_pending_actions"))
+                conn.commit()
 
     Base.metadata.create_all(bind=engine)  # สร้างตารางที่ยังไม่มี (ไม่แตะตารางที่มีอยู่แล้ว)
 
@@ -1663,6 +1671,22 @@ def clear_chat_pending_actions(chat_id: int) -> None:
     with SessionLocal() as session:
         session.query(ChatPendingAction).filter(ChatPendingAction.chat_id == chat_id).delete()
         session.commit()
+
+
+def update_chat_pending_action_version(pending_id: int, version_marker) -> None:
+    """อัปเดต version_id_at_propose ใน action_json ของรายการที่ยังค้างอยู่ในคิว (ไม่ลบ/ไม่สร้างแถวใหม่ — แก้แค่
+    ฟิลด์นี้) เรียกตอนรายการอื่นในคิวถูก apply สำเร็จแล้วจริง (เอกสารขยับเวอร์ชันไปแล้ว) แต่รายการนี้ยังไม่ถูก
+    ยืนยัน ต้องขยับ baseline ของมันตามไปด้วย ไม่งั้น _pending_queue_baseline_valid (main.py) รอบถัดไปจะเข้าใจผิด
+    ว่ามีการแก้จากนอกคิวแทรกเข้ามา (ทั้งที่ความจริงคือ apply รายการอื่นในคิวเดียวกันสำเร็จตามปกติ) ไม่ error ถ้า
+    ไม่มีแถวอยู่แล้ว (เช่นถูกลบไปพร้อมกันในคำสั่งเดียวกัน — ไม่ใช่ race จริง เพราะ apply ทำทีละรายการในโปรเซส
+    เดียว แต่กันไว้เผื่อ)"""
+    with SessionLocal() as session:
+        row = session.get(ChatPendingAction, pending_id)
+        if row is not None:
+            action = dict(row.action_json)
+            action["version_id_at_propose"] = version_marker
+            row.action_json = action
+            session.commit()
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------

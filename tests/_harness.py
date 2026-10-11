@@ -70,7 +70,8 @@ WANTED_MAIN_CONSTS = {
     "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS", "PENDING_ACTION_TTL_SECONDS",
     "_LABEL_TRAILING_PUNCTUATION", "_TABLE_NON_FORMULA_AMOUNT_ERROR",
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
-    "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE", "_FABRICATED_EDIT_CLAIM_PATTERNS",
+    "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
+    "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES",
     "_POLITE_PARTICLE_COMPOUND_RE", "_POLITE_PARTICLE_TRAILING_RE",
 }
@@ -203,6 +204,13 @@ class _FakeDb:
     def clear_chat_pending_actions(self, chat_id):
         self.pending_actions.pop(chat_id, None)
 
+    def update_chat_pending_action_version(self, pending_id, version_marker):
+        for rows in self.pending_actions.values():
+            for row in rows:
+                if row["id"] == pending_id:
+                    row["action"] = dict(row["action"])
+                    row["action"]["version_id_at_propose"] = version_marker
+
     def add_storage_blob(self, storage_key: str, value) -> None:
         """value: bytes (คืนตรงๆ) หรือ Exception instance (raise เมื่อถูกเรียก) — จำลอง storage_get จริง"""
         self.storage_blobs = getattr(self, "storage_blobs", {})
@@ -329,6 +337,7 @@ def build_namespace() -> dict:
         "get_chat_pending_actions": fake_db.get_chat_pending_actions,
         "delete_chat_pending_action": fake_db.delete_chat_pending_action,
         "clear_chat_pending_actions": fake_db.clear_chat_pending_actions,
+        "update_chat_pending_action_version": fake_db.update_chat_pending_action_version,
         "list_active_editable_documents_by_chat": fake_db.list_active_editable_documents_by_chat,
         "create_editable_document": fake_db.create_editable_document,
         "get_library_file": fake_db.get_library_file,

@@ -339,6 +339,71 @@ def test_confirm_latest_applies_only_last_item(ns, doc1):
     assert len(filled) == 7  # รายการลบ (ล่าสุด) ถูก apply ไปแล้วจริง
 
 
+def test_confirm_latest_then_confirm_single_applies_remaining_item(ns, doc1):
+    """บั๊กจริงจาก review PR #28: propose VAT 10% -> propose ลบรายการที่ 3 -> "ยืนยันล่าสุด" (ลบ) ->
+    "ยืนยัน" (คิวเหลือรายการเดียว คือ VAT) ต้อง apply รายการ VAT สำเร็จจริง ไม่ใช่โดนเข้าใจผิดว่ามีการแก้นอกคิว
+    แทรกเข้ามา (เพราะ apply รายการแรกในคิวทำให้เวอร์ชันเอกสารขยับไปจริง ต้องอัปเดต version_id_at_propose ของ
+    รายการที่เหลือในคิวตามไปด้วย ไม่งั้น baseline check รอบถัดไปจะเทียบกับเวอร์ชันเก่าที่ไม่ตรงแล้วเสมอ)"""
+    r1 = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
+    assert r1["proposed"] is True
+    r2 = ns["propose_delete_table_item"](1, 1, 1, 3)
+    assert r2["proposed"] is True
+
+    queue = ns["get_chat_pending_actions"](1)
+    latest_result = ns["_handle_pending_queue_command"]("confirm_latest", queue, 1, 1)
+    assert latest_result.startswith("✓")
+    assert "เปลี่ยนไป" not in latest_result
+
+    remaining = ns["get_chat_pending_actions"](1)
+    assert len(remaining) == 1
+    assert remaining[0]["action"]["type"] == "change_rate"
+
+    final_result = ns["_handle_pending_queue_command"]("confirm_single", remaining, 1, 1)
+    assert "เปลี่ยนไป" not in final_result  # ไม่ใช่ถูกเข้าใจผิดว่ามีการแก้นอกคิวแทรก
+    assert final_result.startswith("✓ เปลี่ยนอัตรา")
+    assert ns["get_chat_pending_actions"](1) == []
+
+    updated_doc = ns["get_editable_document_raw"](1)
+    data = ns["read_document_values"](updated_doc)
+    filled = data["tables"][0]["rows"]
+    assert len(filled) == 7
+    assert not any(r["values"]["description"] == "Item C" for r in filled)
+
+    label_values = {l["label"]: l["value"] for l in data["labels"]}
+    expected_total = FIXTURE_TOTAL - 150  # Item C ที่ถูกลบ: qty 3 * unit_price 50
+    expected_vat = round(expected_total * 0.10, 2)
+    expected_grand_total = expected_total + expected_vat
+    assert label_values["รวมเงิน"] == expected_total
+    assert label_values["ภาษีมูลค่าเพิ่ม 7%"] == expected_vat  # key ชื่อเดิมแช่แข็งไว้ แต่ค่าเป็น 10% แล้ว
+    assert label_values["รวมราคาทั้งสิ้น"] == expected_grand_total
+
+
+def test_confirm_latest_then_external_edit_still_clears_remaining_queue(ns, doc1):
+    """การอัปเดต version_id_at_propose ของรายการที่เหลือหลัง apply บางส่วนสำเร็จ (บั๊กที่เพิ่งแก้ข้างบน) ต้องไม่
+    ทำให้การตรวจจับ "มีการแก้จากนอกคิวแทรก" เสียไป — ยืนยันล่าสุดสำเร็จ แล้วมีการแก้จากนอกคิวแทรกเข้ามาอีกที (ไม่
+    ผ่านกลไกคิวเลย) ก่อนยืนยันรายการที่เหลือ ต้องยังล้างคิวทั้งหมดทิ้งและแจ้งผู้ใช้เหมือนเดิม ไม่ใช่ apply ทับไป
+    เงียบๆ"""
+    ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
+    ns["propose_delete_table_item"](1, 1, 1, 3)
+    queue = ns["get_chat_pending_actions"](1)
+    ns["_handle_pending_queue_command"]("confirm_latest", queue, 1, 1)
+
+    doc = ns["get_editable_document_raw"](1)
+    base_bytes, label_map = ns["get_working_copy"](doc)
+
+    def _external_mutate(wb):
+        ws = wb["Quotation"]
+        ws.cell(row=16, column=2, value="Changed from outside the queue again")
+
+    ns["create_new_version"](1, _external_mutate, change_summary="external edit 2")
+
+    remaining = ns["get_chat_pending_actions"](1)
+    assert len(remaining) == 1
+    answer = ns["_handle_pending_queue_command"]("confirm_single", remaining, 1, 1)
+    assert "เปลี่ยนไป" in answer
+    assert ns["get_chat_pending_actions"](1) == []
+
+
 def test_identity_based_resolution_survives_prior_delete_in_queue(ns, doc1):
     """เสนอแก้รายการที่ 5 (Item E) ก่อน แล้วเสนอลบรายการที่ 1 (Item A) ทีหลัง — ตอน apply ทั้งคิว การแก้ Item E
     ต้องยัง "เจอ Item E ถูกตัว" แม้ว่ารายการก่อนหน้ามันจะถูกลบไปจริงแล้ว (เลื่อนตำแหน่งแถว) ไม่ใช่ไปแก้แถวอื่นผิด
@@ -514,6 +579,25 @@ def test_rag_answer_blocks_fabricated_edit_claim_without_receipts(ns, doc1):
     ns["_fake_agentic_loop"].set_response("✓ แก้รายการเรียบร้อยแล้วครับ", [], False)
     answer, sources = ns["rag_answer"]("เปลี่ยน Box 4x4 เป็น 7x7", user_id=1, chat_id=1, structural_route=False)
     assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
+def test_rag_answer_blocks_claim_with_filler_words_between_verb_and_done(ns, doc1):
+    """"ลบรายการที่ 3 แล้วครับ" (มีข้อความคั่นกลางระหว่าง "ลบ" กับ "แล้ว" ไม่ใช่ "ลบแล้ว" ติดกันเป๊ะ) ต้องยังถูก
+    จับได้เหมือนเดิม แม้ structural_route=False — ไม่ได้พึ่งคำว่า "ยืนยัน"/"preview"/"✓" เลย"""
+    ns["_fake_agentic_loop"].set_response("ลบรายการที่ 3 แล้วครับ", [], False)
+    answer, sources = ns["rag_answer"]("ลบรายการที่ 3", user_id=1, chat_id=1, structural_route=False)
+    assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
+def test_rag_answer_does_not_block_legal_confirm_word_even_with_active_docs(ns, doc1):
+    """review PR #28 จุดที่ 3: คำตอบกฎหมายปกติที่มีคำว่า "ยืนยัน" ปนอยู่ (เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี") ต้อง
+    ไม่ถูก block แม้มีเอกสารเปิดอยู่ในแชทจริงก็ตาม (เดิมกว้างไป บล็อกผิดเพราะเช็ค "ยืนยัน" ทุกเส้นทางที่มีเอกสาร
+    เปิดอยู่ — "ยืนยัน"/"preview"/"✓" ควรเช็คเฉพาะตอน structural_route=True เท่านั้น เพราะมีแต่เส้นทางนั้นที่คำพวก
+    นี้บ่งบอกการแต่ง preview/ยืนยันปลอมได้จริง)"""
+    ns["_fake_agentic_loop"].set_response("ต้องยืนยันตัวตนก่อนยื่นภาษีครับ", [], False)
+    answer, sources = ns["rag_answer"]("ต้องทำอะไรก่อนยื่นภาษี", user_id=1, chat_id=1, structural_route=False)
+    assert answer != ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+    assert "ยืนยันตัวตน" in answer
 
 
 def test_rag_answer_does_not_block_normal_legal_answer_without_active_docs(ns):
