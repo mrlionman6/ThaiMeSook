@@ -282,15 +282,23 @@ class ChatDocumentFocus(Base):
 
 
 class ChatPendingAction(Base):
-    """การแก้โครงสร้าง Excel (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ที่รอผู้ใช้ยืนยัน ("ยืนยัน"/"ยกเลิก") ก่อนลงมือ
-    จริง — เก็บ action_json (สิ่งที่จะทำ ถ้ายืนยัน) และ preview_text (ข้อความ preview ที่โชว์ไปแล้ว ใช้ย้อนดู/
-    debug เท่านั้น ไม่ได้ใช้ตัดสินใจอะไรตอน execute) 1 แชทมีได้แค่รายการเดียว ณ เวลาหนึ่ง (chat_id เป็น primary
-    key ตรงๆ แทนที่แถวเดิมเสมอเมื่อมี pending action ใหม่ — รูปแบบเดียวกับ ChatLastListing/ChatDocumentFocus
-    ด้านบน) หมดอายุ 10 นาทีนับจาก created_at (เช็คใน main.py ไม่ใช่ที่นี่ — ดู get_chat_pending_action) ไม่ต้อง
-    ALTER ตารางเดิมเลย เป็นตารางใหม่ล้วนๆ"""
+    """คิวการแก้โครงสร้าง Excel (เปลี่ยนอัตรา/ลบ/เพิ่ม/แก้ค่าของรายการในตาราง) ที่รอผู้ใช้ยืนยัน ("ยืนยัน"/
+    "ยืนยันทั้งหมด"/"ยืนยันล่าสุด"/"ยกเลิก") ก่อนลงมือจริง — เก็บ action_json (สิ่งที่จะทำ ถ้ายืนยัน รวม identity
+    ของเป้าหมายไว้ด้วย ดู main.py) และ preview_text (ข้อความ preview ที่โชว์ไปแล้ว ใช้ย้อนดู/debug เท่านั้น ไม่ได้
+    ใช้ตัดสินใจอะไรตอน execute)
+
+    เปลี่ยนจาก "1 แชทมีได้แค่รายการเดียว" (เวอร์ชันก่อนหน้า — chat_id เป็น primary key ตรงๆ แทนที่แถวเดิมเสมอ)
+    เป็นคิวหลายรายการต่อแชท: id เป็น primary key (auto-increment) เรียงลำดับตาม id/created_at เสมอ, chat_id
+    เป็นแค่คอลัมน์ธรรมดา (มี index ช่วยค้น ไม่ unique อีกต่อไป) ต่อท้ายคิวได้เรื่อยๆ ไม่ทับของเดิม หมดอายุ 10 นาที
+    นับจาก "รายการล่าสุดของคิว" (เช็คใน main.py ไม่ใช่ที่นี่ — ดู _is_pending_queue_fresh)
+
+    migration: ตาราง schema เดิม (chat_id เป็น primary key, 1 แถวต่อแชท) ถูก DROP แล้วสร้างใหม่ด้วย schema นี้ใน
+    init_db() เพราะ pending action เป็นข้อมูลชั่วคราวอายุสั้นอยู่แล้ว (10 นาที) เสียของเก่าทิ้งไปตอน deploy ไม่
+    กระทบอะไร (ดีกว่าพยายาม ALTER เปลี่ยน primary key ซึ่งซับซ้อนกว่ามากสำหรับข้อมูลที่ไม่มีค่าให้รักษาไว้เลย)"""
     __tablename__ = "chat_pending_actions"
 
-    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
     action_json = Column(JSON, nullable=False)
     preview_text = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
@@ -401,6 +409,14 @@ def init_db():
     ปลอดภัยรันซ้ำได้ (idempotent) ทั้ง fresh DB และ DB ที่มีข้อมูลอยู่แล้ว"""
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        conn.commit()
+
+    # migration: chat_pending_actions เปลี่ยนจาก "1 แถวต่อแชท" (chat_id เป็น primary key) เป็นคิวหลายแถวต่อแชท
+    # (id auto-increment เป็น primary key แทน) — create_all ไม่ alter ตารางเดิมที่มี schema ไม่ตรงกันเลย (แค่ข้าม
+    # ถ้าชื่อตารางมีอยู่แล้ว) ต้อง DROP ทิ้งก่อนให้ create_all สร้างใหม่ด้วย schema ล่าสุด ปลอดภัยเพราะข้อมูลในนี้
+    # เป็นของชั่วคราวอายุสั้นเสมอ (หมดอายุ 10 นาที) เสียทิ้งไปตอน deploy ไม่กระทบอะไร
+    with engine.connect() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS chat_pending_actions"))
         conn.commit()
 
     Base.metadata.create_all(bind=engine)  # สร้างตารางที่ยังไม่มี (ไม่แตะตารางที่มีอยู่แล้ว)
@@ -1596,41 +1612,57 @@ def get_chat_last_listing(chat_id: int) -> Optional[dict]:
         }
 
 
-def set_chat_pending_action(chat_id: int, action: dict, preview_text: str) -> None:
-    """บันทึกทับ pending action ของแชทนี้เสมอ (upsert — 1 แชทมีได้แค่รายการเดียว ณ เวลาหนึ่ง) เรียกตอนเสนอ
-    preview ของการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ก่อนผู้ใช้พิมพ์ 'ยืนยัน'"""
-    now = datetime.datetime.utcnow()
+def add_chat_pending_action(chat_id: int, action: dict, preview_text: str) -> int:
+    """ต่อท้ายคิว pending action ของแชทนี้เสมอ (insert ล้วนๆ ไม่ทับของเดิม — ต่างจากเวอร์ชันก่อนหน้าที่ upsert
+    ช่องเดียว) เรียกตอนเสนอ preview ของการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่ม/แก้ค่าของรายการในตาราง) ก่อนผู้ใช้
+    พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/'ยืนยันล่าสุด' คืน id ของแถวที่เพิ่งสร้าง (ใช้อ้างอิงรายการนี้ต่อ เช่นตอน
+    'ยกเลิกล่าสุด' หรือลบทิ้งหลัง apply)"""
     with SessionLocal() as session:
-        row = session.get(ChatPendingAction, chat_id)
-        if row is None:
-            row = ChatPendingAction(chat_id=chat_id, action_json=action, preview_text=preview_text, created_at=now)
-            session.add(row)
-        else:
-            row.action_json = action
-            row.preview_text = preview_text
-            row.created_at = now
+        row = ChatPendingAction(
+            chat_id=chat_id, action_json=action, preview_text=preview_text,
+            created_at=datetime.datetime.utcnow(),
+        )
+        session.add(row)
         session.commit()
+        session.refresh(row)
+        return row.id
 
 
-def get_chat_pending_action(chat_id: int) -> Optional[dict]:
-    """คืน {"action":, "preview_text":, "created_at":} ของ pending action ล่าสุดของแชทนี้ หรือ None ถ้าไม่มี
-    เลย ไม่เช็คหมดอายุที่นี่ (ดู main.py — เทียบ created_at กับ PENDING_ACTION_TTL_SECONDS ตอนใช้งานจริง แทนที่
-    จะ hardcode นโยบายหมดอายุไว้ในชั้น DB)"""
+def get_chat_pending_actions(chat_id: int) -> list[dict]:
+    """คืนคิว pending action ทั้งหมดของแชทนี้ เรียงเก่า->ใหม่ (id เพิ่มขึ้นเสมอ) เป็น list ว่างถ้าไม่มีเลย แต่ละ
+    รายการ: {"id":, "action":, "preview_text":, "created_at":} ไม่เช็คหมดอายุที่นี่ (ดู main.py — เทียบ
+    created_at ของรายการล่าสุดกับ PENDING_ACTION_TTL_SECONDS ตอนใช้งานจริง แทนที่จะ hardcode นโยบายหมดอายุไว้
+    ในชั้น DB)"""
     with SessionLocal() as session:
-        row = session.get(ChatPendingAction, chat_id)
-        if row is None:
-            return None
-        return {"action": row.action_json, "preview_text": row.preview_text, "created_at": row.created_at}
+        rows = (
+            session.query(ChatPendingAction)
+            .filter(ChatPendingAction.chat_id == chat_id)
+            .order_by(ChatPendingAction.id)
+            .all()
+        )
+        return [
+            {"id": r.id, "action": r.action_json, "preview_text": r.preview_text, "created_at": r.created_at}
+            for r in rows
+        ]
 
 
-def clear_chat_pending_action(chat_id: int) -> None:
-    """ลบ pending action ของแชทนี้ทิ้ง (ถ้ามี) — เรียกตอนยืนยัน (ทำสำเร็จแล้ว ไม่ต้องรอซ้ำอีก) หรือยกเลิก
+def delete_chat_pending_action(pending_id: int) -> None:
+    """ลบ pending action รายการเดียวออกจากคิวด้วย id ของแถวเอง (ไม่ใช่ chat_id — คิวมีได้หลายรายการต่อแชท) —
+    เรียกตอนรายการนั้นถูก apply สำเร็จ/ล้มเหลวแล้ว (เอาออกจากคิวไม่ว่าผลจะเป็นอย่างไร) หรือ 'ยกเลิกล่าสุด'
     ไม่ error ถ้าไม่มีแถวอยู่แล้ว"""
     with SessionLocal() as session:
-        row = session.get(ChatPendingAction, chat_id)
+        row = session.get(ChatPendingAction, pending_id)
         if row is not None:
             session.delete(row)
             session.commit()
+
+
+def clear_chat_pending_actions(chat_id: int) -> None:
+    """ลบคิว pending action ทั้งหมดของแชทนี้ทิ้ง — เรียกตอน 'ยกเลิก'/'ยกเลิกทั้งหมด' หรือตอนตรวจพบว่ามีการแก้/
+    undo จากนอกคิวแทรกเข้ามา (ดู main.py) ไม่ error ถ้าไม่มีแถวอยู่แล้ว"""
+    with SessionLocal() as session:
+        session.query(ChatPendingAction).filter(ChatPendingAction.chat_id == chat_id).delete()
+        session.commit()
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------

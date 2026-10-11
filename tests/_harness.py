@@ -41,19 +41,23 @@ WANTED_MAIN_FUNCS = {
     "_suggest_similar_labels", "_normalize_label",
     "_format_rate_number", "_rewrite_percent_text", "_rewrite_rate_formula", "_resolve_rate_formula",
     "_build_rate_change_mutate_fn", "_label_side_effects", "_format_side_effect_lines",
-    "propose_change_rate", "apply_change_rate",
-    "_get_single_item_table", "apply_update_table_item",
-    "_build_delete_table_item_mutate_fn", "_describe_table_item", "propose_delete_table_item", "apply_delete_table_item",
-    "_build_add_table_item_mutate_fn", "propose_add_table_item", "apply_add_table_item",
+    "_get_single_item_table",
+    "_build_delete_table_item_mutate_fn", "_describe_table_item",
+    "_build_add_table_item_mutate_fn",
     "_table_has_non_formula_amount_value",
+    "_resolve_and_build_mutate_fn", "_replay_pending_queue",
+    "propose_change_rate", "propose_update_table_item", "propose_delete_table_item", "propose_add_table_item",
+    "_apply_single_queue_item", "_apply_pending_queue", "_pending_queue_baseline_valid",
+    "_handle_pending_queue_command",
     "undo_last_edit",
     "_is_document_reading_question", "_has_legal_keyword", "_answer_document_reading_question",
     "_is_structural_edit_command",
-    "_has_explicit_finalize_word", "_is_confirm_command", "_is_cancel_command",
-    "_is_pending_action_fresh", "_get_document_version_marker", "_execute_pending_action",
+    "_has_explicit_finalize_word", "_classify_pending_queue_command", "_is_pending_queue_fresh",
+    "_describe_pending_queue", "_get_document_version_marker",
     "_label_position", "_find_label_by_position",
     "_get_active_chat_document", "execute_open_library_file", "_normalize_filename_for_matching",
     "_match_and_apply_excel_edit", "_parse_json_response",
+    "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
 }
 
 WANTED_MAIN_CONSTS = {
@@ -62,10 +66,18 @@ WANTED_MAIN_CONSTS = {
     "FORMULA_RECALC_TIMEOUT_SECONDS", "_RATE_FORMULA_PATTERNS", "_PERCENT_IN_TEXT_RE", "_TABLE_INPUT_FIELDS",
     "_DOCUMENT_READING_QUESTION_WORDS", "_DOCUMENT_EDIT_COMMAND_WORDS", "_STRUCTURAL_ITEM_NO_RE",
     "_LEGAL_KNOWLEDGE_KEYWORDS", "_FINALIZE_EXPLICIT_WORDS",
-    "_CONFIRM_COMMAND_TEXTS", "_CANCEL_COMMAND_TEXTS", "PENDING_ACTION_TTL_SECONDS",
+    "_CONFIRM_ALL_TEXTS", "_CONFIRM_LATEST_TEXTS", "_CONFIRM_SINGLE_TEXTS",
+    "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS", "PENDING_ACTION_TTL_SECONDS",
     "_LABEL_TRAILING_PUNCTUATION", "_TABLE_NON_FORMULA_AMOUNT_ERROR",
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
+    "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE", "_FABRICATED_EDIT_CLAIM_PATTERNS",
+    "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES",
+    "_POLITE_PARTICLE_COMPOUND_RE", "_POLITE_PARTICLE_TRAILING_RE",
 }
+
+# _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
+# โดยตรง (ทดสอบผ่าน rag_answer ซึ่งหนักเกินจะ extract ทั้งฟังก์ชัน) แต่ยังปล่อยให้ดึงได้ถ้าจำเป็นภายหลัง
+WANTED_MAIN_FUNCS.add("_looks_like_fabricated_edit_claim")
 
 WANTED_DB_FUNCS = {"_is_macro_workbook"}
 
@@ -78,13 +90,14 @@ class _FakeDb:
         self.documents: dict[int, dict] = {}
         self.versions: dict[int, list[dict]] = {}
         self.edit_logs: dict[int, dict] = {}
-        self.pending_actions: dict[int, dict] = {}
+        self.pending_actions: dict[int, list[dict]] = {}  # chat_id -> [{"id","action","preview_text","created_at"}, ...] เรียงเก่า->ใหม่
         self.focus: dict[int, int] = {}
         self.closed_ids: set[int] = set()
         self.library_files: dict[int, dict] = {}
         self._next_document_id = 1
         self._next_version_id = 1
         self._next_edit_log_id = 1
+        self._next_pending_id = 1
 
     def add_document(self, document_id: int, filename: str, original_bytes: bytes, label_map: dict,
                      chat_id: int = 1, user_id: int = 1) -> None:
@@ -170,18 +183,24 @@ class _FakeDb:
     def get_library_file(self, file_id):
         return self.library_files.get(file_id)
 
-    def set_chat_pending_action(self, chat_id, action, preview_text):
-        self.pending_actions[chat_id] = {
-            "action": action, "preview_text": preview_text, "created_at": datetime.datetime.utcnow(),
+    def add_chat_pending_action(self, chat_id, action, preview_text):
+        pending_id = self._next_pending_id
+        self._next_pending_id += 1
+        row = {
+            "id": pending_id, "action": action, "preview_text": preview_text,
+            "created_at": datetime.datetime.utcnow(),
         }
+        self.pending_actions.setdefault(chat_id, []).append(row)
+        return pending_id
 
-    def get_chat_pending_action(self, chat_id):
-        row = self.pending_actions.get(chat_id)
-        if row is None:
-            return None
-        return dict(row)
+    def get_chat_pending_actions(self, chat_id):
+        return [dict(row) for row in self.pending_actions.get(chat_id, [])]
 
-    def clear_chat_pending_action(self, chat_id):
+    def delete_chat_pending_action(self, pending_id):
+        for chat_id, rows in self.pending_actions.items():
+            self.pending_actions[chat_id] = [r for r in rows if r["id"] != pending_id]
+
+    def clear_chat_pending_actions(self, chat_id):
         self.pending_actions.pop(chat_id, None)
 
     def add_storage_blob(self, storage_key: str, value) -> None:
@@ -249,13 +268,47 @@ def _extract(tree: ast.Module, wanted_funcs: set, wanted_consts: set, ns: dict, 
         raise RuntimeError(f"ดึงฟังก์ชัน/ค่าคงที่จาก {label} ไม่ครบ: {sorted(missing)}")
 
 
+class _FakeAgenticLoop:
+    """ตัวแทน run_agentic_tool_loop ที่ควบคุมผลลัพธ์ได้ตรงๆ จากเทสต์ (ตั้งค่าผ่าน set_response ก่อนเรียก
+    rag_answer) — ใช้ทดสอบ guard logic ของ rag_answer เอง (structural_no_tool/fabricated_edit_claim_blocked)
+    แบบแยกส่วน โดยไม่ต้องเรียก Claude จริงหรือประกอบ tools list เต็มๆ (หนักเกินไปสำหรับเทสต์นี้)"""
+
+    def __init__(self):
+        self.response = ("คำตอบปกติ", [], False)
+        self.last_call_args = None
+
+    def set_response(self, text: str, receipts: list, structural_tool_called: bool) -> None:
+        self.response = (text, receipts, structural_tool_called)
+
+    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None):
+        self.last_call_args = {"system_prompt": system_prompt, "user_id": user_id, "chat_id": chat_id}
+        return self.response
+
+
+def _fake_prepare_rag_context(query, history, image_data, user_id=None, chat_id=None):
+    """ตัวแทน _prepare_rag_context แบบง่ายที่สุด (ไม่ค้น KB จริง ไม่เรียก Claude) — คืน ctx dict รูปแบบเดียวกับ
+    ของจริงพอให้ rag_answer ทำงานต่อได้ ใช้เฉพาะทดสอบ guard logic ของ rag_answer เอง"""
+    return {
+        "early_exit": False, "system_prompt": "ระบบทดสอบ", "messages": [{"role": "user", "content": query}],
+        "top_chunks": [], "scores": [],
+    }
+
+
+def _fake_log_if_low_confidence(query, answer, top_chunks, scores):
+    pass
+
+
 def build_namespace() -> dict:
     """คืน namespace (dict) ที่มีฟังก์ชันจริงจาก main.py/db.py ครบตาม WANTED_* ข้างบน ผูกกับ fake db ตัวใหม่
     (แยกกันทุกครั้งที่เรียก กันเทสต์หนึ่งกระทบอีกเทสต์หนึ่ง)"""
     fake_db = _FakeDb()
     fake_client = _FakeAnthropicClient()
+    fake_agentic_loop = _FakeAgenticLoop()
 
     ns = {
+        "run_agentic_tool_loop": fake_agentic_loop,
+        "_prepare_rag_context": _fake_prepare_rag_context,
+        "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "json": json, "zipfile": zipfile, "difflib": difflib, "datetime": datetime,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
@@ -272,9 +325,10 @@ def build_namespace() -> dict:
         "log_document_edit": fake_db.log_document_edit,
         "set_chat_document_focus": fake_db.set_chat_document_focus,
         "get_chat_document_focus": fake_db.get_chat_document_focus,
-        "set_chat_pending_action": fake_db.set_chat_pending_action,
-        "get_chat_pending_action": fake_db.get_chat_pending_action,
-        "clear_chat_pending_action": fake_db.clear_chat_pending_action,
+        "add_chat_pending_action": fake_db.add_chat_pending_action,
+        "get_chat_pending_actions": fake_db.get_chat_pending_actions,
+        "delete_chat_pending_action": fake_db.delete_chat_pending_action,
+        "clear_chat_pending_actions": fake_db.clear_chat_pending_actions,
         "list_active_editable_documents_by_chat": fake_db.list_active_editable_documents_by_chat,
         "create_editable_document": fake_db.create_editable_document,
         "get_library_file": fake_db.get_library_file,
@@ -288,6 +342,7 @@ def build_namespace() -> dict:
 
     ns["_fake_db"] = fake_db
     ns["_fake_client"] = fake_client
+    ns["_fake_agentic_loop"] = fake_agentic_loop
     return ns
 
 
