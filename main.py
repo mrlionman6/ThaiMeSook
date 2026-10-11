@@ -3243,9 +3243,11 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
             else:
                 # เส้นทางทั่วไป (ไม่ใช่คำสั่งแก้โครงสร้าง): คำตอบกฎหมายปกติมักมีกริยา "แก้/เปลี่ยน/ลบ/เพิ่ม" กับ
                 # "แล้ว" ปนอยู่ในประโยคโดยไม่เกี่ยวกับการแก้ไฟล์เลย (เช่น "ต้องยื่นคำขอแล้วรออนุมัติ") — ถ้าคำถาม
-                # เป็นคำถามเชิงกฎหมาย (ดู _has_legal_keyword) หรือคำตอบมาจากฐานความรู้จริง (มี source จาก RAG —
-                # ctx["top_chunks"] ไม่ว่าง) ให้ข้าม guard นี้ไปเลย ไม่เสี่ยงบล็อกคำตอบกฎหมายที่ถูกต้องผิดๆ
-                is_legal_answer = _has_legal_keyword(query) or bool(ctx["top_chunks"])
+                # เป็นคำถามเชิงกฎหมาย (ดู _has_legal_keyword) ให้ข้าม guard นี้ไปเลย ไม่เสี่ยงบล็อกคำตอบกฎหมายที่
+                # ถูกต้องผิดๆ (ไม่ใช้ ctx["top_chunks"] เป็นเงื่อนไขร่วม — rerank_with_scores คืน top_k=5 เสมอใน
+                # production ไม่มี threshold กรองทิ้ง ทำให้ไม่ว่างแทบทุกครั้งอยู่แล้ว ไม่ได้แปลว่าคำตอบมาจาก RAG
+                # จริงๆ — regex ด้านล่างแคบพอแล้วที่จะพึ่งมันอย่างเดียวได้)
+                is_legal_answer = _has_legal_keyword(query)
                 should_block = not is_legal_answer and _looks_like_fabricated_edit_claim(raw_answer, structural_route=False)
             if should_block:
                 print(f"[Guard] fabricated_edit_claim_blocked chat={chat_id}")

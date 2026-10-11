@@ -629,6 +629,31 @@ def test_rag_answer_blocks_additional_fabricated_claim_phrasings(ns, doc1, answe
     assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
 
 
+def test_rag_answer_blocks_fabricated_claim_even_with_nonempty_top_chunks(ns, doc1):
+    """review PR #28 รอบ 3: ctx["top_chunks"] ไม่ว่างเกือบทุกครั้งใน production จริง (rerank_with_scores คืน
+    top_k=5 เสมอ ไม่มี threshold กรองทิ้ง) ไม่ได้แปลว่าคำตอบมาจากฐานความรู้จริงเสมอไป — guard ต้องไม่พึ่งมันเป็น
+    เงื่อนไขเลย คำถามที่ไม่มีคำเชิงกฎหมายปนมา + คำตอบที่ยังอ้างว่าแก้สำเร็จ ต้องยังถูก block แม้ top_chunks ไม่ว่าง"""
+    ns["_fake_rag_context"].top_chunks = ["chunk 1 เนื้อหาอะไรสักอย่างจากฐานความรู้", "chunk 2"]
+    ns["_fake_agentic_loop"].set_response("ลบรายการที่ 3 แล้วครับ", [], False)
+    answer, sources = ns["rag_answer"]("ลบรายการที่ 3", user_id=1, chat_id=1, structural_route=False)
+    assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
+@pytest.mark.parametrize("query,answer_text", [
+    ("เพิ่มทุนจดทะเบียนต้องทำอย่างไร", "ถ้าต้องการเพิ่มทุนจดทะเบียน ต้องยื่นคำขอแล้วรออนุมัติ"),
+    ("แก้ไขหนังสือบริคณห์สนธิต้องทำอย่างไร", "หากแก้ไขหนังสือบริคณห์สนธิแล้ว ต้องแจ้งกรมพัฒน์ภายใน 14 วัน"),
+    ("ผู้ถือหุ้นต่างด้าวเปลี่ยนสัญชาติต้องตรวจอะไรบ้าง", "บริษัทที่เปลี่ยนสัญชาติผู้ถือหุ้นแล้วต้องตรวจ FBA"),
+])
+def test_rag_answer_does_not_block_legal_sentences_with_nonempty_top_chunks(ns, doc1, query, answer_text):
+    """ประโยคกฎหมายปกติทั้ง 3 ข้างบน (ที่ regex ไม่จับอยู่แล้วจากรอบ 2) ต้องไม่ถูก block แม้ ctx["top_chunks"] ไม่
+    ว่างเหมือนสถานการณ์จริงใน production ก็ตาม (ยืนยันว่าไม่ถูก block ด้วย _has_legal_keyword(query) อย่างเดียว
+    ไม่ใช่เพราะ top_chunks ว่างเปล่าในเทสต์)"""
+    ns["_fake_rag_context"].top_chunks = ["chunk 1 เนื้อหาอะไรสักอย่างจากฐานความรู้", "chunk 2"]
+    ns["_fake_agentic_loop"].set_response(answer_text, [], False)
+    answer, sources = ns["rag_answer"](query, user_id=1, chat_id=1, structural_route=False)
+    assert answer != ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
+
+
 def test_rag_answer_does_not_block_normal_legal_answer_without_active_docs(ns):
     """คำตอบกฎหมายปกติที่บังเอิญมีคำว่า "ยืนยัน" ปนอยู่ (เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี") แต่ไม่มีเอกสารเปิดอยู่
     เลย -> ไม่ควรถูก guard บล็อก (กันคำว่า "ยืนยัน" ที่เป็นคำปกติถูกเหมาเข่งผิดๆ)"""

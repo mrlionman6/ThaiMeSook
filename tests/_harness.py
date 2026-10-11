@@ -293,13 +293,20 @@ class _FakeAgenticLoop:
         return self.response
 
 
-def _fake_prepare_rag_context(query, history, image_data, user_id=None, chat_id=None):
-    """ตัวแทน _prepare_rag_context แบบง่ายที่สุด (ไม่ค้น KB จริง ไม่เรียก Claude) — คืน ctx dict รูปแบบเดียวกับ
-    ของจริงพอให้ rag_answer ทำงานต่อได้ ใช้เฉพาะทดสอบ guard logic ของ rag_answer เอง"""
-    return {
-        "early_exit": False, "system_prompt": "ระบบทดสอบ", "messages": [{"role": "user", "content": query}],
-        "top_chunks": [], "scores": [],
-    }
+class _FakeRagContext:
+    """ตัวแทน _prepare_rag_context ที่ตั้งค่า top_chunks ได้จากเทสต์ตรงๆ (ค่าเริ่มต้นว่างเปล่า) — ใช้ยืนยันว่า
+    guard fabricated_edit_claim_blocked ของ rag_answer ไม่พึ่ง ctx["top_chunks"] เป็นเงื่อนไขเลย (ใน production
+    rerank_with_scores คืน top_k=5 เสมอไม่มี threshold กรองทิ้ง จึงแทบไม่เคยว่างเปล่าจริงๆ — ไม่ได้แปลว่าคำตอบมา
+    จากฐานความรู้จริงเสมอไป) ค่าเริ่มต้นว่างเปล่าเหมือนเดิมสำหรับเทสต์อื่นที่ไม่เกี่ยวข้องกับเงื่อนไขนี้"""
+
+    def __init__(self):
+        self.top_chunks: list = []
+
+    def __call__(self, query, history, image_data, user_id=None, chat_id=None):
+        return {
+            "early_exit": False, "system_prompt": "ระบบทดสอบ", "messages": [{"role": "user", "content": query}],
+            "top_chunks": self.top_chunks, "scores": [0.9] * len(self.top_chunks),
+        }
 
 
 def _fake_log_if_low_confidence(query, answer, top_chunks, scores):
@@ -312,10 +319,11 @@ def build_namespace() -> dict:
     fake_db = _FakeDb()
     fake_client = _FakeAnthropicClient()
     fake_agentic_loop = _FakeAgenticLoop()
+    fake_rag_context = _FakeRagContext()
 
     ns = {
         "run_agentic_tool_loop": fake_agentic_loop,
-        "_prepare_rag_context": _fake_prepare_rag_context,
+        "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "json": json, "zipfile": zipfile, "difflib": difflib, "datetime": datetime,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
@@ -352,6 +360,7 @@ def build_namespace() -> dict:
     ns["_fake_db"] = fake_db
     ns["_fake_client"] = fake_client
     ns["_fake_agentic_loop"] = fake_agentic_loop
+    ns["_fake_rag_context"] = fake_rag_context
     return ns
 
 
