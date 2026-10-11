@@ -281,6 +281,21 @@ class ChatDocumentFocus(Base):
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class ChatPendingAction(Base):
+    """การแก้โครงสร้าง Excel (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ที่รอผู้ใช้ยืนยัน ("ยืนยัน"/"ยกเลิก") ก่อนลงมือ
+    จริง — เก็บ action_json (สิ่งที่จะทำ ถ้ายืนยัน) และ preview_text (ข้อความ preview ที่โชว์ไปแล้ว ใช้ย้อนดู/
+    debug เท่านั้น ไม่ได้ใช้ตัดสินใจอะไรตอน execute) 1 แชทมีได้แค่รายการเดียว ณ เวลาหนึ่ง (chat_id เป็น primary
+    key ตรงๆ แทนที่แถวเดิมเสมอเมื่อมี pending action ใหม่ — รูปแบบเดียวกับ ChatLastListing/ChatDocumentFocus
+    ด้านบน) หมดอายุ 10 นาทีนับจาก created_at (เช็คใน main.py ไม่ใช่ที่นี่ — ดู get_chat_pending_action) ไม่ต้อง
+    ALTER ตารางเดิมเลย เป็นตารางใหม่ล้วนๆ"""
+    __tablename__ = "chat_pending_actions"
+
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    action_json = Column(JSON, nullable=False)
+    preview_text = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class ChatLastListing(Base):
     """รายการล่าสุดที่เครื่องมือค้นคลังไฟล์ (find_customers/list_customer_documents/list_project_documents/
     list_templates) แสดงให้ผู้ใช้ดูในแชทนี้ — ใช้โดย select_list_item() (main.py) แปล "ข้อ 2"/"อันแรก"/ชื่อที่
@@ -1579,6 +1594,43 @@ def get_chat_last_listing(chat_id: int) -> Optional[dict]:
             "message_count_at_creation": stored.get("message_count_at_creation"),
             "created_at": row.created_at,
         }
+
+
+def set_chat_pending_action(chat_id: int, action: dict, preview_text: str) -> None:
+    """บันทึกทับ pending action ของแชทนี้เสมอ (upsert — 1 แชทมีได้แค่รายการเดียว ณ เวลาหนึ่ง) เรียกตอนเสนอ
+    preview ของการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ก่อนผู้ใช้พิมพ์ 'ยืนยัน'"""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        row = session.get(ChatPendingAction, chat_id)
+        if row is None:
+            row = ChatPendingAction(chat_id=chat_id, action_json=action, preview_text=preview_text, created_at=now)
+            session.add(row)
+        else:
+            row.action_json = action
+            row.preview_text = preview_text
+            row.created_at = now
+        session.commit()
+
+
+def get_chat_pending_action(chat_id: int) -> Optional[dict]:
+    """คืน {"action":, "preview_text":, "created_at":} ของ pending action ล่าสุดของแชทนี้ หรือ None ถ้าไม่มี
+    เลย ไม่เช็คหมดอายุที่นี่ (ดู main.py — เทียบ created_at กับ PENDING_ACTION_TTL_SECONDS ตอนใช้งานจริง แทนที่
+    จะ hardcode นโยบายหมดอายุไว้ในชั้น DB)"""
+    with SessionLocal() as session:
+        row = session.get(ChatPendingAction, chat_id)
+        if row is None:
+            return None
+        return {"action": row.action_json, "preview_text": row.preview_text, "created_at": row.created_at}
+
+
+def clear_chat_pending_action(chat_id: int) -> None:
+    """ลบ pending action ของแชทนี้ทิ้ง (ถ้ามี) — เรียกตอนยืนยัน (ทำสำเร็จแล้ว ไม่ต้องรอซ้ำอีก) หรือยกเลิก
+    ไม่ error ถ้าไม่มีแถวอยู่แล้ว"""
+    with SessionLocal() as session:
+        row = session.get(ChatPendingAction, chat_id)
+        if row is not None:
+            session.delete(row)
+            session.commit()
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน แบ่งเป็นหมวด/โฟลเดอร์) ----------

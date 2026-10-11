@@ -105,6 +105,9 @@ from db import (
     log_document_edit,
     get_recent_document_edits,
     get_document_edit_count,
+    set_chat_pending_action,
+    get_chat_pending_action,
+    clear_chat_pending_action,
 )
 
 import os
@@ -126,6 +129,7 @@ import openpyxl
 import xlrd
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.workbook.properties import CalcProperties
+from openpyxl.cell.cell import MergedCell
 from pycel import ExcelCompiler
 from typing import Optional
 from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
@@ -1437,6 +1441,81 @@ CHAT_DOCUMENT_TOOLS = [
             "required": ["document_id"],
         },
     },
+    {
+        "name": "change_rate",
+        "description": (
+            "เสนอเปลี่ยนอัตรา (เช่น VAT 7% เป็น 10%) ของช่องที่เป็นสูตรคำนวณในไฟล์ที่เปิดอยู่ในแชทนี้ รองรับเฉพาะ"
+            "สูตรรูปแบบ *N/100, *N%, *0.0N, /100*N เท่านั้น ยังไม่แก้ไฟล์จริงทันที — ระบบจะแสดง preview ให้ผู้ใช้"
+            "พิมพ์ 'ยืนยัน' หรือ 'ยกเลิก' เองก่อนเสมอ ต้องเรียก read_document_values ก่อนเพื่อยืนยันชื่อ label ที่"
+            "ถูกต้อง ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะแก้"},
+                "label": {"type": "string", "description": "ชื่อ label ของช่องอัตรา เช่น 'ภาษีมูลค่าเพิ่ม 7%'"},
+                "new_rate": {"type": "number", "description": "อัตราใหม่เป็นเปอร์เซ็นต์ (ตัวเลขเท่านั้น) เช่น 10 สำหรับ 10%"},
+            },
+            "required": ["document_id", "label", "new_rate"],
+        },
+    },
+    {
+        "name": "update_table_item",
+        "description": (
+            "แก้ค่าคอลัมน์ input (ลำดับ/รายละเอียด/จำนวน/หน่วย/ราคาต่อหน่วย — ไม่ใช่จำนวนเงินซึ่งเป็นสูตร) ของ"
+            "รายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ แก้ทันทีไม่ต้องยืนยัน ต้องเรียก "
+            "read_document_values ก่อนเพื่อยืนยัน item_no ที่ถูกต้อง ต้องเป็น document_id ที่ได้จาก "
+            "list_chat_documents เท่านั้น"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะแก้"},
+                "item_no": {"type": "integer", "description": "ลำดับรายการในตาราง (นับจากรายการที่ไม่ว่างรายการแรก = 1)"},
+                "fields": {
+                    "type": "object",
+                    "description": "ค่าใหม่ของคอลัมน์ input ที่จะแก้ เช่น {\"description\": \"Box 7x7\", \"qty\": 15}",
+                },
+            },
+            "required": ["document_id", "item_no", "fields"],
+        },
+    },
+    {
+        "name": "delete_table_item",
+        "description": (
+            "เสนอลบรายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ (รายการถัดไปจะเลื่อนขึ้นมาแทน) "
+            "ยังไม่ลบจริงทันที — ระบบจะแสดง preview ให้ผู้ใช้พิมพ์ 'ยืนยัน' หรือ 'ยกเลิก' เองก่อนเสมอ ต้องเรียก "
+            "read_document_values ก่อนเพื่อยืนยัน item_no ที่ถูกต้อง ต้องเป็น document_id ที่ได้จาก "
+            "list_chat_documents เท่านั้น"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะแก้"},
+                "item_no": {"type": "integer", "description": "ลำดับรายการในตารางที่จะลบ (นับจากรายการที่ไม่ว่างรายการแรก = 1)"},
+            },
+            "required": ["document_id", "item_no"],
+        },
+    },
+    {
+        "name": "add_table_item",
+        "description": (
+            "เสนอเพิ่มรายการใหม่ในแถวว่างแรกของตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ ยังไม่เพิ่มจริงทันที — "
+            "ระบบจะแสดง preview ให้ผู้ใช้พิมพ์ 'ยืนยัน' หรือ 'ยกเลิก' เองก่อนเสมอ ถ้าตารางเต็มแล้วจะไม่เสนอและ"
+            "แจ้งว่าตารางเต็ม ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "document_id": {"type": "integer", "description": "document_id ของไฟล์ที่จะแก้"},
+                "fields": {
+                    "type": "object",
+                    "description": "ค่าของรายการใหม่ เช่น {\"description\": \"Box 4x4\", \"qty\": 5, \"unit\": \"ชิ้น\", \"unit_price\": 50}",
+                },
+            },
+            "required": ["document_id", "fields"],
+        },
+    },
 ]
 
 
@@ -1706,6 +1785,42 @@ def execute_read_document_values(tool_input: dict, user_id: int, chat_id: int) -
     return {"text": text}
 
 
+def execute_change_rate(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_change_rate — เสนอ preview เท่านั้น
+    ยังไม่แก้ไฟล์จริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    return propose_change_rate(doc["id"], user_id, chat_id, tool_input.get("label"), tool_input.get("new_rate"))
+
+
+def execute_update_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก apply_update_table_item — แก้ทันทีไม่ต้องยืนยัน
+    (คอลัมน์ input เท่านั้น ไม่ใช่คอลัมน์สูตร)"""
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    return apply_update_table_item(doc["id"], user_id, tool_input.get("item_no"), tool_input.get("fields") or {})
+
+
+def execute_delete_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_delete_table_item — เสนอ preview
+    เท่านั้น ยังไม่ลบจริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    return propose_delete_table_item(doc["id"], user_id, chat_id, tool_input.get("item_no"))
+
+
+def execute_add_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_add_table_item — เสนอ preview เท่านั้น
+    ยังไม่เพิ่มจริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
+    if doc is None:
+        return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
+    return propose_add_table_item(doc["id"], user_id, chat_id, tool_input.get("fields") or {})
+
+
 _UNDO_COMMAND_TEXTS = ("ย้อนการแก้", "undo")
 
 
@@ -1714,6 +1829,201 @@ def _is_undo_command(query: str) -> bool:
     ช่องว่างหัวท้าย) ใช้ดักก่อนเรียก _classify_excel_editor_intent (LLM) ใน ask_question() — คำสั่งชัดเจนแบบนี้
     ไม่ต้องเสีย API call ไปตีความ และกันความเสี่ยงที่ LLM จะตีความผิดเป็นคำสั่งแก้ค่าแทน"""
     return query.strip().lower() in _UNDO_COMMAND_TEXTS
+
+
+# คำที่บ่งบอกว่าข้อความนี้เป็นคำถามเกี่ยวกับเนื้อหาไฟล์ ไม่ใช่คำสั่งแก้/จบงาน — ใช้ดักก่อนส่งเข้า
+# _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close เท่านั้น ไม่มีหมวด "ถาม") ดู
+# docstring ของ _is_document_reading_question
+# "ดู" ไม่อยู่ในชุดนี้โดยตั้งใจ — เช็คแยกต่างหากใน _is_document_reading_question (ต้องเป็นคำขึ้นต้นหรือ
+# "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring เช่น "ดูดี" ในชื่อบริษัท)
+_DOCUMENT_READING_QUESTION_WORDS = ("อะไร", "เท่าไร", "บ้าง", "ไหม", "กี่", "แสดง", "สรุป")
+
+
+_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน")
+
+
+def _is_document_reading_question(query: str) -> bool:
+    """เช็คว่าข้อความนี้ดูเหมือนคำถามเกี่ยวกับเนื้อหา/ค่าของไฟล์ไหม (เช่น "มีรายการอะไรบ้าง", "ยอดรวมตอนนี้
+    เท่าไร") — ใช้ดักใน ask_question() ก่อนเข้า branch ตัดสินใจของ Excel editor (single/multi-document) เสมอ
+    เหตุการณ์จริงที่แก้: _classify_excel_editor_intent มีแค่ 4 หมวด (edit/finalize/compare/close) ไม่มีหมวด
+    "ถาม" เลย คำถามแบบนี้เคยถูกเดาเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งหาค่าใหม่ที่จะแก้ไม่เจอ
+    ตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ — คำถามแบบนี้ควรปล่อยผ่าน flow ปกติ
+    (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เองแทน
+
+    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำเชิงคำถามปน
+    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มี "ไหม" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถาม
+    อ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี
+    "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
+    stripped = query.strip()
+    if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
+        return False
+    if "?" in stripped or any(word in stripped for word in _DOCUMENT_READING_QUESTION_WORDS):
+        return True
+    if "ขอดู" in stripped or "ดูรายการ" in stripped:
+        return True
+    tokens = word_tokenize(stripped, engine="newmm")
+    return bool(tokens) and tokens[0] == "ดู"
+
+
+# คำที่บ่งบอกว่าคำถามนี้เป็นคำถามเชิงความรู้กฎหมาย/ธุรกิจ (ต้องไปทาง RAG/ฐานความรู้) ไม่ใช่คำถามเรื่องเนื้อหา
+# ไฟล์ที่เปิดอยู่ แม้จะมีคำเชิงคำถามปนมาด้วยก็ตาม (เช่น "ธุรกิจบัญชีสามมีอะไรบ้าง" มีคำว่า "อะไร"/"บ้าง" แต่เป็น
+# คำถามกฎหมาย ไม่ใช่คำถามเรื่องไฟล์) เช็คแบบไม่สนตัวพิมพ์เล็กใหญ่ (ครอบคลุม FBA/BOI ภาษาอังกฤษด้วย)
+_LEGAL_KNOWLEDGE_KEYWORDS = ("fba", "boi", "ต่างด้าว", "บัญชี", "กฎหมาย", "ใบอนุญาต")
+
+
+def _has_legal_keyword(query: str) -> bool:
+    """เช็คว่าข้อความนี้มีคำเชิงความรู้กฎหมาย/ธุรกิจปนมาไหม (ดู _LEGAL_KNOWLEDGE_KEYWORDS) — ใช้แยกคำถามเรื่อง
+    เนื้อหาไฟล์ (ตอบด้วย read_document_values ตรงๆ ไม่ผ่าน RAG) ออกจากคำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา
+    ด้วย (เช่น "ธุรกิจบัญชีสามมีอะไรบ้าง" ต้องไปทาง RAG ไม่ใช่ไปอ่านไฟล์)"""
+    return any(kw in query.lower() for kw in _LEGAL_KNOWLEDGE_KEYWORDS)
+
+
+# regex จับ "รายการที่ N" (เช่น "รายการที่ 3") — ส่วนหนึ่งของ _is_structural_edit_command ด้านล่าง
+_STRUCTURAL_ITEM_NO_RE = re.compile(r"รายการที่\s*\d+")
+
+
+def _is_structural_edit_command(query: str) -> bool:
+    """ด่านกันด้วยโค้ด (ก่อนเรียก _classify_excel_editor_intent/_route_multi_file_instruction เสมอ ไม่พึ่ง LLM
+    อย่างเดียว) เช็คว่าข้อความนี้ดูเหมือนคำสั่งแก้โครงสร้างไฟล์ (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ไหม — ถ้าใช่
+    ให้ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/
+    delete_table_item/add_table_item) โดยไม่ต้องผ่าน classifier เลย ประหยัด API call และกันพลาด
+
+    เหตุการณ์จริงที่แก้: "เปลี่ยน VAT เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียว
+    เปิดอยู่ ถูก _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียน
+    ค่าทับเซลล์สูตรตรงๆ ได้ (สูตร VAT กลายเป็นค่าคงที่ถาวร) โดยไม่มี preview/ยืนยันเลย — ตัวจับคู่ label:value
+    แบบนั้นไม่รู้จักแนวคิด "เปลี่ยนอัตรา"/"ลบ-เพิ่มรายการในตาราง" เลยสักนิด
+
+    นี่เป็นแค่ชั้นกรองหยาบๆ จับเคสที่ชัดเจนเท่านั้น (มี "%"/"อัตรา", พิมพ์ "รายการที่ N" ตรงๆ, หรือมีทั้งคำว่า
+    "ลบ"/"เพิ่ม" และ "รายการ") เคสที่กำกวมกว่านี้ (เช่น "เปลี่ยน Box 4x4 เป็น 7x7" ไม่มีคำไหนในนี้เลย) ยังต้องพึ่ง
+    intent "structural" จาก classifier (LLM) แทน — ดู EXCEL_EDITOR_INTENT_SYSTEM_PROMPT"""
+    if "%" in query or "อัตรา" in query:
+        return True
+    if _STRUCTURAL_ITEM_NO_RE.search(query):
+        return True
+    if ("ลบ" in query or "เพิ่ม" in query) and "รายการ" in query:
+        return True
+    return False
+
+
+def _answer_document_reading_question(query: str, active_docs: list, user_id: int, chat_id: int) -> tuple[str, Optional[int]]:
+    """ตอบคำถามเกี่ยวกับเนื้อหา/ค่าของไฟล์ที่เปิดอยู่โดยตรง ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย — เรียก
+    read_document_values ด้วยโค้ดตรงๆ (ไม่รอให้ AI ตัดสินใจเรียกเอง กันพลาดเหมือนที่เคยเจอ) แล้วให้ Claude
+    จัดรูปคำตอบจากผลลัพธ์นี้เท่านั้น (ไม่ใส่ context จากฐานความรู้กฎหมายเข้าไปเลย) คืน (ข้อความคำตอบ, document_id
+    ที่ใช้ตอบ หรือ None ถ้าถามกลับเพราะกำกวม) ใช้เฉพาะคำถามที่ไม่มีคำเชิงกฎหมายปนมา (ดู _has_legal_keyword)"""
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+
+    if target_doc is None:
+        name_matches = match_documents_by_name(query, active_docs)
+        if len(name_matches) == 1:
+            target_doc = name_matches[0]
+        else:
+            names = ", ".join(f"'{d['filename']}'" for d in active_docs)
+            return f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุชื่อไฟล์ที่ต้องการถามครับ", None
+
+    data = read_document_values(target_doc)
+    tool_text = _format_document_values_text(data)
+
+    # ถ้าเรียก Claude จัดรูปคำตอบล้ม (เช่น API ล่ม/timeout) ให้ตอบ tool_text ที่โค้ดจัดไว้แล้วตรงๆ แทน — ข้อมูล
+    # ยังถูกต้องครบถ้วนเป๊ะเหมือนเดิม (มาจาก read_document_values ตรงๆ) แค่ไม่ได้เรียบเรียงเป็นประโยคให้สวยงาม
+    # เท่านั้น ดีกว่าโยน error ทั้งที่ข้อมูลที่ต้องการตอบมีอยู่ในมือแล้ว
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            system=(
+                "คุณจะได้รับค่าปัจจุบันของไฟล์ Excel (จัดรูปจากโค้ดแล้ว ถูกต้องเป๊ะ ไม่ต้องคำนวณซ้ำ) และคำถามของ"
+                "ผู้ใช้ ตอบคำถามโดยใช้ข้อมูลนี้เท่านั้น ห้ามใช้ความรู้อื่นใดๆ นอกเหนือจากนี้ ห้ามคำนวณหรือเดาค่าเอง "
+                "ถ้าข้อมูลที่ให้มาไม่พอตอบคำถาม ให้บอกตรงๆ ว่าไม่มีข้อมูลนี้ในไฟล์ ตอบเป็นภาษาไทย ลงท้ายด้วย \"ครับ\""
+            ),
+            messages=[{"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"}],
+        )
+        return response.content[0].text.strip(), target_doc["id"]
+    except Exception as e:
+        print(f"[DocumentReadingQuestion] format_failed exception_type={type(e).__name__}")
+        return tool_text, target_doc["id"]
+
+
+# คำที่ถือเป็น "ขอไฟล์ชัดเจน" เท่านั้นที่ยอม finalize (ส่งลิงก์ดาวน์โหลด) — ดู docstring ของ
+# _has_explicit_finalize_word
+_FINALIZE_EXPLICIT_WORDS = ("ดาวน์โหลด", "ขอไฟล์", "ส่งไฟล์", "เสร็จแล้วขอไฟล์", "บันทึกไฟล์")
+
+
+def _has_explicit_finalize_word(query: str) -> bool:
+    """เช็คว่าข้อความนี้มีคำขอไฟล์/ดาวน์โหลดที่ชัดเจนไหม (ดู _FINALIZE_EXPLICIT_WORDS + "export" ภาษาอังกฤษ
+    เช็คแบบไม่สนตัวพิมพ์) ใช้เป็นเงื่อนไขเพิ่มเติม "หลัง" _classify_excel_editor_intent ตอบ finalize มาแล้ว
+    เสมอ (ทั้ง single-document และ multi-document path ใน ask_question()) — เหตุการณ์จริงที่แก้: ตัวแยก intent
+    (LLM) ตีความคำยืนยันกำกวมอย่าง "ครบ"/"ครบถ้วน"/"โอเค"/"ได้"/"ถูกต้อง" เป็น finalize ทั้งที่ผู้ใช้ไม่ได้ขอ
+    ไฟล์เลย ได้ลิงก์ดาวน์โหลดมาแบบไม่ได้ขอ ถ้าไม่มีคำชัดเจน ให้ตอบรับเฉยๆ แล้วถามว่าต้องการดาวน์โหลดไหมแทน"""
+    return any(word in query for word in _FINALIZE_EXPLICIT_WORDS) or "export" in query.lower()
+
+
+# ข้อความสั้นที่ถือเป็นคำยืนยัน/ยกเลิกจริงๆ เท่านั้น (strip แล้วต้องตรงเป๊ะ ไม่ใช่แค่มีคำนี้ปนอยู่) — กันกรณี
+# "ไม่ยืนยัน"/"ยังไม่ยืนยัน"/"ไม่ยกเลิก" ถูกนับเป็นคำสั่งยืนยัน/ยกเลิกผิดๆ เพราะมีคำว่า "ยืนยัน"/"ยกเลิก" ปนอยู่
+# (ตรรกะเดิมเช็คแค่ "in query" ซึ่งรวมคำปฏิเสธด้วย)
+_CONFIRM_COMMAND_TEXTS = ("ยืนยัน", "ยืนยันครับ", "ยืนยันค่ะ", "ยืนยันการแก้ไข", "ตกลง ยืนยัน", "ตกลงยืนยัน")
+_CANCEL_COMMAND_TEXTS = ("ยกเลิก", "ยกเลิกครับ", "ยกเลิกค่ะ", "ยกเลิกการแก้ไข", "ไม่เอาแล้ว")
+
+
+def _is_confirm_command(query: str) -> bool:
+    """เช็คว่าข้อความนี้เป็นคำยืนยันการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง — ดู ChatPendingAction)
+    ที่ค้างอยู่ไหม — ต้องเป็นข้อความสั้นที่ตรงกับ _CONFIRM_COMMAND_TEXTS เป๊ะ (หลัง strip) เท่านั้น ไม่ใช่แค่มี
+    คำว่า "ยืนยัน" ปนอยู่ที่ไหนก็ได้ กันเคส "ไม่ยืนยัน"/"ยังไม่ยืนยัน" ถูกนับเป็นคำสั่งยืนยันผิดๆ"""
+    return query.strip() in _CONFIRM_COMMAND_TEXTS
+
+
+def _is_cancel_command(query: str) -> bool:
+    """เช็คว่าข้อความนี้เป็นคำสั่งยกเลิกการแก้โครงสร้างที่ค้างอยู่ไหม (ดู ChatPendingAction) — ต้องตรงกับ
+    _CANCEL_COMMAND_TEXTS เป๊ะ (หลัง strip) เหมือน _is_confirm_command กันเคส "ไม่ยกเลิก" ถูกนับผิด"""
+    return query.strip() in _CANCEL_COMMAND_TEXTS
+
+
+PENDING_ACTION_TTL_SECONDS = 600  # 10 นาที — ตามสเปก ส่วน D
+
+
+def _is_pending_action_fresh(created_at: datetime.datetime) -> bool:
+    """เช็คว่า pending action นี้ (จาก get_chat_pending_action) ยังไม่หมดอายุไหม (สร้างไว้ไม่เกิน
+    PENDING_ACTION_TTL_SECONDS วินาทีที่แล้ว) รองรับทั้ง created_at แบบ tz-aware (Postgres คอลัมน์
+    DateTime(timezone=True) คืนค่าแบบนี้ของจริง) และ naive (เช่นจากการทดสอบที่ใช้ datetime.utcnow() ตรงๆ) —
+    naive ถือเป็น UTC เสมอ ลบ aware กับ naive ตรงๆ จะ TypeError จึงต้องแปลงฝั่งใดฝั่งหนึ่งให้ตรงกันก่อนเทียบ"""
+    now = datetime.datetime.now(datetime.timezone.utc) if created_at.tzinfo is not None else datetime.datetime.utcnow()
+    return (now - created_at).total_seconds() <= PENDING_ACTION_TTL_SECONDS
+
+
+def _get_document_version_marker(document: dict) -> Optional[int]:
+    """คืน id ของเวอร์ชันล่าสุดของไฟล์นี้ (หรือ None ถ้ายังไม่เคยมีเวอร์ชันเลย — ยังใช้ต้นฉบับอยู่) ใช้เป็น
+    "ลายเซ็น" ของสถานะไฟล์ ณ ตอนเสนอ preview (ดู propose_change_rate/propose_delete_table_item/
+    propose_add_table_item) เทียบกับตอนยืนยันจริง (ดู _execute_pending_action) กันแก้ไฟล์ไปแล้วระหว่างรอยืนยัน
+    (เช่นแก้ผ่านทางอื่นแทรกเข้ามา) ทำให้ preview ที่โชว์ไปไม่ตรงกับไฟล์จริงอีกต่อไป"""
+    latest = get_latest_document_version(document["id"])
+    return latest["id"] if latest is not None else None
+
+
+def _execute_pending_action(action: dict, user_id: int, chat_id: int) -> str:
+    """ทำ pending action ที่ผู้ใช้เพิ่งพิมพ์ "ยืนยัน" จริง (ดู ChatPendingAction/propose_change_rate/
+    propose_delete_table_item/propose_add_table_item) — ตรวจก่อนเสมอว่าไฟล์ยังเปิดอยู่ในแชทนี้จริง (ยังไม่ถูก
+    ปิด) และยังเป็นเวอร์ชันเดียวกับตอนเสนอ preview (ดู _get_document_version_marker) ถ้าไม่ตรง (เอกสารถูกปิด/
+    ลบ/แก้ไปแล้วระหว่างรอยืนยัน) ไม่ทำอะไรเลย บอกให้สั่งใหม่แทนที่จะเสี่ยงแก้ทับของเก่าที่ไม่ตรงกับ preview ที่
+    เพิ่งโชว์ไป คืนข้อความคำตอบเสมอ ไม่ raise เลย"""
+    document_id = action.get("document_id")
+    doc = _get_active_chat_document(document_id, user_id, chat_id)
+    if doc is None:
+        return "เอกสารเปลี่ยนไปหลังจากเสนอการแก้ไข กรุณาสั่งใหม่อีกครั้งครับ"
+
+    if _get_document_version_marker(doc) != action.get("version_id"):
+        return "เอกสารเปลี่ยนไปหลังจากเสนอการแก้ไข กรุณาสั่งใหม่อีกครั้งครับ"
+
+    action_type = action.get("type")
+    if action_type == "change_rate":
+        result = apply_change_rate(document_id, user_id, action.get("label"), action.get("new_rate"))
+    elif action_type == "delete_table_item":
+        result = apply_delete_table_item(document_id, user_id, action.get("item_no"))
+    elif action_type == "add_table_item":
+        result = apply_add_table_item(document_id, user_id, action.get("fields") or {})
+    else:
+        return "การแก้ไขนี้ไม่รองรับแล้ว กรุณาลองสั่งใหม่อีกครั้งครับ"
+
+    return result["message"]
 
 
 _OPEN_COMMAND_PREFIXES = ("เปิดไฟล์", "เปิด")  # "เปิดไฟล์" ก่อนเสมอ (ยาวกว่า เฉพาะเจาะจงกว่า) ค่อย "เปิด" เฉยๆ
@@ -2037,10 +2347,20 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
             return f"✗ {result['error']}"
         return None
 
-    if tool_name in ("edit_chat_document", "undo_last_edit"):
+    if tool_name in ("edit_chat_document", "undo_last_edit", "update_table_item"):
         message = result.get("message") or ""
         first_line = message.splitlines()[0] if message else ""
         if result.get("matched") is True:
+            return f"✓ {first_line}" if first_line else None
+        if "error" in result:
+            return f"✗ {result['error']}"
+        return f"✗ {first_line}" if first_line else None
+
+    if tool_name in ("change_rate", "delete_table_item", "add_table_item"):
+        # tool กลุ่มนี้แค่ "เสนอ" (proposed) preview ไว้รอยืนยัน ยังไม่แก้ไฟล์จริง — ดูส่วน D ของ task
+        message = result.get("message") or ""
+        first_line = message.splitlines()[0] if message else ""
+        if result.get("proposed") is True:
             return f"✓ {first_line}" if first_line else None
         if "error" in result:
             return f"✗ {result['error']}"
@@ -2210,6 +2530,38 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "read_document_values" and user_id and chat_id:
                 # ไม่เปลี่ยนข้อมูลใดๆ (อ่านอย่างเดียว) — ไม่ต้องออกใบยืนยันจากโค้ดเหมือน tool ที่เปลี่ยนข้อมูลจริง
                 result = _safe_execute_tool("read_document_values", execute_read_document_values, block.input, user_id, chat_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "change_rate" and user_id and chat_id:
+                result = _safe_execute_tool("change_rate", execute_change_rate, block.input, user_id, chat_id)
+                _add_receipt("change_rate", result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "update_table_item" and user_id and chat_id:
+                result = _safe_execute_tool("update_table_item", execute_update_table_item, block.input, user_id, chat_id)
+                _add_receipt("update_table_item", result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "delete_table_item" and user_id and chat_id:
+                result = _safe_execute_tool("delete_table_item", execute_delete_table_item, block.input, user_id, chat_id)
+                _add_receipt("delete_table_item", result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "add_table_item" and user_id and chat_id:
+                result = _safe_execute_tool("add_table_item", execute_add_table_item, block.input, user_id, chat_id)
+                _add_receipt("add_table_item", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2636,9 +2988,14 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
         "ให้บอกเฉพาะขั้นตอนถัดไปหรือข้อมูลอื่นที่เกี่ยวข้องแทน ถ้าต้องเปิดไฟล์ ต้องเรียกเครื่องมือเสมอ แม้เคยเห็น "
         "ข้อมูลไฟล์นั้นในประวัติแชทมาก่อนแล้วก็ตาม\n"
         "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
-        "- คำถามเรื่องค่าหรือยอดในไฟล์ที่เปิดอยู่ (เช่น ยอดรวมตอนนี้เท่าไร, ช่องนี้มีค่าอะไร) ให้เรียก "
-        "read_document_values ก่อนตอบเสมอ ห้ามคำนวณหรือเดาค่าเอง ถ้าผลลัพธ์บอกว่าช่องนั้นคำนวณไม่ได้ในระบบ "
-        "ให้บอกผู้ใช้ว่าต้องเปิดไฟล์ด้วย Excel จึงจะเห็นค่าได้\n"
+        "- เมื่อมีเอกสาร Excel เปิดอยู่ในแชทนี้ คำถามเกี่ยวกับค่าหรือยอดในไฟล์นั้น (เช่น ยอดรวมตอนนี้เท่าไร, "
+        "ช่องนี้มีค่าอะไร, มีรายการอะไรบ้าง) ให้เรียก read_document_values ก่อนตอบเสมอ ห้ามถามกลับว่าหมายถึงไฟล์ไหน "
+        "ห้ามคำนวณหรือเดาค่าเอง ถ้าผลลัพธ์บอกว่าช่องนั้นคำนวณไม่ได้ในระบบ ให้บอกผู้ใช้ว่าต้องเปิดไฟล์ด้วย Excel "
+        "จึงจะเห็นค่าได้\n"
+        "- เปลี่ยนอัตราคำนวณ (เช่น VAT) ให้เรียก change_rate ลบ/เพิ่มรายการในตารางให้เรียก delete_table_item/"
+        "add_table_item เสมอ ห้ามใช้ edit_chat_document กับสิ่งเหล่านี้เด็ดขาด เครื่องมือเหล่านี้แค่เสนอ preview "
+        "ให้ผู้ใช้พิมพ์ 'ยืนยัน' หรือ 'ยกเลิก' เองเท่านั้น ยังไม่ได้แก้ไฟล์จริง ห้ามบอกว่าทำสำเร็จแล้ว แก้ค่าในคอลัมน์ "
+        "input ของรายการที่มีอยู่แล้ว (ไม่ใช่ลบ/เพิ่ม) ให้เรียก update_table_item แทน (แก้ทันที ไม่ต้องยืนยัน)\n"
         "- คำสั่งหลายขั้น (เช่น เปิดแล้วเปรียบเทียบ) ให้เรียก tool ให้ครบทุกขั้นในเทิร์นเดียว\n"
         "- ถ้าได้ผลเปรียบเทียบไฟล์จากเครื่องมือ compare_chat_documents กลับมาเป็นตาราง markdown สำเร็จรูป "
         "ให้แสดงตารางทั้งหมดตามที่ได้รับทุกแถวเป๊ะๆ ห้ามย่อ ห้ามตัดแถว ห้ามแก้ตัวเลขหรือข้อความในตาราง "
@@ -3133,10 +3490,75 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        if len(active_docs) == 1:
+        # ยืนยัน/ยกเลิกการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่มรายการในตาราง) ที่ค้างอยู่ (ดู ChatPendingAction,
+        # ส่วน D ของ task) ดักก่อนเรียก LLM ใดๆ เสมอ เหมือนคำสั่งย้อนการแก้/ปิดไฟล์ด้านบน — ต้องเช็คก่อนเข้า
+        # branch ตัดสินใจของ Excel editor เสมอ กัน "ยืนยัน" ถูกตีความเป็นคำสั่งแก้ค่าปกติ (intent="edit")
+        pending = get_chat_pending_action(chat_id)
+        pending_is_fresh = pending is not None and _is_pending_action_fresh(pending["created_at"])
+
+        if _is_confirm_command(query) and pending_is_fresh:
+            answer = _execute_pending_action(pending["action"], user_id, chat_id)
+            clear_chat_pending_action(chat_id)
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+        if _is_cancel_command(query) and pending is not None:
+            clear_chat_pending_action(chat_id)
+            answer = "ยกเลิกการแก้ไขที่ค้างอยู่แล้วครับ"
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+        # ไม่มี pending ที่ยังไม่หมดอายุ แล้วพิมพ์ "ยืนยัน" -> ไม่ทำอะไรเชิงโครงสร้าง ปล่อยตกไปทำงานปกติด้านล่าง
+        # (ไม่ return ที่นี่ ไม่ใช่ error — "ยืนยัน" เฉยๆ ไม่มีความหมายอะไรถ้าไม่มีอะไรค้างให้ยืนยัน)
+
+        # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอย่าง "อะไร"/"เท่าไร"/"บ้าง"/"ไหม"/"กี่"/"?"/"แสดง"/"ดู"/"สรุป") ขณะมี
+        # เอกสารเปิดอยู่ — ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก
+        # read_document_values เอง ห้ามให้ _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close)
+        # ตัดสินใจแทน เพราะคำถามแบบนี้ไม่เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า
+        # "ไม่พบ label ที่ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ
+        reading_question = bool(active_docs) and _is_document_reading_question(query)
+        # คำถามเนื้อหาไฟล์ "แท้ๆ" (ไม่มีคำเชิงกฎหมายปนมา — ดู _has_legal_keyword) ตอบตรงด้วย
+        # read_document_values เลย ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย กันพึ่ง system prompt อย่างเดียวให้ AI
+        # ตัดสินใจเรียก tool เอง (เคยพลาด) คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา (เช่น "ธุรกิจบัญชีสามมีอะไร
+        # บ้าง") ยังต้องไปทาง RAG ตามปกติ (reading_question ยังเป็น True เพื่อข้าม branch ตัดสินใจของ Excel
+        # editor ด้านล่าง แต่ไม่เข้า branch นี้)
+        document_content_question = reading_question and not _has_legal_keyword(query)
+
+        if document_content_question:
+            answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
+            print(f"[Route] chat={chat_id} branch=document_reading active_doc={used_doc_id}")
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+        if reading_question:
+            print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
+
+        # ด่านกันด้วยโค้ดก่อนเรียก classifier เลย (ไม่พึ่ง LLM อย่างเดียว) — เหตุการณ์จริงที่แก้: "เปลี่ยน VAT
+        # เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียวเปิดอยู่ ถูก
+        # _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียนค่า
+        # ทับเซลล์สูตรตรงๆ (สูตร VAT กลายเป็นค่าคงที่) โดยไม่มี preview/ยืนยันเลย ดู _is_structural_edit_command
+        structural_command = bool(active_docs) and _is_structural_edit_command(query)
+        if structural_command:
+            focus_doc = get_chat_document_focus(chat_id, user_id)
+            log_doc_id = focus_doc["id"] if focus_doc else (active_docs[0]["id"] if len(active_docs) == 1 else None)
+            print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
+
+        if len(active_docs) == 1 and not reading_question and not structural_command:
             editable_doc = active_docs[0]
+            print(f"[Route] chat={chat_id} branch=single_doc_classifier active_doc={editable_doc['id']}")
             _, editable_doc_label_map = get_working_copy(editable_doc)
             intent = _classify_excel_editor_intent(editable_doc_label_map, query)
+
+            if intent == "structural":
+                print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={editable_doc['id']}")
+                # ไม่ return ที่นี่ (เหมือน unrelated) ปล่อยให้ตกไปทำงาน flow ปกติด้านล่าง (rag_answer ->
+                # run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+                # add_table_item รองรับอยู่แล้ว)
 
             if intent == "edit":
                 result = _match_and_apply_excel_edit(editable_doc["id"], user_id, query)
@@ -3146,9 +3568,15 @@ async def ask_question(
                 return {"answer": result["message"], "sources": [], "chat_id": chat_id}
 
             if intent == "finalize":
-                set_chat_document_focus(chat_id, editable_doc["id"])
-                download_url = f"/api/excel-editor/{editable_doc['id']}/download"
-                answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
+                # ต้องมีคำชัดเจนเท่านั้น (ดู _has_explicit_finalize_word) ไม่งั้นแค่ถามกลับเฉยๆ — เหตุการณ์จริง
+                # ที่แก้: _classify_excel_editor_intent ตีความคำยืนยันกำกวมอย่าง "ครบถ้วน"/"โอเค" เป็น finalize
+                # ทั้งที่ผู้ใช้ไม่ได้ขอไฟล์เลย ทำให้ได้ลิงก์ดาวน์โหลดมาแบบไม่ได้ขอ
+                if not _has_explicit_finalize_word(query):
+                    answer = "รับทราบครับ ต้องการดาวน์โหลดไฟล์เลยไหมครับ"
+                else:
+                    set_chat_document_focus(chat_id, editable_doc["id"])
+                    download_url = f"/api/excel-editor/{editable_doc['id']}/download"
+                    answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -3182,7 +3610,8 @@ async def ask_question(
 
             # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
 
-        elif len(active_docs) >= 2:
+        elif len(active_docs) >= 2 and not reading_question and not structural_command:
+            print(f"[Route] chat={chat_id} branch=multi_doc_classifier active_doc=None")
             valid_ids = {doc["id"] for doc in active_docs}
             docs_by_id = {doc["id"]: doc for doc in active_docs}
 
@@ -3203,6 +3632,13 @@ async def ask_question(
             )
             action = route.get("action")
 
+            if action == "structural":
+                log_doc_id = code_matched_document_id or route.get("document_id")
+                print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
+                # ไม่ return ที่นี่ (เหมือน unrelated) ปล่อยให้ตกไปทำงาน flow ปกติด้านล่าง (rag_answer ->
+                # run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+                # add_table_item รองรับอยู่แล้ว)
+
             if action == "edit":
                 # โค้ดจับคู่ชื่อไฟล์ได้ชัดเจนแล้ว ใช้ตรงนี้เสมอ (authoritative กว่า LLM) ไม่งั้นค่อยใช้ของตัวจัดเส้นทาง
                 target_id = code_matched_document_id or route.get("document_id")
@@ -3211,6 +3647,14 @@ async def ask_question(
                     answer = result["message"]
                 else:
                     answer = "ระบบระบุไฟล์ที่จะแก้ไม่ได้ชัดเจน กรุณาระบุชื่อไฟล์ในคำสั่งให้ชัดเจนขึ้นครับ"
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if action == "finalize" and not _has_explicit_finalize_word(query):
+                # คำยืนยันกำกวม (ไม่มีคำชัดเจนในคำสั่งเลย) — ดู docstring ของ _has_explicit_finalize_word
+                answer = "รับทราบครับ ต้องการดาวน์โหลดไฟล์เลยไหมครับ"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -5101,8 +5545,13 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในบทสนทนานี้เกี่ยวข้องกับการแก้ไฟล์ Excel ที่กำลังทำอยู่หรือไม่ "
     "ผู้ใช้กำลังแก้ไฟล์ excel อยู่ โดยมี label ที่แก้ได้ในไฟล์นี้ (JSON) ให้ดูประกอบการตัดสินใจ\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบ:\n"
-    '{"intent": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "unrelated"}\n\n'
-    "- edit: ผู้ใช้กำลังสั่งแก้ค่าบางอย่างในไฟล์ต่อ\n"
+    '{"intent": "edit" หรือ "structural" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "unrelated"}\n\n'
+    "- edit: ผู้ใช้กำลังสั่งแก้ค่าของช่อง (label) เดียวตรงๆ ให้เป็นค่าใหม่ค่าหนึ่ง (เช่น แก้ชื่อลูกค้า แก้วันที่)\n"
+    "- structural: คำสั่งเปลี่ยนโครงสร้างของไฟล์ ไม่ใช่แค่แก้ค่าช่องเดียว ได้แก่ (ก) เปลี่ยนอัตรา/เปอร์เซ็นต์ "
+    "ที่เป็นสูตรคำนวณ เช่น \"เปลี่ยน VAT เป็น 10%\" (ข) ลบหรือเพิ่มรายการในตารางรายการ เช่น \"ลบรายการที่ 3\", "
+    "\"เพิ่มรายการ Box 2x2\" (ค) แก้ค่าของรายการที่มีอยู่แล้วในตารางรายการ (ชื่อสินค้า/จำนวน/ราคา/หน่วย) เช่น "
+    "\"เปลี่ยน Box 4x4 เป็น 7x7\" ถ้าไม่แน่ใจว่าเป็น edit ธรรมดาหรือ structural แต่คำสั่งพูดถึงอัตรา/เปอร์เซ็นต์/"
+    "รายการในตาราง ให้ตอบ structural ไว้ก่อนเสมอ (ปลอดภัยกว่า — ไม่ทับสูตรเงียบๆ)\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้)\n"
     "- compare: ผู้ใช้ขอให้เปรียบเทียบไฟล์นี้กับไฟล์อื่นที่ 'แนบเข้ามาในแชทแล้ว' เท่านั้น (ไม่ใช่ไฟล์จากคลังเอกสารที่ยังไม่ได้เปิด)\n"
     "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์นี้ไปเลย ไม่เอาไฟล์นี้ในแชทอีกต่อไป (เช่น \"เลิกใช้ไฟล์นี้\", "
@@ -5115,8 +5564,11 @@ EXCEL_EDITOR_INTENT_SYSTEM_PROMPT = (
 
 def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     """ตัดสินใจว่าข้อความล่าสุด (ไม่มีไฟล์แนบ) ในแชทที่มี EditableDocument ผูกอยู่ เกี่ยวกับการแก้ไฟล์
-    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'finalize' | 'compare' | 'unrelated' เสมอ — parse ไม่ได้ถือว่า
-    'unrelated' (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้ตั้งใจ)"""
+    excel ที่กำลังทำอยู่ไหม คืน 'edit' | 'structural' | 'finalize' | 'compare' | 'close' | 'unrelated' เสมอ —
+    parse ไม่ได้ถือว่า 'unrelated' (fail-safe ให้หลุดเข้า flow RAG ปกติ ดีกว่าค้างอยู่ใน flow แก้ไฟล์โดยไม่ได้
+    ตั้งใจ) 'structural' เช่นเดียวกับ 'unrelated' ไม่ถูกจัดการใน branch ของฟังก์ชันนี้เลย (ดู ask_question) —
+    ปล่อยให้ตกไปที่ run_agentic_tool_loop ซึ่งมี tool change_rate/update_table_item/delete_table_item/
+    add_table_item รองรับอยู่แล้ว (ดูเหตุผลใน docstring ของ _is_structural_edit_command)"""
     prompt = (
         f"label ทั้งหมดในไฟล์ (JSON):\n{json.dumps(label_map, ensure_ascii=False)}\n\n"
         f"ข้อความล่าสุดของผู้ใช้: {query}"
@@ -5129,7 +5581,8 @@ def _classify_excel_editor_intent(label_map: dict, query: str) -> str:
     )
     parsed = _parse_json_response(response.content[0].text, dict)
     intent = (parsed or {}).get("intent")
-    return intent if intent in ("edit", "finalize", "compare", "close", "unrelated") else "unrelated"
+    valid_intents = ("edit", "structural", "finalize", "compare", "close", "unrelated")
+    return intent if intent in valid_intents else "unrelated"
 
 
 EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
@@ -5137,16 +5590,22 @@ EXCEL_EDITOR_MULTI_FILE_SYSTEM_PROMPT = (
     "หลายไฟล์ ด้านล่างคือรายการไฟล์ทั้งหมดพร้อม document_id และ label ที่แก้ได้ของแต่ละไฟล์ (JSON) "
     "ไฟล์ที่กำลังโฟกัสอยู่ล่าสุด (ถ้ามี) และข้อความ 4 เทิร์นล่าสุดในบทสนทนานี้ (ถ้ามี)\n\n"
     "ตอบกลับมาเป็น JSON object เดียวเท่านั้น ห้ามมีข้อความอื่นนอกเหนือจาก JSON รูปแบบต้องเป็นดังนี้เป๊ะ:\n"
-    '{"action": "edit" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "clarify" หรือ "unrelated", '
-    '"document_id": <เลข document_id ถ้า action เป็น edit, finalize หรือ close ไม่งั้นใส่ null>, '
+    '{"action": "edit" หรือ "structural" หรือ "finalize" หรือ "compare" หรือ "close" หรือ "clarify" หรือ '
+    '"unrelated", '
+    '"document_id": <เลข document_id ถ้า action เป็น edit, structural, finalize หรือ close ไม่งั้นใส่ null>, '
     '"document_id_a": <เลข document_id ไฟล์แรกถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"document_id_b": <เลข document_id ไฟล์ที่สองถ้า action เป็น compare ไม่งั้นใส่ null>, '
     '"message": "<ข้อความถามกลับสั้นๆ ถ้า action เป็น clarify ไม่งั้นใส่ null>"}\n\n'
-    "- edit: คำสั่งระบุค่า/ตำแหน่งที่ต้องการแก้ไขชัดเจน ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
+    "- edit: คำสั่งแก้ค่าของช่อง (label) เดียวตรงๆ ให้เป็นค่าใหม่ค่าหนึ่ง ต้องระบุ document_id ของไฟล์นั้นมาด้วยเสมอ "
     "ตัดสินใจว่าเป็นไฟล์ไหนตามลำดับนี้: 1) เอ่ยชื่อไฟล์หรือ label ที่ตรงกับไฟล์เดียวในรายการชัดเจน ให้ใช้ไฟล์นั้น "
     "2) ถ้าไม่ได้ระบุไฟล์เลยแต่มีไฟล์ที่กำลังโฟกัสอยู่ ให้ใช้ไฟล์ที่โฟกัส 3) ถ้าคำสั่งอ้างอิงบทสนทนาก่อนหน้า "
     "(เช่น 'ไฟล์ที่แก้ไปเมื่อกี้') ให้ดูจากข้อความล่าสุดหรือไฟล์โฟกัสประกอบกัน ถ้ายังกำกวมจริงๆ (ไม่มีโฟกัสและ "
     "ตัดสินไม่ได้จากขั้นตอนข้างต้นเลย) ให้ตอบ clarify แทน ห้ามเดา\n"
+    "- structural: คำสั่งเปลี่ยนโครงสร้างของไฟล์ ไม่ใช่แค่แก้ค่าช่องเดียว ได้แก่ (ก) เปลี่ยนอัตรา/เปอร์เซ็นต์ที่"
+    "เป็นสูตรคำนวณ เช่น \"เปลี่ยน VAT เป็น 10%\" (ข) ลบหรือเพิ่มรายการในตารางรายการ เช่น \"ลบรายการที่ 3\" (ค) "
+    "แก้ค่าของรายการที่มีอยู่แล้วในตารางรายการ (ชื่อสินค้า/จำนวน/ราคา/หน่วย) ต้องระบุ document_id ด้วยลำดับ"
+    "เดียวกับ edit ถ้าไม่แน่ใจว่าเป็น edit ธรรมดาหรือ structural แต่คำสั่งพูดถึงอัตรา/เปอร์เซ็นต์/รายการในตาราง "
+    "ให้ตอบ structural ไว้ก่อนเสมอ (ปลอดภัยกว่า — ไม่ทับสูตรเงียบๆ)\n"
     "- finalize: ผู้ใช้บอกว่าเสร็จแล้ว/พอแล้ว/ขอไฟล์/ขอดาวน์โหลด (ยังเปิดไฟล์นี้ไว้ในแชทต่อได้ แค่ขอไฟล์ไปใช้ "
     "เฉพาะไฟล์ในรายการนี้) ตัดสินใจว่าเป็นไฟล์ไหนด้วยลำดับเดียวกับ edit ต้องระบุ document_id เสมอ\n"
     "- close: ผู้ใช้ขอ 'ปิด' หรือ 'เลิกใช้' ไฟล์ใดไฟล์หนึ่งในรายการนี้ไปเลย ไม่เอาไฟล์นั้นในแชทอีกต่อไป "
@@ -5213,7 +5672,8 @@ def _route_multi_file_instruction(
         messages=[{"role": "user", "content": prompt}],
     )
     parsed = _parse_json_response(response.content[0].text, dict)
-    if parsed is None or parsed.get("action") not in ("edit", "finalize", "compare", "close", "clarify", "unrelated"):
+    valid_actions = ("edit", "structural", "finalize", "compare", "close", "clarify", "unrelated")
+    if parsed is None or parsed.get("action") not in valid_actions:
         return {"action": "clarify", "document_id": None, "document_id_a": None, "document_id_b": None, "message": None}
     return {
         "action": parsed.get("action"),
@@ -5833,6 +6293,543 @@ def _format_document_values_text(data: dict, filter_labels: Optional[list[str]] 
     return "\n".join(lines)
 
 
+# ---------- เฟส 2 PR2: แก้โครงสร้าง Excel (เปลี่ยนอัตรา / แก้-ลบ-เพิ่มรายการในตาราง) ----------
+# สูตรทุกตัวมาจากกฎตายตัวในโค้ดด้านล่างเท่านั้น (regex ที่รู้จักไว้ล่วงหน้า) ไม่เคยให้ AI เขียนสูตร Excel เอง
+
+_RATE_FORMULA_PATTERNS = (
+    # (regex, "kind") — ลองตามลำดับนี้ ใช้ตัวแรกที่ match เท่านั้น (ไม่ลองต่อ)
+    (re.compile(r"\*\s*(\d+(?:\.\d+)?)\s*/\s*100"), "mul_div100"),   # *7/100
+    (re.compile(r"/\s*100\s*\*\s*(\d+(?:\.\d+)?)"), "div100_mul"),   # /100*7
+    (re.compile(r"\*\s*(\d+(?:\.\d+)?)\s*%"), "mul_percent"),         # *7%
+    (re.compile(r"\*\s*(0\.\d+)(?!\d)"), "mul_decimal"),              # *0.07
+)
+
+_PERCENT_IN_TEXT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+_TABLE_INPUT_FIELDS = ("no", "description", "qty", "unit", "unit_price")  # "amount" เป็นสูตรเสมอ ห้ามแตะ
+
+
+def _format_rate_number(value) -> str:
+    """แปลงตัวเลขอัตราเป็นข้อความสั้นที่สุดก่อนแทรกลงสูตร/label (เช่น 10.0 -> '10', 7.5 -> '7.5') ไม่ใส่
+    ทศนิยมท้ายที่ไม่จำเป็น"""
+    value = float(value)
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def _rewrite_percent_text(text: str, new_rate) -> str:
+    """แทนที่ตัวเลข % ทุกตัวในข้อความ (เช่น label 'ภาษีมูลค่าเพิ่ม 7%') ด้วยอัตราใหม่ เช่น 'ภาษีมูลค่าเพิ่ม 10%'"""
+    return _PERCENT_IN_TEXT_RE.sub(f"{_format_rate_number(new_rate)}%", text)
+
+
+def _rewrite_rate_formula(formula: str, new_rate) -> Optional[str]:
+    """เปลี่ยนค่าคงที่ตัวเลขอัตราในสูตร Excel เป็นอัตราใหม่ — รองรับเฉพาะ 4 รูปแบบใน _RATE_FORMULA_PATTERNS
+    เท่านั้น (ใช้ regex แทนที่เฉพาะตัวเลขอัตรา ไม่แตะส่วนอื่นของสูตรเลย) คืน None ถ้าสูตรไม่ตรงรูปแบบที่รู้จักเลย
+    สักแบบ (ห้ามเดา — ดู docstring ของ propose_change_rate)"""
+    for pattern, kind in _RATE_FORMULA_PATTERNS:
+        m = pattern.search(formula)
+        if not m:
+            continue
+        if kind == "mul_div100":
+            replacement = f"*{_format_rate_number(new_rate)}/100"
+        elif kind == "div100_mul":
+            replacement = f"/100*{_format_rate_number(new_rate)}"
+        elif kind == "mul_percent":
+            replacement = f"*{_format_rate_number(new_rate)}%"
+        else:  # mul_decimal — ค่าคงที่ตรงนี้คือเศษส่วนของอัตราอยู่แล้ว (0.07 = 7%) ต้องหารร้อยก่อนแทรก
+            replacement = f"*{_format_rate_number(float(new_rate) / 100)}"
+        return formula[: m.start()] + replacement + formula[m.end() :]
+    return None
+
+
+def _resolve_rate_formula(base_bytes: bytes, label_info: dict, new_rate) -> tuple[Optional[str], Optional[str]]:
+    """คืน (new_formula, error_message) — error_message ไม่ None แปลว่าทำต่อไม่ได้ (new_formula เป็น None เสมอ
+    ในกรณีนั้น) ใช้ร่วมกันทั้ง propose_change_rate (preview) และ apply_change_rate (ทำจริง) กันตรรกะตรวจสูตร
+    ไม่ตรงกันระหว่างสองจุด อ่านสูตรดิบด้วย data_only=False เสมอ (ไม่พึ่งค่า cache)"""
+    wb_raw = openpyxl.load_workbook(io.BytesIO(base_bytes), data_only=False)
+    cell_value = wb_raw[label_info["sheet"]].cell(row=label_info["row"], column=label_info["col"]).value
+    if not (isinstance(cell_value, str) and cell_value.startswith("=")):
+        return None, "ช่องนี้ไม่ใช่สูตรคำนวณ ไม่สามารถเปลี่ยนอัตราได้ครับ"
+    new_formula = _rewrite_rate_formula(cell_value, new_rate)
+    if new_formula is None:
+        return None, "สูตรนี้ไม่ใช่รูปแบบอัตราที่รองรับ"
+    return new_formula, None
+
+
+def _build_rate_change_mutate_fn(label_info: dict, new_formula: str, new_rate):
+    """สร้าง mutate_fn สำหรับ _build_document_version/create_new_version: เขียนสูตรใหม่ลงเซลล์ของ label นี้
+    แล้วอัปเดตข้อความใดๆ ในแถวเดียวกันที่มีเลข % (เช่น label 'ภาษีมูลค่าเพิ่ม 7%' -> 'ภาษีมูลค่าเพิ่ม 10%') ข้าม
+    เซลล์ที่เป็น MergedCell (ไม่ใช่เซลล์บนซ้ายของช่วงที่ผสาน — เขียนค่าไม่ได้ ไม่ error แค่ข้ามไป)"""
+
+    def _mutate(wb):
+        ws = wb[label_info["sheet"]]
+        ws.cell(row=label_info["row"], column=label_info["col"], value=new_formula)
+        for cell in ws[label_info["row"]]:
+            if isinstance(cell, MergedCell):
+                continue
+            if isinstance(cell.value, str) and _PERCENT_IN_TEXT_RE.search(cell.value):
+                cell.value = _rewrite_percent_text(cell.value, new_rate)
+
+    return _mutate
+
+
+def _label_position(info: dict) -> tuple:
+    """คืน (sheet, row, col) ของ label — ใช้เป็น "ตำแหน่งจริง" แทนชื่อ label ตอนเทียบ label เก่า<->ใหม่ กัน
+    เคสชื่อ label เปลี่ยนไป (เช่น change_rate แก้ข้อความ '...7%' เป็น '...10%' ในเซลล์จริง แต่ key เดิมใน
+    label_map ที่มาจากตอน extract ครั้งแรกไม่เคยเปลี่ยนตาม — ยังใช้งานได้ปกติเพราะ key อ้างอิงตำแหน่งเซลล์ภายใน
+    อยู่แล้ว แต่จับคู่ด้วยตำแหน่งตรงๆ ชัดเจนและทนทานกว่าไม่ต้องพึ่งว่า key จะตรงกันเป๊ะ)"""
+    return (info["sheet"], info["row"], info["col"])
+
+
+def _find_label_by_position(label_map: dict, position: tuple) -> Optional[dict]:
+    """หา label info ใน label_map ที่ตำแหน่งเซลล์ (sheet, row, col) ตรงกับ position คืน None ถ้าไม่เจอ"""
+    for info in label_map.values():
+        if _label_position(info) == position:
+            return info
+    return None
+
+
+def _label_side_effects(old_label_map: dict, new_label_map: dict, exclude_position: Optional[tuple] = None) -> list[dict]:
+    """หา label ที่ค่าต่างไปจากเดิม (ผลข้างเคียงจากสูตรคำนวณใหม่ ไม่ใช่การแก้ตรงๆ) — ใช้ร่วมกันทุก action ใน
+    เฟสนี้ (change_rate/update/delete/add_table_item) ตรรกะเดียวกับที่ _match_and_apply_excel_edit ใช้ จับคู่
+    label เก่า<->ใหม่ด้วยตำแหน่งเซลล์ (ดู _label_position) ไม่ใช่ชื่อ label คืน list [{"label": ชื่อปัจจุบัน
+    (จาก new_label_map), "old_value":, "new_value":}, ...] ไม่เกิน 3 รายการ (ตัดให้ caller แล้ว ไม่ต้องตัดเอง)"""
+    old_by_position = {_label_position(info): info["current_value"] for info in old_label_map.values()}
+    results = []
+    for new_lbl, new_info in new_label_map.items():
+        position = _label_position(new_info)
+        if position == exclude_position or position not in old_by_position:
+            continue
+        old_value = old_by_position[position]
+        if not _cell_values_equal(old_value, new_info["current_value"]):
+            results.append({"label": new_lbl, "old_value": old_value, "new_value": new_info["current_value"]})
+    return results[:3]
+
+
+def _format_side_effect_lines(side_effects: list[dict], verb: str) -> str:
+    """ต่อท้ายข้อความ preview/ยืนยันด้วยรายการ label ที่เปลี่ยน (จาก _label_side_effects — ตัดไม่เกิน 3 รายการ
+    มาให้แล้ว) verb: 'จะเปลี่ยน'/'เปลี่ยน'"""
+    if not side_effects:
+        return ""
+    lines = [f"{e['label']}{verb}จาก {e['old_value']} เป็น {e['new_value']}" for e in side_effects]
+    return "\n\n" + " / ".join(lines)
+
+
+def propose_change_rate(document_id: int, user_id: int, chat_id: int, label: str, new_rate) -> dict:
+    """เสนอเปลี่ยนอัตรา (preview เท่านั้น ไม่แก้ไฟล์จริง) — คำนวณ dry-run ผ่าน _build_document_version ตรงๆ
+    (ไม่บันทึกลง DB) เพื่อโชว์ค่าที่จะเปลี่ยนจริงในข้อความ preview แล้วบันทึก ChatPendingAction รอผู้ใช้พิมพ์
+    'ยืนยัน'/'ยกเลิก' (ดู apply_change_rate ที่ทำจริงตอนยืนยัน) คืน {"proposed": bool, "message": str} เสมอ"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    if label not in label_map:
+        suggestions = _suggest_similar_labels(label or "", label_map)
+        suggestion_text = f" label ที่ใกล้เคียง: {', '.join(suggestions)}" if suggestions else ""
+        return {"proposed": False, "message": f"ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}'{suggestion_text}"}
+
+    label_info = label_map[label]
+    new_formula, error = _resolve_rate_formula(base_bytes, label_info, new_rate)
+    if error:
+        return {"proposed": False, "message": error}
+
+    mutate_fn = _build_rate_change_mutate_fn(label_info, new_formula, new_rate)
+    _, preview_label_map = _build_document_version(base_bytes, label_map, mutate_fn)
+
+    position = _label_position(label_info)
+    old_value = label_info["current_value"]
+    new_info = _find_label_by_position(preview_label_map, position)
+    new_value = new_info["current_value"] if new_info is not None else old_value
+    side_effects = _label_side_effects(label_map, preview_label_map, exclude_position=position)
+
+    preview_text = (
+        f"จะเปลี่ยนอัตราของ '{label}' เป็น {_format_rate_number(new_rate)}% "
+        f"— ค่าจะเปลี่ยนจาก {old_value} เป็น {new_value}"
+    )
+    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
+    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
+
+    set_chat_pending_action(
+        chat_id, {
+            "type": "change_rate", "document_id": document_id, "label": label, "new_rate": new_rate,
+            "version_id": _get_document_version_marker(doc),
+        },
+        preview_text,
+    )
+    return {"proposed": True, "message": preview_text}
+
+
+def apply_change_rate(document_id: int, user_id: int, label: str, new_rate) -> dict:
+    """ทำการเปลี่ยนอัตราจริง (เรียกตอนผู้ใช้พิมพ์ 'ยืนยัน' เท่านั้น — ดู _execute_pending_action) ผ่าน
+    create_new_version เสมอ (undo ได้) คืน {"matched": bool, "message": str} เสมอ ไม่ raise เลย"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    if label not in label_map:
+        return {"matched": False, "message": f"ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}' แล้ว (อาจถูกแก้ไปก่อนหน้านี้)"}
+
+    label_info = label_map[label]
+    new_formula, error = _resolve_rate_formula(base_bytes, label_info, new_rate)
+    if error:
+        return {"matched": False, "message": error}
+
+    position = _label_position(label_info)
+    old_value = label_info["current_value"]
+    mutate_fn = _build_rate_change_mutate_fn(label_info, new_formula, new_rate)
+    version_result = create_new_version(document_id, mutate_fn, change_summary=f"เปลี่ยนอัตรา '{label}' เป็น {new_rate}%")
+    new_label_map = version_result["label_map"]
+    new_info = _find_label_by_position(new_label_map, position)
+    new_value = new_info["current_value"] if new_info is not None else old_value
+
+    edit_log_id = log_document_edit(document_id, label, old_value, new_value, was_formula=True)
+    link_edit_log_to_version(edit_log_id, version_result["version_id"])
+
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
+
+    side_effects = _label_side_effects(label_map, new_label_map, exclude_position=position)
+    message = f"เปลี่ยนอัตราของ '{label}' เป็น {_format_rate_number(new_rate)}% แล้ว — ค่าเปลี่ยนจาก {old_value} เป็น {new_value}"
+    message += _format_side_effect_lines(side_effects, "เปลี่ยน")
+
+    return {"matched": True, "label": label, "old_value": old_value, "new_value": new_value, "message": message}
+
+
+def _get_single_item_table(base_bytes: bytes) -> Optional[dict]:
+    """หาตารางรายการแรกที่เจอในไฟล์ (ไล่ทุกชีต) — เฟสนี้รองรับตารางเดียวต่อไฟล์เหมือน read_document_values คืน
+    None ถ้าไม่พบตารางเลยสักชีต"""
+    wb = openpyxl.load_workbook(io.BytesIO(base_bytes), data_only=False)
+    for sheet_name in wb.sheetnames:
+        table = _detect_item_table(wb[sheet_name])
+        if table is not None:
+            return table
+    return None
+
+
+def apply_update_table_item(document_id: int, user_id: int, item_no: int, fields: dict) -> dict:
+    """แก้ค่าคอลัมน์ input ของรายการที่ item_no ในตารางทันที (ไม่ต้องยืนยัน — ทำเหมือน edit ปกติ) item_no นับ
+    จากรายการที่ไม่ว่างรายการแรก = 1 (ตรงกับที่ read_document_values แสดง) คอลัมน์ "amount" (จำนวนเงิน) เป็น
+    สูตรเสมอ ห้ามแก้ตรงๆ — ปฏิเสธถ้า fields มีคอลัมน์นี้หรือคอลัมน์ที่ไม่รู้จัก คืน {"matched": bool, "message":
+    str} เสมอ ไม่ raise เลย"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    if not fields:
+        return {"matched": False, "message": "ไม่ได้ระบุค่าที่จะแก้"}
+    invalid_fields = [k for k in fields if k not in _TABLE_INPUT_FIELDS]
+    if invalid_fields:
+        return {"matched": False, "message": f"แก้คอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return {"matched": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+    if item_no is None or item_no < 1 or item_no > len(filled_rows):
+        return {"matched": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
+
+    target_row_info = filled_rows[item_no - 1]
+    target_row = target_row_info["row"]
+    old_row_values = dict(target_row_info["values"])
+
+    def _mutate(wb):
+        ws = wb[table["sheet"]]
+        for field, value in fields.items():
+            col = table["columns"].get(field)
+            if col is None:
+                continue
+            cell = _merged_cell_top_left(ws, ws.cell(row=target_row, column=col))
+            cell.value = value
+
+    version_result = create_new_version(document_id, _mutate, change_summary=f"แก้รายการที่ {item_no} ในตาราง")
+
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
+
+    updated_doc = get_editable_document_raw(document_id)
+    after = read_document_values(updated_doc)
+    after_table = next((t for t in after["tables"] if t["sheet"] == table["sheet"]), None)
+    after_row = next((r for r in after_table["rows"] if r["row"] == target_row), None) if after_table else None
+
+    changed_fields = [f"{field} เปลี่ยนจาก {old_row_values.get(field)} เป็น {value}" for field, value in fields.items()]
+    message = f"แก้รายการที่ {item_no} ในตารางแล้ว: " + " / ".join(changed_fields)
+    if after_row is not None and not _cell_values_equal(old_row_values.get("amount"), after_row["values"].get("amount")):
+        message += f"\n\nจำนวนเงินของรายการนี้เปลี่ยนจาก {old_row_values.get('amount')} เป็น {after_row['values'].get('amount')}"
+
+    new_label_map = version_result["label_map"]
+    side_effects = _label_side_effects(label_map, new_label_map)
+    message += _format_side_effect_lines(side_effects, "เปลี่ยน")
+
+    return {"matched": True, "item_no": item_no, "message": message}
+
+
+def _build_delete_table_item_mutate_fn(table: dict, filled_rows: list, item_no: int):
+    """สร้าง mutate_fn ลบรายการที่ item_no: เลื่อนค่าคอลัมน์ input (ไม่รวม "ลำดับ" และ "amount") ของแถวถัดไปขึ้น
+    มาแทนทีละแถว ล้างแถวสุดท้ายที่มีข้อมูลทิ้ง ไม่เคย delete_rows() เลย (ไม่ขยับแถวจริงในชีต กันสูตร SUM/VAT/
+    BAHTTEXT ที่อ้างอิงช่วงแถวคงที่พัง) คอลัมน์ "ลำดับ": เรียงใหม่ 1..n ถ้าเป็นค่าคงที่ (เช็คจากแถวรายการแถวแรก
+    ของตาราง) ถ้าเป็นสูตรไม่แตะเลย"""
+    target_row = filled_rows[item_no - 1]["row"]
+    shift_rows = [r["row"] for r in table["rows"] if r["row"] > target_row]
+    shift_fields = [f for f in ("description", "qty", "unit", "unit_price") if f in table["columns"]]
+    no_col = table["columns"].get("no")
+    remaining_count = len(filled_rows) - 1
+
+    def _mutate(wb):
+        ws = wb[table["sheet"]]
+
+        no_is_constant = True
+        if no_col is not None:
+            first_no_value = ws.cell(row=table["first_row"], column=no_col).value
+            no_is_constant = not (isinstance(first_no_value, str) and first_no_value.startswith("="))
+
+        if not shift_rows:
+            # รายการที่ลบเป็นแถวสุดท้ายของตารางพอดี (ไม่มีแถวว่างเหลือให้เลื่อนขึ้นมาแทนเลย) แค่ล้างแถวนี้ทิ้ง
+            for field in shift_fields:
+                cell = _merged_cell_top_left(ws, ws.cell(row=target_row, column=table["columns"][field]))
+                cell.value = None
+            if no_is_constant and no_col is not None:
+                cell = _merged_cell_top_left(ws, ws.cell(row=target_row, column=no_col))
+                cell.value = None
+            return
+
+        current_values = {
+            field: [ws.cell(row=r, column=table["columns"][field]).value for r in shift_rows]
+            for field in shift_fields
+        }
+        dest_rows = [target_row] + shift_rows[:-1]
+        for field in shift_fields:
+            col = table["columns"][field]
+            for dest_row, value in zip(dest_rows, current_values[field]):
+                cell = _merged_cell_top_left(ws, ws.cell(row=dest_row, column=col))
+                cell.value = value
+            last_cell = _merged_cell_top_left(ws, ws.cell(row=shift_rows[-1], column=col))
+            last_cell.value = None
+
+        if no_is_constant and no_col is not None:
+            # แถวตั้งแต่ target_row (รายการที่ item_no) เป็นต้นไป ต้องได้เลขต่อจากรายการ "ก่อนหน้า" ที่ไม่ถูก
+            # แตะเลย (1..item_no-1 คงเดิม) ไม่ใช่เริ่มนับ 1 ใหม่ตรงนี้ — บั๊กเดิม: ลบรายการที่ 3 จากทั้งหมด 8
+            # รายการ ได้ลำดับ 1,2,1,2,3,4,5 (ซ้ำกับ 1,2 เดิม) แทนที่จะเป็น 1,2,3,4,5,6,7 ต่อเนื่องกัน
+            real_remaining_after_target = remaining_count - (item_no - 1)
+            for offset, row_num in enumerate(dest_rows[:real_remaining_after_target]):
+                cell = _merged_cell_top_left(ws, ws.cell(row=row_num, column=no_col))
+                cell.value = item_no + offset
+            for row_num in dest_rows[real_remaining_after_target:] + [shift_rows[-1]]:
+                cell = _merged_cell_top_left(ws, ws.cell(row=row_num, column=no_col))
+                cell.value = None
+
+    return _mutate
+
+
+def _describe_table_item(row_info: dict) -> str:
+    """สร้างข้อความสั้นๆ อธิบายรายการในตาราง (เช่น 'Box 4x4, 20 ชิ้น') ใช้ในข้อความ preview ของการลบ"""
+    values = row_info["values"]
+    desc = values.get("description")
+    qty = values.get("qty")
+    unit = values.get("unit")
+    parts = []
+    if desc:
+        parts.append(str(desc))
+    if qty is not None:
+        parts.append(f"{qty} {unit}".strip() if unit else str(qty))
+    return ", ".join(parts) or f"แถว {row_info['row']}"
+
+
+_TABLE_NON_FORMULA_AMOUNT_ERROR = (
+    "คอลัมน์จำนวนเงินบางแถวไม่ใช่สูตร ลบ/เพิ่มอัตโนมัติไม่ได้ กรุณาแก้ใน Excel ครับ"
+)
+
+
+def _table_has_non_formula_amount_value(table: dict) -> bool:
+    """เช็คว่ามีแถวไหนในตารางที่คอลัมน์ "จำนวนเงิน" ไม่ใช่สูตร แต่มีค่าอยู่ (พิมพ์ค่าคงที่ตรงๆ) ไหม — delete/add
+    เลื่อน/เติมแค่คอลัมน์ input แล้วพึ่งให้สูตรคำนวณจำนวนเงินใหม่เองหลังเลื่อน ถ้าแถวไหนจำนวนเงินเป็นค่าคงที่
+    (ไม่ใช่สูตร) การเลื่อน/เพิ่มจะทำให้แถวนั้นค้างค่าเก่าที่ผิดเงียบๆ (ไม่ถูกคำนวณใหม่ให้) ต้องปฏิเสธไปเลยแทน"""
+    return any(
+        not row["amount_is_formula"] and row["values"].get("amount") is not None
+        for row in table["rows"]
+    )
+
+
+def propose_delete_table_item(document_id: int, user_id: int, chat_id: int, item_no: int) -> dict:
+    """เสนอลบรายการที่ item_no (preview เท่านั้น ไม่ลบจริง) คืน {"proposed": bool, "message": str} เสมอ"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return {"proposed": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+    if _table_has_non_formula_amount_value(table):
+        return {"proposed": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
+
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+    if item_no is None or item_no < 1 or item_no > len(filled_rows):
+        return {"proposed": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
+
+    item_summary = _describe_table_item(filled_rows[item_no - 1])
+    mutate_fn = _build_delete_table_item_mutate_fn(table, filled_rows, item_no)
+    _, preview_label_map = _build_document_version(base_bytes, label_map, mutate_fn)
+    side_effects = _label_side_effects(label_map, preview_label_map)
+
+    preview_text = f"จะลบรายการที่ {item_no} ({item_summary})"
+    if item_no < len(filled_rows):
+        preview_text += f" รายการ {item_no + 1}–{len(filled_rows)} จะเลื่อนขึ้นมาแทน"
+    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
+    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
+
+    set_chat_pending_action(
+        chat_id, {
+            "type": "delete_table_item", "document_id": document_id, "item_no": item_no,
+            "version_id": _get_document_version_marker(doc),
+        },
+        preview_text,
+    )
+    return {"proposed": True, "message": preview_text}
+
+
+def apply_delete_table_item(document_id: int, user_id: int, item_no: int) -> dict:
+    """ลบรายการที่ item_no จริง (เรียกตอนผู้ใช้พิมพ์ 'ยืนยัน' เท่านั้น) ผ่าน create_new_version เสมอ (undo ได้)
+    คืน {"matched": bool, "message": str} เสมอ ไม่ raise เลย"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return {"matched": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+    if _table_has_non_formula_amount_value(table):
+        return {"matched": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
+
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+    if item_no is None or item_no < 1 or item_no > len(filled_rows):
+        return {"matched": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
+
+    mutate_fn = _build_delete_table_item_mutate_fn(table, filled_rows, item_no)
+    version_result = create_new_version(document_id, mutate_fn, change_summary=f"ลบรายการที่ {item_no} ในตาราง")
+
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
+
+    new_label_map = version_result["label_map"]
+    side_effects = _label_side_effects(label_map, new_label_map)
+    message = f"ลบรายการที่ {item_no} ในไฟล์ '{doc['filename']}' แล้ว"
+    message += _format_side_effect_lines(side_effects, "เปลี่ยน")
+
+    return {"matched": True, "item_no": item_no, "message": message}
+
+
+def _build_add_table_item_mutate_fn(table: dict, target_row: int, fields: dict):
+    """สร้าง mutate_fn เพิ่มรายการใหม่ที่ target_row (แถวว่างแรกของตาราง — ดู propose_add_table_item): เขียนค่า
+    fields ลงคอลัมน์ input (ข้าม "amount" ถ้าหลุดมา เป็นสูตรเสมอ) คอลัมน์ "ลำดับ": auto-assign เป็นเลขถัดไป
+    ถ้าเป็นค่าคงที่ (ไม่สนค่าที่ fields ส่งมาสำหรับคอลัมน์นี้ ถ้ามี) ถ้าเป็นสูตรไม่แตะเลย"""
+    no_col = table["columns"].get("no")
+    filled_before = sum(1 for r in table["rows"] if r["row"] < target_row and not r["is_empty"])
+
+    def _mutate(wb):
+        ws = wb[table["sheet"]]
+        for field, value in fields.items():
+            if field in ("no", "amount"):
+                continue
+            col = table["columns"].get(field)
+            if col is None:
+                continue
+            cell = _merged_cell_top_left(ws, ws.cell(row=target_row, column=col))
+            cell.value = value
+
+        if no_col is not None:
+            first_no_value = ws.cell(row=table["first_row"], column=no_col).value
+            no_is_constant = not (isinstance(first_no_value, str) and first_no_value.startswith("="))
+            if no_is_constant:
+                cell = _merged_cell_top_left(ws, ws.cell(row=target_row, column=no_col))
+                cell.value = filled_before + 1
+
+    return _mutate
+
+
+def propose_add_table_item(document_id: int, user_id: int, chat_id: int, fields: dict) -> dict:
+    """เสนอเพิ่มรายการใหม่ในแถวว่างแรกของตาราง (preview เท่านั้น ไม่เพิ่มจริง) ตารางเต็มแล้ว -> ไม่เสนอ ไม่สร้าง
+    pending action เลย รายงานตรงๆ ทันที คืน {"proposed": bool, "message": str} เสมอ"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    if not fields:
+        return {"proposed": False, "message": "ไม่ได้ระบุรายการที่จะเพิ่ม"}
+    invalid_fields = [k for k in fields if k not in _TABLE_INPUT_FIELDS]
+    if invalid_fields:
+        return {"proposed": False, "message": f"ระบุคอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return {"proposed": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+    if _table_has_non_formula_amount_value(table):
+        return {"proposed": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
+
+    capacity = table["last_row"] - table["first_row"] + 1
+    empty_row = next((r for r in table["rows"] if r["is_empty"]), None)
+    if empty_row is None:
+        return {"proposed": False, "message": f"ตารางเต็มแล้ว ({capacity} แถว) เพิ่มไม่ได้ครับ"}
+
+    mutate_fn = _build_add_table_item_mutate_fn(table, empty_row["row"], fields)
+    _, preview_label_map = _build_document_version(base_bytes, label_map, mutate_fn)
+    side_effects = _label_side_effects(label_map, preview_label_map)
+
+    field_summary = ", ".join(f"{k}={v}" for k, v in fields.items())
+    preview_text = f"จะเพิ่มรายการใหม่ ({field_summary}) ที่แถวว่างแรกของตาราง"
+    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
+    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
+
+    set_chat_pending_action(
+        chat_id, {
+            "type": "add_table_item", "document_id": document_id, "fields": fields,
+            "version_id": _get_document_version_marker(doc),
+        },
+        preview_text,
+    )
+    return {"proposed": True, "message": preview_text}
+
+
+def apply_add_table_item(document_id: int, user_id: int, fields: dict) -> dict:
+    """เพิ่มรายการใหม่จริง (เรียกตอนผู้ใช้พิมพ์ 'ยืนยัน' เท่านั้น) ผ่าน create_new_version เสมอ (undo ได้) ตาราง
+    เต็มแล้ว (เช่นมีรายการอื่นมาเติมเต็มระหว่างรอยืนยัน) -> ปฏิเสธตอนนี้แทน คืน {"matched": bool, "message":
+    str} เสมอ ไม่ raise เลย"""
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+
+    base_bytes, label_map = get_working_copy(doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return {"matched": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+    if _table_has_non_formula_amount_value(table):
+        return {"matched": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
+
+    capacity = table["last_row"] - table["first_row"] + 1
+    empty_row = next((r for r in table["rows"] if r["is_empty"]), None)
+    if empty_row is None:
+        return {"matched": False, "message": f"ตารางเต็มแล้ว ({capacity} แถว) เพิ่มไม่ได้ครับ"}
+
+    mutate_fn = _build_add_table_item_mutate_fn(table, empty_row["row"], fields)
+    version_result = create_new_version(document_id, mutate_fn, change_summary="เพิ่มรายการในตาราง")
+
+    if doc.get("chat_id"):
+        set_chat_document_focus(doc["chat_id"], document_id)
+
+    new_label_map = version_result["label_map"]
+    side_effects = _label_side_effects(label_map, new_label_map)
+    message = f"เพิ่มรายการใหม่ในไฟล์ '{doc['filename']}' แล้ว"
+    message += _format_side_effect_lines(side_effects, "เปลี่ยน")
+
+    return {"matched": True, "message": message}
+
+
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
     """เรียก Claude จับคู่คำสั่งกับ label ใน label_map (ของสำเนาทำงานปัจจุบัน — ดู get_working_copy) แล้วเขียน
     ค่าใหม่ลงเซลล์จริงผ่าน create_new_version() (ไม่แตะ original_bytes เลย) คืน dict เสมอ ไม่ raise เลย (ใช้ทั้ง
@@ -5906,6 +6903,17 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
     # ต่อท้ายข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรในเวอร์ชันใหม่ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะ
     # ย้อนการแก้กลับไปเวอร์ชันก่อนหน้า)
     was_formula = _is_label_cell_formula(base_bytes, target_info)
+
+    # ด่านป้องกันสุดท้าย (safety net) — ถ้าเซลล์เป้าหมายเป็นสูตรคำนวณอยู่แล้ว และค่าใหม่ที่จะเขียนมี "%" ปนมา
+    # (ดูเหมือนคำสั่งเปลี่ยนอัตรา เช่น "10%") ห้ามเขียนทับเงียบๆ เด็ดขาด ต้องใช้ change_rate แทน (ซึ่งมี preview/
+    # ยืนยันและปรับเฉพาะตัวเลขอัตราในสูตรจริงๆ ไม่ใช่ทับทั้งเซลล์เป็นค่าคงที่) — กันเคสหลุดจากด่านกรองโค้ด/
+    # classifier ชั้นก่อนหน้า (_is_structural_edit_command / intent="structural") มาถึงจุดนี้โดยบังเอิญ
+    if was_formula and isinstance(new_value, str) and "%" in new_value:
+        return {
+            "matched": False,
+            "message": f"'{label}' เป็นสูตรคำนวณอัตราอยู่ กรุณาใช้คำสั่งเปลี่ยนอัตราแทน (change_rate) ครับ",
+        }
+
     old_value = target_info["current_value"]
 
     def _apply_edit(wb):
