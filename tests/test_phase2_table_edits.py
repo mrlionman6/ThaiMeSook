@@ -240,6 +240,256 @@ def test_classify_cancel_rejects_negated_form(ns):
     assert ns["_classify_pending_queue_command"]("ไม่ยกเลิก") is None
 
 
+# ---------- คิว pending action: คำสั่งทนรูปแบบ (ตัดคำลงท้าย/สร้อยคำพูดก่อนเทียบ) ----------
+
+@pytest.mark.parametrize("text,expected", [
+    ("ยืนยันทั้งหมดครับ", "confirm_all"),
+    ("ยืนยันทั้งหมดเลย", "confirm_all"),
+    ("ยืนยันหมดเลยนะ", "confirm_all"),
+    ("ยกเลิกทั้งหมดเลย", "cancel_all"),
+    ("ยืนยันด้วย", "confirm_single"),
+    ("ยืนยันล่าสุดครับ", "confirm_latest"),
+])
+def test_classify_tolerates_trailing_particles(ns, text, expected):
+    """เหตุการณ์จริงที่แก้: "ยืนยันทั้งหมดเลย" ไม่ตรง _CONFIRM_ALL_TEXTS เป๊ะ (ขาดแค่คำว่า "เลย") เลยตกไปให้ LLM
+    ตีความแทน ซึ่งไปเรียก propose ซ้ำของเดิมในคิว — ตอนนี้ต้องตัดคำลงท้าย/สร้อยคำพูดออกก่อนเทียบเสมอ"""
+    assert ns["_classify_pending_queue_command"](text) == expected
+
+
+@pytest.mark.parametrize("text", ["ไม่ยืนยันนะ", "อย่าเพิ่งยืนยัน", "ยังไม่ยืนยันครับ"])
+def test_classify_still_rejects_negated_forms_with_particles(ns, text):
+    """คำปฏิเสธต้องไม่ถูกตัดคำลงท้ายจนกลายเป็นคำสั่งยืนยันจริงๆ ไปได้ — "ไม่ยืนยันนะ" ตัด "นะ" เหลือ "ไม่ยืนยัน"
+    ซึ่งยังไม่ตรง _CONFIRM_SINGLE_TEXTS อยู่ดี (ไม่ใช่ "ยืนยัน" เฉยๆ)"""
+    assert ns["_classify_pending_queue_command"](text) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("ยืนยันทั้งหมดเลย", "ยืนยันทั้งหมด"),
+    ("ยืนยันหมดเลยนะ", "ยืนยันหมด"),
+    ("ไม่ยืนยันนะ", "ไม่ยืนยัน"),
+    ("ยืนยันได้เลย", "ยืนยัน"),
+])
+def test_normalize_pending_queue_command_text(ns, text, expected):
+    assert ns["_normalize_pending_queue_command_text"](text) == expected
+
+
+# ---------- คิว pending action: ดักคำสั่งที่ "ดูเหมือน" ตั้งใจจะสั่งคิวแต่พิมพ์แปลกไปจากรูปแบบที่รู้จัก ----------
+
+def test_mentions_pending_queue_intent_catches_unrecognized_confirm_phrasing(ns):
+    assert ns["_mentions_pending_queue_intent"]("ยืนยันแบบนั้นแหละ") is True
+
+
+@pytest.mark.parametrize("text", ["ไม่ยืนยันนะ", "อย่าเพิ่งยืนยัน", "ไม่ยกเลิกนะ"])
+def test_mentions_pending_queue_intent_excludes_negated_forms(ns, text):
+    assert ns["_mentions_pending_queue_intent"](text) is False
+
+
+@pytest.mark.parametrize("text", [
+    "ต้องยืนยันตัวตนก่อนยื่นภาษีไหม",
+    "ยืนยันตัวตนต้องทำอย่างไรบ้าง",
+])
+def test_mentions_pending_queue_intent_excludes_real_questions(ns, text):
+    """กันคำถามกฎหมายทั่วไปที่บังเอิญมีคำว่า "ยืนยัน" ปนอยู่ (เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษีไหม") ถูกเข้าใจผิด
+    เป็นความตั้งใจจะสั่งคิว — ใช้คำเชิงคำถามเดียวกับ _OPEN_COMMAND_QUESTION_WORDS กัน"""
+    assert ns["_mentions_pending_queue_intent"](text) is False
+
+
+def test_mentions_pending_queue_intent_false_when_no_confirm_cancel_word(ns):
+    assert ns["_mentions_pending_queue_intent"]("เปลี่ยน Box 4x4 เป็น 7x7") is False
+
+
+# ---------- คิว pending action: กันรายการซ้ำ/การแก้ที่ไม่เปลี่ยนอะไร (propose_* ทุกตัว) ----------
+
+def test_propose_change_rate_duplicate_in_queue_is_rejected(ns, doc1):
+    first = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
+    assert first["proposed"] is True
+
+    second = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
+    assert second["proposed"] is False
+    assert "อยู่ในคิวรอยืนยันแล้วครับ (ข้อ 1)" in second["message"]
+    assert len(ns["get_chat_pending_actions"](1)) == 1
+
+
+def test_propose_change_rate_noop_when_already_at_target_rate(ns, doc1):
+    """ไฟล์ fixture เริ่มต้นที่ VAT 7% อยู่แล้ว — เสนอเปลี่ยนเป็น 7% (เท่าเดิม) ต้องไม่ต่อคิว"""
+    result = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 7)
+    assert result["proposed"] is False
+    assert "อยู่แล้ว" in result["message"]
+    assert ns["get_chat_pending_actions"](1) == []
+
+
+def test_propose_update_table_item_duplicate_in_queue_is_rejected(ns, doc1):
+    """เปลี่ยนคอลัมน์อื่นที่ไม่ใช่ "รายละเอียด" (เช่น จำนวน) ซ้ำ — รายละเอียดเดิมยังเหมือนเดิมในสถานะเสมือนด้วย
+    (ไม่ใช่ฟิลด์ที่เพิ่งแก้) identity จึงยังตรงกับรายการที่คิวไว้แล้ว ตรวจจับเป็นรายการซ้ำได้ถูกต้อง (ต่างจากกรณี
+    แก้ "รายละเอียด" เองซ้ำ ซึ่งจะเข้าทาง no-op แทน เพราะสถานะเสมือนหลังคิวแรกมีค่าใหม่อยู่แล้ว — ดู
+    test_propose_update_table_item_noop_when_value_matches_already_queued_change ด้านล่าง)"""
+    first = ns["propose_update_table_item"](1, 1, 1, 1, {"qty": 99})
+    assert first["proposed"] is True
+
+    second = ns["propose_update_table_item"](1, 1, 1, 1, {"qty": 99})
+    assert second["proposed"] is False
+    assert "อยู่ในคิวรอยืนยันแล้วครับ (ข้อ 1)" in second["message"]
+    assert len(ns["get_chat_pending_actions"](1)) == 1
+
+
+def test_propose_update_table_item_noop_when_value_unchanged(ns, doc1):
+    result = ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Item A"})
+    assert result["proposed"] is False
+    assert "อยู่แล้ว" in result["message"]
+    assert ns["get_chat_pending_actions"](1) == []
+
+
+def test_propose_update_table_item_noop_when_value_matches_already_queued_change(ns, doc1):
+    """เสนอแก้ "รายละเอียด" เป็นค่าเดียวกันซ้ำ (ฟิลด์เดียวกับที่ใช้จับคู่ identity เอง) — สถานะเสมือนหลังรายการ
+    แรกในคิวมีค่าใหม่อยู่แล้ว การเสนอซ้ำจึงเข้าทาง "no-op" (ค่าที่ต้องการอยู่แล้วเมื่อนับรวมคิว) แทนที่จะเป็น
+    "รายการซ้ำ" ตรงๆ — แต่ผลลัพธ์ที่ผู้ใช้ต้องการ (ไม่ต่อคิวซ้ำ) เหมือนกัน"""
+    first = ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Box 7x7"})
+    assert first["proposed"] is True
+
+    second = ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Box 7x7"})
+    assert second["proposed"] is False
+    assert "อยู่แล้ว" in second["message"]
+    assert len(ns["get_chat_pending_actions"](1)) == 1
+
+
+def test_find_duplicate_queue_action_detects_delete_table_item_duplicate(ns):
+    """delete_table_item ไม่สามารถเสนอซ้ำผ่าน propose_delete_table_item ตามธรรมชาติได้จริง (รายการที่ถูกลบไปแล้ว
+    ในคิวจะหายไปจากสถานะเสมือนเลย ทำให้ item_no เดิมชี้ไปรายการอื่นที่เลื่อนมาแทนเสมอ ไม่ใช่รายการซ้ำ) — ทดสอบ
+    ตรรกะการตรวจจับรายการซ้ำของ _find_duplicate_queue_action ตรงๆ แทน (จำลองคิวที่มี delete ของ "Item C" อยู่
+    แล้ว แล้วเสนอ delete ของ "Item C" เดิมซ้ำด้วย identity เดียวกันเป๊ะ)"""
+    pending_queue = [{
+        "id": 1,
+        "action": {"type": "delete_table_item", "document_id": 1, "identity": {"row": 18, "description": "Item C"}},
+    }]
+    candidate = {"type": "delete_table_item", "document_id": 1, "identity": {"row": 18, "description": "Item C"}}
+    assert ns["_find_duplicate_queue_action"](pending_queue, candidate) == 1
+
+    different = {"type": "delete_table_item", "document_id": 1, "identity": {"row": 19, "description": "Item D"}}
+    assert ns["_find_duplicate_queue_action"](pending_queue, different) is None
+
+
+def test_propose_add_table_item_duplicate_in_queue_is_rejected(ns, doc1):
+    fields = {"description": "Item I", "qty": 2, "unit": "ชิ้น", "unit_price": 20}
+    first = ns["propose_add_table_item"](1, 1, 1, dict(fields))
+    assert first["proposed"] is True
+
+    second = ns["propose_add_table_item"](1, 1, 1, dict(fields))
+    assert second["proposed"] is False
+    assert "อยู่ในคิวรอยืนยันแล้วครับ (ข้อ 1)" in second["message"]
+    assert len(ns["get_chat_pending_actions"](1)) == 1
+
+
+# ---------- คิว pending action: ชื่อฟิลด์ภาษาไทยใน preview/receipt ----------
+
+def test_update_table_item_preview_uses_thai_field_names(ns, doc1):
+    result = ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Box 7x7", "qty": 15})
+    assert result["proposed"] is True
+    assert "รายละเอียด จะเปลี่ยนจาก" in result["message"]
+    assert "จำนวน จะเปลี่ยนจาก" in result["message"]
+    assert "description" not in result["message"]
+    assert "qty" not in result["message"]
+
+
+def test_add_table_item_preview_uses_thai_field_names(ns, doc1):
+    result = ns["propose_add_table_item"](1, 1, 1, {"description": "Item I", "qty": 2, "unit": "ชิ้น", "unit_price": 20})
+    assert result["proposed"] is True
+    assert "รายละเอียด=Item I" in result["message"]
+    assert "จำนวน=2" in result["message"]
+    assert "ราคา/หน่วย=20" in result["message"]
+
+
+def test_apply_update_table_item_receipt_uses_thai_field_names(ns, doc1):
+    ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Box 7x7"})
+    queue = ns["get_chat_pending_actions"](1)
+    confirmed = ns["_handle_pending_queue_command"]("confirm_single", queue, 1, 1)
+    assert "รายละเอียด เปลี่ยนเป็น Box 7x7" in confirmed
+
+
+# ---------- คำสั่งรูปแบบชัดเจน: parse ด้วยโค้ดตรงๆ ไม่ผ่าน LLM (_parse_direct_structural_command) ----------
+
+def test_find_single_rate_label_finds_the_one_percent_label(ns, doc1):
+    base_bytes, label_map = ns["get_working_copy"](doc1)
+    assert ns["_find_single_rate_label"](base_bytes, label_map) == "ภาษีมูลค่าเพิ่ม 7%"
+
+
+@pytest.mark.parametrize("query", ["เปลี่ยน VAT เป็น 10%", "แก้ภาษีเป็น10%", "เปลี่ยนภาษีมูลค่าเพิ่มเป็น 10%"])
+def test_parse_direct_structural_command_detects_rate_change(ns, doc1, query):
+    base_bytes, label_map = ns["get_working_copy"](doc1)
+    action = ns["_parse_direct_structural_command"](query, base_bytes, label_map)
+    assert action == {"type": "change_rate", "label": "ภาษีมูลค่าเพิ่ม 7%", "new_rate": 10.0}
+
+
+def test_parse_direct_structural_command_detects_delete(ns, doc1):
+    base_bytes, label_map = ns["get_working_copy"](doc1)
+    action = ns["_parse_direct_structural_command"]("ลบรายการที่ 3", base_bytes, label_map)
+    assert action == {"type": "delete_table_item", "item_no": 3}
+
+
+def test_parse_direct_structural_command_returns_none_for_ambiguous_command(ns, doc1):
+    base_bytes, label_map = ns["get_working_copy"](doc1)
+    assert ns["_parse_direct_structural_command"]("เปลี่ยน Box 4x4 เป็น 7x7", base_bytes, label_map) is None
+
+
+def test_parse_direct_structural_command_returns_none_when_multiple_rate_labels(ns):
+    """ไฟล์มี label ที่มี "%" และเป็นสูตรอัตราที่รู้จักมากกว่า 1 ตัว — กำกวมเกินจะเดา ต้องคืน None (ปล่อยให้ agent/
+    LLM ตัดสินใจแทน ไม่ใช่เดาสุ่มตัวใดตัวหนึ่ง)"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+    ws["A1"] = "ภาษี A 7%"
+    ws["B1"] = "=C1*7/100"
+    ws["A2"] = "ภาษี B 7%"
+    ws["B2"] = "=C2*7/100"
+    buf = io.BytesIO()
+    wb.save(buf)
+    raw = inject_formula_cache(buf.getvalue(), {"B1": 70, "B2": 70})
+    label_map = ns["_extract_excel_labels"](raw)
+
+    action = ns["_parse_direct_structural_command"]("เปลี่ยน VAT เป็น 10%", raw, label_map)
+    assert action is None
+
+
+# ---------- สถานการณ์จริง (รอบ 2): เปลี่ยน VAT -> เปลี่ยนชื่อ -> "ลบรายการที่ 3" (parse ตรง ไม่ใช้ LLM) ->
+# "ยืนยัน" (ถามกลับ) -> "ยืนยันทั้งหมดเลย" (normalize แล้วจึง apply ครบ) ----------
+
+def test_full_scenario_direct_parse_delete_then_confirm_all_with_particle(ns, doc1):
+    r1 = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
+    assert r1["proposed"] is True
+
+    r2 = ns["propose_update_table_item"](1, 1, 1, 1, {"description": "Box 7x7"})
+    assert r2["proposed"] is True
+
+    # "ลบรายการที่ 3" ต้อง parse ได้ด้วยโค้ดตรงๆ (เหมือนที่ ask_question() เรียกจริง) ไม่ต้องพึ่ง LLM เลือก tool
+    base_bytes, label_map = ns["get_working_copy"](ns["get_editable_document_raw"](1))
+    direct_action = ns["_parse_direct_structural_command"]("ลบรายการที่ 3", base_bytes, label_map)
+    assert direct_action == {"type": "delete_table_item", "item_no": 3}
+    r3 = ns["propose_delete_table_item"](1, 1, 1, direct_action["item_no"])
+    assert r3["proposed"] is True
+
+    queue = ns["get_chat_pending_actions"](1)
+    assert len(queue) == 3
+
+    # "ยืนยัน" เฉยๆ กับคิว 3 รายการ -> ถามกลับ ไม่ apply (ลำดับเดิมจาก PR #28)
+    ask_back = ns["_handle_pending_queue_command"]("confirm_single", queue, 1, 1)
+    assert "ยืนยันทั้งหมด" in ask_back
+    assert ns["get_chat_pending_actions"](1) == queue
+
+    # "ยืนยันทั้งหมดเลย" ต้อง normalize แล้วจัดเป็น confirm_all เหมือน "ยืนยันทั้งหมด" เป๊ะ (ไม่ตกไปให้ LLM)
+    command = ns["_classify_pending_queue_command"]("ยืนยันทั้งหมดเลย")
+    assert command == "confirm_all"
+    ns["_handle_pending_queue_command"](command, queue, 1, 1)
+    assert ns["get_chat_pending_actions"](1) == []
+
+    updated_doc = ns["get_editable_document_raw"](1)
+    data = ns["read_document_values"](updated_doc)
+    filled = data["tables"][0]["rows"]
+    assert len(filled) == 7
+    assert filled[0]["values"]["description"] == "Box 7x7"
+    assert not any(r["values"]["description"] == "Item C" for r in filled)
+    label_values = {l["label"]: l["value"] for l in data["labels"]}
+    assert label_values["ภาษีมูลค่าเพิ่ม 7%"] != FIXTURE_VAT  # VAT เปลี่ยนไปจากเดิมแล้ว (เป็น 10% ไม่ใช่ 7%)
+
+
 def test_is_pending_queue_fresh_handles_naive_and_aware_and_empty(ns):
     naive_now = datetime.datetime.utcnow()
     aware_now = datetime.datetime.now(datetime.timezone.utc)

@@ -146,7 +146,12 @@ function isChatPending(chatId) {
 }
 
 function updateLoadingIndicator() {
-    document.getElementById("loading").hidden = !isChatPending(currentChatId);
+    const pending = isChatPending(currentChatId);
+    document.getElementById("loading").hidden = !pending;
+    // ปิดปุ่ม "ถาม" ระหว่างรอคำตอบของแชทที่กำลังดูอยู่ — กันกดรัว/กด Enter ซ้ำแล้วส่งคำสั่งเดียวกันเข้าไป 2 ครั้ง
+    // (askQuestion() เองก็กันซ้ำด้วย isChatPending() อีกชั้นหนึ่ง นี่แค่ feedback ให้ผู้ใช้เห็นว่ากดซ้ำไม่ได้)
+    const askButton = document.getElementById("askButton");
+    if (askButton) askButton.disabled = pending;
 }
 
 function markChatPending(chatId, isPending) {
@@ -158,6 +163,11 @@ function markChatPending(chatId, isPending) {
 }
 
 async function askQuestion() {
+    // กันกดปุ่ม/กด Enter รัวส่งคำสั่งเดียวกันซ้ำเข้าไปสองครั้งระหว่างที่แชทนี้ยังรอคำตอบอยู่ — เช็คแบบ synchronous
+    // ตั้งแต่บรรทัดแรกสุด (ก่อน askButton.disabled จาก updateLoadingIndicator จะมีผลจริงด้วยซ้ำ) กันคลิกรัวเร็ว
+    // มากจนคลิกที่สองหลุดเข้ามาก่อนปุ่มจะถูกปิดจริง
+    if (isChatPending(currentChatId)) return;
+
     const input = document.getElementById("questionInput");
     const query = input.value.trim();
     const imageInput = document.getElementById("imageAttachInput");
@@ -251,6 +261,16 @@ async function askQuestion() {
         }
     }
 }
+
+// กด Enter ในกล่องพิมพ์คำถามหลัก = กดปุ่ม "ถาม" (askQuestion() กันกดซ้ำระหว่างรอคำตอบเองอยู่แล้ว — ดู
+// isChatPending() ด้านบน) ไม่ผูกกับ questionExpandTextarea (popup ขยายช่องพิมพ์) เพราะเป็น textarea หลายบรรทัด
+// ต้องให้ Enter ขึ้นบรรทัดใหม่ได้ตามปกติ ไม่ใช่ส่งคำถามทันที
+document.getElementById("questionInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+        e.preventDefault();
+        askQuestion();
+    }
+});
 
 // ส่งผลอัปโหลดเอกสาร (Feasibility, Deal Screening หรือ Excel Editor) ไปเซฟลงแชทปกติ เหมือนที่ /ask ทำกับข้อความทั่วไป
 // ใช้ร่วมกันทั้ง 3 flow — sync currentChatId + sidebar ให้ตรงกันถ้า backend สร้างแชทใหม่ให้ (chat_id เดิมเป็น null)
