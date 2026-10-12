@@ -118,9 +118,30 @@ def test_apply_change_rate_to_10_percent(ns, doc1):
 
     data = _current(ns)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
-    assert label_values["ภาษีมูลค่าเพิ่ม 7%"] == expected_vat
+    # label เปลี่ยนชื่อตามข้อความจริงในเซลล์ป้ายหลังแก้ (ดู _current_label_display_name) — ไม่ใช่ key เดิม
+    # "ภาษีมูลค่าเพิ่ม 7%" ที่แช่แข็งไว้ตั้งแต่ extract ครั้งแรกอีกต่อไป
+    assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
+    assert label_values["ภาษีมูลค่าเพิ่ม 10%"] == expected_vat
     assert label_values["รวมราคาทั้งสิ้น"] == expected_total
     assert len(ns["_fake_db"].versions.get(1, [])) == 1  # แก้ทันทีเป็น 1 เวอร์ชัน ไม่มีคิวมาเกี่ยวข้องเลย
+
+
+def test_apply_change_rate_message_and_values_show_current_label_not_stale_name(ns, doc1):
+    """เหตุการณ์จริงที่แก้: เปลี่ยน VAT จาก 7% เป็น 25% สำเร็จ แต่ข้อความผลลัพธ์/read_document_values ยังโชว์ชื่อ
+    เดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่ตลอดไป (label_map key แช่แข็งไว้ตั้งแต่ extract ครั้งแรก ไม่เคยอัปเดตตาม
+    ข้อความจริงในเซลล์ป้าย) ตอนนี้ต้องโชว์ "ภาษีมูลค่าเพิ่ม 25%" ทั้งในข้อความผลลัพธ์และ read_document_values"""
+    result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 25)
+    assert result["matched"] is True
+    assert "'ภาษีมูลค่าเพิ่ม 25%'" in result["message"]
+    assert "ภาษีมูลค่าเพิ่ม 7%" not in result["message"]
+    assert "ยอดล่าสุด" in result["message"]
+    assert "ภาษีมูลค่าเพิ่ม 25%:" in result["message"]
+
+    data = _current(ns)
+    label_values = {l["label"]: l["value"] for l in data["labels"]}
+    assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
+    expected_vat = round(FIXTURE_TOTAL * 0.25, 2)
+    assert label_values["ภาษีมูลค่าเพิ่ม 25%"] == expected_vat
 
 
 def test_apply_change_rate_noop_when_already_at_target_rate(ns, doc1):
@@ -517,7 +538,9 @@ def test_full_scenario_vat_rename_delete_then_undo_three_times(ns, box_doc):
     assert filled[0]["values"]["description"] == "Box 7x7"
     assert not any(r["values"]["description"] == "ไส้ไก่" for r in filled)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
-    assert label_values["ภาษีมูลค่าเพิ่ม 7%"] != _BOX_VAT_7
+    # label เปลี่ยนชื่อตามข้อความจริงในเซลล์ป้ายหลังแก้ (ดู _current_label_display_name) — "7%" เดิมไม่มีอีกแล้ว
+    assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
+    assert label_values["ภาษีมูลค่าเพิ่ม 10%"] != _BOX_VAT_7
 
     for _ in range(3):
         undo_result = ns["undo_last_edit"](1, 1)
@@ -557,7 +580,8 @@ def test_full_scenario_multi_command_single_message_creates_two_versions(ns, doc
     filled = data["tables"][0]["rows"]
     assert len(filled) == 7
     label_values = {l["label"]: l["value"] for l in data["labels"]}
-    assert label_values["ภาษีมูลค่าเพิ่ม 7%"] != FIXTURE_VAT
+    assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
+    assert label_values["ภาษีมูลค่าเพิ่ม 10%"] != FIXTURE_VAT
 
 
 def test_apply_structural_commands_reports_failure_without_stopping_remaining_commands(ns, doc1):
@@ -700,8 +724,12 @@ def test_reading_question_without_legal_keyword_routes_to_document_values(ns):
 
 
 def test_reading_question_with_legal_keyword_routes_to_rag(ns):
+    """"ธุรกิจบัญชีสามมีอะไรบ้าง" ไม่มีคำอ้างอิงไฟล์เลย (ดู _DOCUMENT_REFERENCE_KEYWORDS หลัง tighten) —
+    _is_document_reading_question จึงเป็น False อยู่แล้วด้วยตัวมันเอง แต่ที่สำคัญกว่าคือ _has_legal_keyword
+    เป็น True ("บัญชี") ซึ่งทำให้ _classify_legal_or_advisor_route ตัดสินเป็น legal ก่อนเช็คอะไรอื่นเสมอ ไม่ว่า
+    _is_document_reading_question จะตอบอย่างไรก็ตาม"""
     query = "ธุรกิจบัญชีสามมีอะไรบ้าง"
-    assert ns["_is_document_reading_question"](query) is True
+    assert ns["_is_document_reading_question"](query) is False
     assert ns["_has_legal_keyword"](query) is True
     document_content_question = ns["_is_document_reading_question"](query) and not ns["_has_legal_keyword"](query)
     assert document_content_question is False
@@ -810,3 +838,131 @@ def test_rag_answer_does_not_block_normal_legal_answer_without_active_docs(ns):
     answer, sources = ns["rag_answer"]("ต้องทำอะไรก่อนยื่นภาษี", user_id=None, chat_id=None, structural_route=False)
     assert answer != ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
     assert "ยืนยันตัวตน" in answer
+
+
+# ---------- feat/advisor-route: แยกคำถามไฟล์/กฎหมาย/advisor ออกจากกัน + advisor_answer ----------
+# เหตุการณ์จริงที่แก้: คำถามแนะนำสินค้า (เช่น "แนะนำ Rack case server ที่คุ้มกว่า 9U") ขณะมีไฟล์เปิดอยู่ ถูก
+# _is_document_reading_question เดิม (เช็คแค่คำเชิงคำถามทั่วไปอย่าง "บ้าง"/"ไหม") ตีความผิดเป็นคำถามเกี่ยวกับไฟล์
+# ตอบ "ไฟล์ไม่มีข้อมูลรุ่นให้เลือก" หรือหลุดไปทาง rag_answer เดิม (มี context ฐานความรู้กฎหมายเสมอ) ได้คำตอบไม่
+# เกี่ยวข้องเรื่อง FBA/BOI แทนที่จะแนะนำสินค้าจริง
+
+@pytest.mark.parametrize("query", ["มีรายการอะไรบ้าง", "ยอดรวมเท่าไร"])
+def test_document_reading_keywords_still_match_quotation_questions(ns, query):
+    assert ns["_is_document_reading_question"](query) is True
+
+
+@pytest.mark.parametrize("query", ["มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย", "แนะนำ Rack case server 12U"])
+def test_advisor_style_questions_are_not_document_reading_questions(ns, doc1, query):
+    """คำถามแนะนำสินค้าทั่วไปขณะมีไฟล์เปิดอยู่ ต้องไม่ถูกตีความเป็นคำถามเกี่ยวกับไฟล์เลย ทั้งทางคำเชิงคำถามทั่วไป
+    (ไม่มีคำอ้างอิงไฟล์ใน _DOCUMENT_REFERENCE_KEYWORDS) และทางชื่อรายการ/label ในไฟล์ (fixture ไม่มี "server"/
+    "รุ่น" อยู่ในตารางหรือ label เลย)"""
+    assert ns["_is_document_reading_question"](query) is False
+    assert ns["_query_mentions_table_item_or_label"](query, doc1) is False
+
+
+def test_classify_question_route_legal_keyword_short_circuits_without_llm_call(ns):
+    """"ธุรกิจบัญชีสามมีอะไรบ้าง" มีคำเชิงความรู้กฎหมาย ("บัญชี") ปนมา -> ต้องตัดสินเป็น legal ทันทีด้วยโค้ด
+    (_has_legal_keyword) ไม่ต้องเรียก Haiku classifier เลยสักครั้ง (ประหยัด API call)"""
+    result = ns["_classify_question_route"]("ธุรกิจบัญชีสามมีอะไรบ้าง")
+    assert result == "legal"
+    assert ns["_fake_client"].last_call_kwargs is None
+
+
+@pytest.mark.parametrize("query", ["มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย", "แนะนำ Rack case server 12U"])
+def test_classify_question_route_falls_back_to_llm_classifier_for_advisor_questions(ns, query):
+    """ไม่มีคำเชิงความรู้กฎหมายปนมาเลย -> ต้องถาม Haiku classifier (ดู _classify_legal_or_advisor_route) ซึ่ง
+    ในเทสต์นี้ตั้งค่าให้ตอบ "advisor" กลับมา"""
+    ns["_fake_client"].response_text = '{"category": "advisor"}'
+    result = ns["_classify_question_route"](query)
+    assert result == "advisor"
+    assert ns["_fake_client"].last_call_kwargs is not None
+
+
+def test_classify_legal_or_advisor_route_defaults_to_advisor_on_api_failure(ns):
+    ns["_fake_client"].raise_on_create = RuntimeError("simulated API failure")
+    assert ns["_classify_legal_or_advisor_route"]("คำถามอะไรสักอย่างที่กำกวม") == "advisor"
+
+
+def test_advisor_answer_sends_chat_history_and_has_no_legal_kb_text_in_system_prompt(ns):
+    """advisor_answer ต้องส่งประวัติสนทนาเข้าไปด้วย (ให้ AI เข้าใจว่าผู้ใช้เพิ่งตอบคำถามที่เคยถูกถามกลับไปแล้ว)
+    และ system prompt ต้องไม่มีคำเชิงความรู้ฐาน KB กฎหมายเฉพาะทาง (BOI/FBA/พ.ร.บ.ต่างด้าว) ปนเลยสักคำ — ต่างจาก
+    system prompt ของ rag_answer (_prepare_rag_context) ที่มีคำพวกนี้อยู่เสมอ"""
+    ns["_fake_agentic_loop"].set_response("แนะนำรุ่น A, B, C ครับ", [], False)
+    history = [
+        {"role": "user", "content": "ฉันกำลังหา Rack case server ที่น่าจะคุ้มกว่า 9U แนะนำหน่อย"},
+        {"role": "assistant", "content": "งบประมาณเท่าไรครับ"},
+        {"role": "user", "content": "งบไม่จำกัด ส่วนอย่างอื่นเอาแบบดีที่สุด"},
+    ]
+    answer, sources = ns["advisor_answer"](
+        "มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย", history=history, user_id=1, chat_id=1, active_docs=[],
+    )
+    assert sources == []
+    call_args = ns["_fake_agentic_loop"].last_call_args
+    assert call_args["tools_override"] == ns["ADVISOR_TOOLS"]
+    sent_messages = call_args["messages"]
+    assert len(sent_messages) == len(history) + 1
+    assert sent_messages[-1]["content"] == "มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย"
+    system_prompt = call_args["system_prompt"]
+    for forbidden in ("BOI", "FBA", "พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว"):
+        assert forbidden not in system_prompt
+
+
+def test_advisor_answer_offers_replacement_when_asked_item_exists_in_open_quotation_table(ns, box_doc):
+    """มีใบเสนอราคาเปิดอยู่ และคำถามเอ่ยถึงรายการที่มีอยู่จริงในตารางตรงๆ ("Box 4x4") -> ต่อท้ายคำตอบด้วยข้อความ
+    เสนอ "แทนรายการที่ N ด้วยรุ่นที่เลือก" (การแทนจริงยังไม่ต่อสายใน PR นี้ — แค่ข้อความเสนอ)"""
+    ns["_fake_agentic_loop"].set_response("Box 4x4 รุ่นที่คุ้มกว่าคือ ... ครับ", [], False)
+    answer, _ = ns["advisor_answer"](
+        "Box 4x4 มีรุ่นที่คุ้มกว่านี้ไหม", history=[], user_id=1, chat_id=1, active_docs=[box_doc],
+    )
+    assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] in answer
+
+
+def test_advisor_answer_does_not_offer_replacement_when_question_unrelated_to_open_table(ns, box_doc):
+    ns["_fake_agentic_loop"].set_response("แนะนำรุ่น A, B, C ครับ", [], False)
+    answer, _ = ns["advisor_answer"](
+        "แนะนำ Rack case server 12U", history=[], user_id=1, chat_id=1, active_docs=[box_doc],
+    )
+    assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] not in answer
+
+
+# ---------- feat/advisor-route: export บทสนทนาเป็นไฟล์ .txt ----------
+
+def test_is_chat_export_command_matches_known_phrases(ns):
+    for phrase in ["ขอบทสนทนา", "export แชท", "บันทึกแชทเป็นไฟล์", "ดาวน์โหลดบทสนทนา", "ช่วยขอบทสนทนานี้หน่อย"]:
+        assert ns["_is_chat_export_command"](phrase) is True
+    assert ns["_is_chat_export_command"]("ลบรายการที่ 3") is False
+
+
+def test_build_chat_export_answer_is_pure_text_without_calling_llm(ns):
+    """คำสั่ง export ต้องตอบลิงก์ดาวน์โหลดตรงๆ โดยไม่เรียก LLM เลยสักครั้ง (ดู ask_question — ดักก่อนเรียก AI
+    ใดๆ เสมอ)"""
+    answer = ns["_build_chat_export_answer"](42)
+    assert "/api/chat/42/export.txt" in answer
+    assert ns["_fake_client"].last_call_kwargs is None
+
+
+def test_build_chat_export_text_contains_all_messages_in_chronological_order_with_thai_role_labels(ns):
+    messages = [
+        {"role": "user", "content": "สวัสดีครับ", "created_at": "2026-10-12T12:30:00"},
+        {"role": "assistant", "content": "สวัสดีครับ มีอะไรให้ช่วยไหมครับ", "created_at": "2026-10-12T12:30:05"},
+        {"role": "user", "content": "ขอบทสนทนานี้หน่อย", "created_at": "2026-10-12T12:35:00"},
+    ]
+    text = ns["_build_chat_export_text"]("แชททดสอบ", messages)
+
+    assert "แชททดสอบ" in text
+    # UTC naive -> เวลาไทย (+7) เสมอ (ดู _format_chat_export_timestamp)
+    assert "[2026-10-12 19:30] ผู้ใช้: สวัสดีครับ" in text
+    assert "[2026-10-12 19:30] ThaiMeSook: สวัสดีครับ มีอะไรให้ช่วยไหมครับ" in text
+    assert "[2026-10-12 19:35] ผู้ใช้: ขอบทสนทนานี้หน่อย" in text
+
+    # เรียงตามเวลาจริง (ลำดับเดียวกับที่ get_chat_messages คืนมา ไม่ใช่สลับเอง)
+    first_idx = text.index("สวัสดีครับ")
+    second_idx = text.index("มีอะไรให้ช่วยไหมครับ")
+    third_idx = text.index("ขอบทสนทนานี้หน่อย")
+    assert first_idx < second_idx < third_idx
+
+
+def test_build_chat_export_text_handles_missing_or_unparsable_timestamp(ns):
+    messages = [{"role": "user", "content": "ข้อความไม่มีเวลา", "created_at": None}]
+    text = ns["_build_chat_export_text"]("แชททดสอบ", messages)
+    assert "[-] ผู้ใช้: ข้อความไม่มีเวลา" in text

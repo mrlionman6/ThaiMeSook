@@ -18,6 +18,7 @@ import datetime
 import tempfile
 import concurrent.futures
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Optional
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -51,6 +52,7 @@ WANTED_MAIN_FUNCS = {
     "_apply_single_queue_item", "_document_totals_lines", "_apply_structural_commands",
     "undo_last_edit",
     "_is_document_reading_question", "_has_legal_keyword", "_answer_document_reading_question",
+    "_query_mentions_table_item_or_label",
     "_is_structural_edit_command",
     "_find_single_rate_label",
     "_match_structural_clause", "_resolve_table_target", "_normalize_structural_target_text",
@@ -59,10 +61,14 @@ WANTED_MAIN_FUNCS = {
     "_has_explicit_finalize_word", "_classify_pending_queue_command",
     "_normalize_pending_queue_command_text", "_mentions_pending_queue_intent",
     "_get_document_version_marker",
-    "_label_position", "_find_label_by_position",
+    "_label_position", "_find_label_by_position", "_current_label_display_name",
     "_get_active_chat_document", "execute_open_library_file", "_normalize_filename_for_matching",
     "_match_and_apply_excel_edit", "_parse_json_response",
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
+    "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
+    "_classify_question_route", "_classify_legal_or_advisor_route",
+    "_is_chat_export_command", "_build_chat_export_answer",
+    "_format_chat_export_timestamp", "_build_chat_export_text",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
     "_format_cell_display_text", "_cell_style_info", "_evaluate_preview_formula_cells",
     "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
@@ -73,7 +79,8 @@ WANTED_MAIN_CONSTS = {
     "EXCEL_LABEL_SECTION_HEADING_LOOKBACK", "_ITEM_TABLE_HEADER_WORDS", "_ITEM_TABLE_COLUMN_MAP",
     "_ITEM_TABLE_STOP_PREFIXES", "_ITEM_TABLE_MAX_ROWS", "_ITEM_TABLE_EMPTY_STREAK_LIMIT",
     "FORMULA_RECALC_TIMEOUT_SECONDS", "_RATE_FORMULA_PATTERNS", "_PERCENT_IN_TEXT_RE", "_TABLE_INPUT_FIELDS",
-    "_DOCUMENT_READING_QUESTION_WORDS", "_DOCUMENT_EDIT_COMMAND_WORDS", "_STRUCTURAL_ITEM_NO_RE",
+    "_DOCUMENT_REFERENCE_KEYWORDS", "_DOCUMENT_EDIT_COMMAND_WORDS", "_STRUCTURAL_ITEM_NO_RE",
+    "_MIN_TABLE_OR_LABEL_MATCH_LENGTH",
     "_LEGAL_KNOWLEDGE_KEYWORDS", "_FINALIZE_EXPLICIT_WORDS",
     "_CONFIRM_ALL_TEXTS", "_CONFIRM_LATEST_TEXTS", "_CONFIRM_SINGLE_TEXTS",
     "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS",
@@ -87,7 +94,10 @@ WANTED_MAIN_CONSTS = {
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
     "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
-    "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES",
+    "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES",
+    "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
+    "QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT",
+    "_CHAT_EXPORT_ROLE_LABELS", "_CHAT_EXPORT_COMMAND_TEXTS",
     "_POLITE_PARTICLE_COMPOUND_RE", "_POLITE_PARTICLE_TRAILING_RE",
     "_THAI_DIGIT_WORDS", "_THAI_PLACE_WORDS",
     "_BAHTTEXT_FORMULA_RE", "_SIMPLE_CELL_REFERENCE_RE", "_PREVIEW_NOT_COMPUTABLE_TITLE",
@@ -324,8 +334,11 @@ class _FakeAgenticLoop:
     def set_response(self, text: str, receipts: list, structural_tool_called: bool) -> None:
         self.response = (text, receipts, structural_tool_called)
 
-    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None):
-        self.last_call_args = {"system_prompt": system_prompt, "user_id": user_id, "chat_id": chat_id}
+    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None):
+        self.last_call_args = {
+            "system_prompt": system_prompt, "messages": initial_messages, "user_id": user_id, "chat_id": chat_id,
+            "tools_override": tools_override,
+        }
         return self.response
 
 
@@ -362,7 +375,7 @@ def build_namespace() -> dict:
         "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "html": html, "json": json, "zipfile": zipfile, "difflib": difflib,
-        "datetime": datetime,
+        "datetime": datetime, "ZoneInfo": ZoneInfo,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,

@@ -1291,6 +1291,20 @@ button {
     color: #c0392b;
 }
 
+/* ปุ่มดาวน์โหลดบทสนทนา (.txt) — สไตล์เดียวกับ .side-chat-delete (ปุ่มไอคอนเปล่าๆ สีเทา) วางไว้ก่อนปุ่มลบเสมอ */
+.side-chat-download {
+    background: none;
+    border: none;
+    color: #999;
+    font-size: 12px;
+    padding: 2px 6px;
+    flex-shrink: 0;
+}
+
+.side-chat-download:hover {
+    color: var(--color-primary);
+}
+
 /* ตัวเลขจำนวนไฟล์ที่เปิดอยู่ในแชทนี้ — สไตล์เดียวกับ .files-panel-badge (สีพื้น/ตัวหนังสือ/รูปทรงกลม) แต่อยู่
    "ในบรรทัด" เดียวกับชื่อแชท ไม่ใช่ position:absolute ลอยทับ (ไม่เหมาะกับรายการแชทที่เรียงต่อกันในแนวตั้ง) เป็น
    sibling ของ .side-chat-title ไม่ใช่ลูก (ดู loadChatHistory ใน script.js) กัน white-space:nowrap/

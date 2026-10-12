@@ -121,6 +121,7 @@ import random
 import difflib
 import datetime
 import tempfile
+from zoneinfo import ZoneInfo
 import concurrent.futures
 import urllib.parse
 import bcrypt
@@ -500,6 +501,21 @@ AVAILABLE_TOOLS = [
         },
     },
 ]
+
+# web_search สำหรับเส้นทาง advisor (แนะนำสินค้า/รุ่น/ราคา ฯลฯ) โดยเฉพาะ — ไม่จำกัด allowed_domains เหมือน
+# web_search ใน AVAILABLE_TOOLS (จำกัดเฉพาะเว็บราชการ .go.th สำหรับข้อเท็จจริงทางกฎหมาย) เพราะราคา/สเปกสินค้า
+# ส่วนใหญ่อยู่บนเว็บผู้ผลิต/ร้านค้าทั่วไป ไม่ใช่เว็บราชการ — เหตุการณ์จริงที่แก้: ถามหา "Rack case server ที่คุ้ม
+# กว่า 9U" ไม่มีทางหาราคา/รุ่นจริงได้เลยถ้าค้นได้แค่เว็บราชการ ดู docstring ของ advisor_answer
+GENERAL_WEB_SEARCH_TOOL = {
+    "type": "web_search_20250305",
+    "name": "web_search",
+    "max_uses": 3,
+}
+
+# เส้นทาง advisor ไม่ให้เครื่องมือแก้ไฟล์ (change_rate/update_table_item/ฯลฯ) หรือเครื่องมือคลังเอกสารเลย —
+# ฟีเจอร์ "แทนรายการที่ N ด้วยรุ่นที่เลือก" ยังไม่ได้ต่อสายจริงใน PR นี้ (แค่ข้อความเสนอท้ายคำตอบ ดู
+# _advisor_offer_line) ตั้งใจไม่ให้ AI เรียก tool แก้ไฟล์เองได้เลยในเส้นทางนี้ กันพลาดแก้ไฟล์โดยไม่ได้ตั้งใจ
+ADVISOR_TOOLS = [GENERAL_WEB_SEARCH_TOOL]
 
 # แยกจาก AVAILABLE_TOOLS โดยตั้งใจ — สอง tool นี้เข้าถึงข้อมูลส่วนตัวของ user (สร้าง EditableDocument
 # ผูกกับ user_id/chat_id) จึงต้องส่งให้ Claude เห็นเฉพาะตอนมี user_id ที่ล็อกอินอยู่จริงเท่านั้น
@@ -1833,38 +1849,91 @@ def _is_undo_command(query: str) -> bool:
     return query.strip().lower() in _UNDO_COMMAND_TEXTS
 
 
-# คำที่บ่งบอกว่าข้อความนี้เป็นคำถามเกี่ยวกับเนื้อหาไฟล์ ไม่ใช่คำสั่งแก้/จบงาน — ใช้ดักก่อนส่งเข้า
+# คำสั่ง export บทสนทนาเป็นไฟล์ — เช็คแบบ substring ไม่สนตัวพิมพ์เล็กใหญ่ (ไม่ใช่เทียบเป๊ะเหมือน
+# _UNDO_COMMAND_TEXTS เพราะผู้ใช้มักพิมพ์ปนกับคำอื่น เช่น "ช่วยขอบทสนทนานี้หน่อย")
+_CHAT_EXPORT_COMMAND_TEXTS = ("ขอบทสนทนา", "export แชท", "บันทึกแชทเป็นไฟล์", "ดาวน์โหลดบทสนทนา")
+
+
+def _is_chat_export_command(query: str) -> bool:
+    """เช็คว่าข้อความนี้เป็นคำสั่งขอ export บทสนทนาเป็นไฟล์ไหม — ดักก่อนเรียก LLM ใดๆ เสมอ (ดู ask_question())
+    ไม่ต้องมีเอกสาร Excel เปิดอยู่เลยก็ใช้ได้ (ต่างจากคำสั่งย้อนการแก้/ปิดไฟล์ ที่ผูกกับเอกสารที่เปิดอยู่)"""
+    lowered = query.strip().lower()
+    return any(phrase.lower() in lowered for phrase in _CHAT_EXPORT_COMMAND_TEXTS)
+
+
+def _build_chat_export_answer(chat_id: int) -> str:
+    """ข้อความตอบกลับคำสั่ง export บทสนทนา — ลิงก์ดาวน์โหลดตรงๆ ไม่ผ่าน LLM เลย (ดู export_chat_transcript)"""
+    download_url = f"/api/chat/{chat_id}/export.txt"
+    return f"ดาวน์โหลดบทสนทนานี้ได้ที่ [📥 ดาวน์โหลดบทสนทนา]({download_url})"
+
+
+# คำ/วลีที่บ่งบอกว่าข้อความนี้อ้างถึงเนื้อหา/ค่าของไฟล์ที่เปิดอยู่จริงๆ — ใช้ดักก่อนส่งเข้า
 # _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close เท่านั้น ไม่มีหมวด "ถาม") ดู
-# docstring ของ _is_document_reading_question
+# docstring ของ _is_document_reading_question "รายการ" ครอบคลุม "รายการในตาราง" ไปในตัวอยู่แล้ว (substring)
 # "ดู" ไม่อยู่ในชุดนี้โดยตั้งใจ — เช็คแยกต่างหากใน _is_document_reading_question (ต้องเป็นคำขึ้นต้นหรือ
 # "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring เช่น "ดูดี" ในชื่อบริษัท)
-_DOCUMENT_READING_QUESTION_WORDS = ("อะไร", "เท่าไร", "บ้าง", "ไหม", "กี่", "แสดง", "สรุป")
+_DOCUMENT_REFERENCE_KEYWORDS = (
+    "ในไฟล์", "ใบเสนอราคา", "เอกสาร", "รายการ", "ยอด", "รวม", "vat", "ภาษีมูลค่าเพิ่ม", "ชื่อลูกค้า", "เลขที่",
+)
 
 
 _DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน")
 
 
 def _is_document_reading_question(query: str) -> bool:
-    """เช็คว่าข้อความนี้ดูเหมือนคำถามเกี่ยวกับเนื้อหา/ค่าของไฟล์ไหม (เช่น "มีรายการอะไรบ้าง", "ยอดรวมตอนนี้
+    """เช็คว่าข้อความนี้อ้างถึงเนื้อหา/ค่าของไฟล์ที่เปิดอยู่จริงๆ ไหม (เช่น "มีรายการอะไรบ้าง", "ยอดรวมตอนนี้
     เท่าไร") — ใช้ดักใน ask_question() ก่อนเข้า branch ตัดสินใจของ Excel editor (single/multi-document) เสมอ
-    เหตุการณ์จริงที่แก้: _classify_excel_editor_intent มีแค่ 4 หมวด (edit/finalize/compare/close) ไม่มีหมวด
-    "ถาม" เลย คำถามแบบนี้เคยถูกเดาเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งหาค่าใหม่ที่จะแก้ไม่เจอ
-    ตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ — คำถามแบบนี้ควรปล่อยผ่าน flow ปกติ
-    (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เองแทน
 
-    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำเชิงคำถามปน
-    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มี "ไหม" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถาม
-    อ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี
-    "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
+    เดิมเช็คจากคำเชิงคำถามทั่วไปล้วนๆ (อะไร/เท่าไร/บ้าง/ไหม/กี่/"?"/แสดง/สรุป) กว้างเกินไป — เหตุการณ์จริงที่แก้:
+    คำถามแนะนำสินค้าทั่วไป เช่น "มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย" มีคำว่า "บ้าง" ปนมาด้วย ถูกเข้าใจผิดเป็น
+    คำถามเกี่ยวกับไฟล์ที่เปิดอยู่ ตอบกลับว่า "ไฟล์ไม่มีข้อมูลรุ่นให้เลือก" ทั้งที่ควรไปทาง advisor (แนะนำสินค้า)
+    แทน ตอนนี้ต้องมีคำที่อ้างถึงไฟล์/เอกสาร/ตาราง/ยอดในไฟล์จริงๆ เท่านั้น (ดู _DOCUMENT_REFERENCE_KEYWORDS) — ดู
+    เพิ่มที่ _query_mentions_table_item_or_label สำหรับเงื่อนไขเสริมกรณีเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์
+    ตรงๆ โดยไม่มีคำเหล่านี้ปนมาเลย (เช็คแยกต่างหากเพราะต้องมี target_doc ประกอบ ฟังก์ชันนี้รับแค่ query เดียว)
+
+    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปน
+    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้
+    ไม่ใช่คำถามอ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ)
+    หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
     stripped = query.strip()
     if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
         return False
-    if "?" in stripped or any(word in stripped for word in _DOCUMENT_READING_QUESTION_WORDS):
+    lowered = stripped.lower()
+    if any(kw.lower() in lowered for kw in _DOCUMENT_REFERENCE_KEYWORDS):
         return True
     if "ขอดู" in stripped or "ดูรายการ" in stripped:
         return True
     tokens = word_tokenize(stripped, engine="newmm")
     return bool(tokens) and tokens[0] == "ดู"
+
+
+_MIN_TABLE_OR_LABEL_MATCH_LENGTH = 3  # กันคำสั้นเกินไป (1-2 ตัวอักษร) แมตช์มั่วกับคำทั่วไปในข้อความ
+
+
+def _query_mentions_table_item_or_label(query: str, target_doc: dict) -> bool:
+    """เช็คว่าข้อความนี้เอ่ยถึงรายการในตารางหรือ label ที่มีอยู่จริงในไฟล์ target_doc ตรงๆ ไหม (ไม่สนคำสำคัญตายตัว
+    ใน _DOCUMENT_REFERENCE_KEYWORDS เลย) — ใช้เป็นเงื่อนไขเสริมของ _is_document_reading_question ตอนตัดสินใจ
+    เส้นทางคำถามทั่วไป (ดู _classify_legal_or_advisor_route) กันเคสถามเรื่องของในไฟล์ที่เปิดอยู่ตรงๆ โดยเอ่ยชื่อ
+    สินค้า/ป้ายมาเลย (เช่น "Box 4x4 ราคาเท่าไหร่กันแน่") แต่ไม่มีคำอ้างอิงไฟล์ทั่วไปปนมาเลย ไม่ให้หลุดไปตีความเป็น
+    คำถามแนะนำสินค้าทั่วไป (advisor) ผิดๆ"""
+    normalized_query = _normalize_structural_target_text(query)
+    base_bytes, label_map = get_working_copy(target_doc)
+
+    table = _get_single_item_table(base_bytes)
+    if table:
+        for row in table["rows"]:
+            if row["is_empty"]:
+                continue
+            desc = str(row["values"].get("description") or "").strip()
+            if len(desc) >= _MIN_TABLE_OR_LABEL_MATCH_LENGTH and _normalize_structural_target_text(desc) in normalized_query:
+                return True
+
+    for label in label_map:
+        normalized_label = _normalize_structural_target_text(label)
+        if len(normalized_label) >= _MIN_TABLE_OR_LABEL_MATCH_LENGTH and normalized_label in normalized_query:
+            return True
+
+    return False
 
 
 # คำที่บ่งบอกว่าคำถามนี้เป็นคำถามเชิงความรู้กฎหมาย/ธุรกิจ (ต้องไปทาง RAG/ฐานความรู้) ไม่ใช่คำถามเรื่องเนื้อหา
@@ -2601,9 +2670,14 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
 
 
 def run_agentic_tool_loop(
-    system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None
+    system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
+    tools_override: Optional[list] = None,
 ) -> tuple[str, list[str], bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
+    - tools_override: ถ้าระบุมา ใช้ชุดนี้แทนการประกอบ AVAILABLE_TOOLS+LIBRARY_TOOLS+CHAT_DOCUMENT_TOOLS ตามปกติ
+      ทั้งหมด (ใช้โดย advisor_answer — ดู ADVISOR_TOOLS — ให้เครื่องมือเฉพาะ web_search ทั่วไปเท่านั้น ไม่มี
+      เครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้) dispatcher ของแต่ละ tool ด้านล่างยังคงเช็คชื่อ tool ตามปกติ
+      เหมือนเดิมทุกจุด — ไม่เคยถูกเรียกจริงถ้า tools_override ไม่มี tool นั้นอยู่ด้วย (Claude ไม่เห็น schema เลย)
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
     - find_customers/list_customer_documents/list_project_documents/list_templates/open_library_file/
@@ -2649,7 +2723,7 @@ def run_agentic_tool_loop(
         else:
             _add_receipt(tool_name, result)
 
-    tools_for_this_call = (
+    tools_for_this_call = tools_override if tools_override is not None else (
         AVAILABLE_TOOLS + LIBRARY_TOOLS + CHAT_DOCUMENT_TOOLS if (user_id and chat_id) else AVAILABLE_TOOLS
     )
 
@@ -3448,6 +3522,129 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
     return answer, ctx["top_chunks"]
 
 
+# ---------- เส้นทาง advisor (คำถามทั่วไป/แนะนำสินค้า ไม่ใช่กฎหมาย/เนื้อหาไฟล์ที่เปิดอยู่) ----------
+# เหตุการณ์จริงที่แก้: คำถามอย่าง "แนะนำ Rack case server ที่คุ้มกว่า 9U" หลุดเข้าทาง rag_answer เดิม (มี context
+# ฐานความรู้กฎหมาย + กติกา "ใช้ข้อมูลอ้างอิงเท่านั้น" ปนอยู่ใน system prompt เสมอ) ได้คำตอบไม่เกี่ยวข้องเรื่อง
+# "ข้อมูลอ้างอิง FBA/BOI ไม่เกี่ยวข้อง" แทนที่จะแนะนำสินค้าจริง — เส้นทางนี้แยก system prompt/tool set ออกมา
+# ทั้งหมด ไม่มี context ฐานความรู้กฎหมายปนเลยสักบรรทัด
+
+QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT = (
+    "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในแชทผู้ช่วยธุรกิจ/กฎหมายไทย ควรตอบทางไหน ตอบกลับมาเป็น JSON "
+    'object เดียวเท่านั้น รูปแบบ: {"category": "legal" หรือ "advisor"} ห้ามมีข้อความอื่นนอกเหนือจาก JSON\n\n'
+    "- legal: คำถามเชิงความรู้กฎหมาย/ภาษี/การลงทุน/การจดทะเบียนธุรกิจในประเทศไทย (เช่น พ.ร.บ.ต่างด้าว, BOI, "
+    "ภาษีนิติบุคคล, work permit, การถือครองที่ดิน)\n"
+    "- advisor: คำถามอื่นๆ ทั้งหมดที่ไม่ใช่กฎหมาย/ภาษี/การลงทุนโดยตรง (เช่น แนะนำ/เปรียบเทียบสินค้า อุปกรณ์ รุ่น "
+    "ราคา หรือคำถามธุรกิจทั่วไปอื่นๆ) ถ้าไม่แน่ใจระหว่าง legal กับ advisor ให้เลือก advisor"
+)
+
+
+def _classify_legal_or_advisor_route(query: str) -> str:
+    """ตัวแยกประเภทชั้นสุดท้ายด้วย Haiku — ใช้เฉพาะตอนโค้ดตัดสินใจเองไม่ได้ชัดเจน (ดู _classify_question_route —
+    เรียกเฉพาะตอน _has_legal_keyword(query) เป็น False เท่านั้น) คืน "legal" หรือ "advisor" เสมอ ไม่ raise เลย
+    (เรียก API ล้มเหลว/parse ไม่ได้ -> fallback เป็น "advisor" ปลอดภัยกว่า เพราะเป็นเส้นทางที่ไม่มีข้อผูกมัดต้อง
+    ตอบตาม KB กฎหมายเป็นพิเศษ — ตอบผิดเส้นทางแค่ขาดบริบทฐานความรู้ไป ไม่ถึงกับเสี่ยงให้ข้อมูลกฎหมายผิด)"""
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=50,
+            system=QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"ข้อความล่าสุดของผู้ใช้: {query}"}],
+        )
+        parsed = _parse_json_response(response.content[0].text, dict)
+        category = (parsed or {}).get("category")
+    except Exception as e:
+        print(f"[QuestionDomainClassifier] classify_failed exception_type={type(e).__name__}")
+        category = None
+    return category if category in ("legal", "advisor") else "advisor"
+
+
+def _classify_question_route(query: str) -> str:
+    """ตัดสินใจว่าคำถามนี้ (ผ่านด่านกรองคำถามเกี่ยวกับไฟล์/คำสั่งแก้โครงสร้างใน ask_question() มาแล้วทั้งหมด —
+    ไม่ใช่ reading_question/structural_route เด็ดขาด) ควรไปทาง "legal" (RAG ฐานความรู้กฎหมายเดิม ผ่าน
+    rag_answer) หรือ "advisor" (ไม่มี context ฐานความรู้กฎหมายปนเลย ผ่าน advisor_answer) คืน "legal" ทันทีถ้ามีคำ
+    เชิงความรู้กฎหมายปนมา (ดู _has_legal_keyword — เร็ว ไม่เสีย API call) ไม่งั้นถาม Haiku เป็นตัวแยกประเภทชั้น
+    สุดท้าย (ดู _classify_legal_or_advisor_route)"""
+    if _has_legal_keyword(query):
+        return "legal"
+    return _classify_legal_or_advisor_route(query)
+
+
+_ADVISOR_REPLACEMENT_OFFER_LINE = "ถ้าต้องการ พิมพ์เช่น 'แทนรายการที่ 5 ด้วยรุ่นที่ 1' หรือ 'เพิ่มรุ่นที่ 2'"
+
+
+def _advisor_offer_line(active_docs: list[dict], chat_id: Optional[int], user_id: Optional[int], query: str) -> str:
+    """คืนบรรทัดเสนอ "แทนรายการที่ N ด้วยรุ่นที่เลือก" ท้ายคำตอบ advisor ถ้ามีใบเสนอราคาเปิดอยู่ตอนนี้ และคำถามนี้
+    เอ่ยถึงรายการ/label ที่มีอยู่จริงในตารางของไฟล์นั้นตรงๆ (ดู _query_mentions_table_item_or_label) — การแทน/
+    เพิ่มรายการจริงจากคำตอบ advisor ยังไม่ได้ต่อสายจริงใน PR นี้ (ตั้งใจเลื่อนไป PR ถัดไป) นี่แค่ข้อความเสนอให้
+    ผู้ใช้รู้ว่าพิมพ์คำสั่งแบบไหนได้ คืนว่างเปล่าถ้าไม่มีเอกสารเปิดอยู่/ไม่ได้ล็อกอิน/คำถามไม่เกี่ยวกับรายการใน
+    ตารางของไฟล์ที่เปิดอยู่เลย"""
+    if not active_docs or not chat_id or not user_id:
+        return ""
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    if target_doc is None:
+        return ""
+    if _query_mentions_table_item_or_label(query, target_doc):
+        return "\n\n" + _ADVISOR_REPLACEMENT_OFFER_LINE
+    return ""
+
+
+def _advisor_system_prompt() -> str:
+    """system prompt สำหรับ advisor_answer — ไม่มีข้อความบังคับ "ตอบจากข้อมูลอ้างอิงเท่านั้น"/บริบทฐานความรู้
+    กฎหมายใดๆ เลย (ต่างจาก _prepare_rag_context โดยตั้งใจ) ห้ามพูดถึงฐานความรู้/เอกสารอ้างอิงกับผู้ใช้เด็ดขาดไม่
+    ว่ากรณีใด — วันที่ปัจจุบัน (เวลาไทย) ใส่ไว้ให้ AI ใช้ระบุว่าราคาที่ค้นเจอเป็นราคาโดยประมาณ ณ วันที่เท่าไร"""
+    today = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d")
+    return (
+        "คุณเป็นผู้ช่วยให้คำแนะนำทั่วไปสำหรับผู้ประกอบการ/นักลงทุนในประเทศไทย ตอบคำถามทั่วไปที่ไม่ใช่คำถามเชิง"
+        "กฎหมาย/ภาษี/การลงทุน (เช่น แนะนำ/เปรียบเทียบสินค้า อุปกรณ์ รุ่น ราคา ผู้ให้บริการ หรือคำถามธุรกิจทั่วไป"
+        "อื่นๆ)\n"
+        f"วันนี้คือ {today}\n"
+        "- คุณไม่มีฐานความรู้/เอกสารอ้างอิงพิเศษใดๆ ในเรื่องนี้ ห้ามพูดถึงคำว่า 'ฐานความรู้'/'ข้อมูลอ้างอิง'/"
+        "'เอกสารอ้างอิง' กับผู้ใช้เด็ดขาดไม่ว่ากรณีใด ตอบด้วยความรู้ทั่วไปของคุณ ผสมกับผลค้นเว็บ (web_search) "
+        "เมื่อจำเป็น\n"
+        "- ถ้าต้องแนะนำรุ่น/ราคาสินค้า ให้ใช้เครื่องมือค้นเว็บ (web_search) ค้นหาข้อมูลจริงก่อนเสมอ ห้ามแต่งรุ่น/"
+        "ราคาขึ้นเองเด็ดขาด ทุกราคาที่บอกต้องระบุแหล่งที่มา (ชื่อเว็บไซต์/ผู้ขาย) และระบุด้วยว่าเป็นราคาโดยประมาณ "
+        "ณ วันที่ค้นหา (เพราะราคาจริงอาจเปลี่ยนแปลงได้)\n"
+        "- ถามกลับผู้ใช้เพื่อขอความชัดเจนได้ไม่เกิน 1 คำถามต่อการตอบ 1 ครั้งเท่านั้น ถ้าผู้ใช้ตอบว่า 'ไม่จำกัด'/"
+        "'ดีที่สุด'/'ได้หมด'/ไม่ระบุงบ ให้แนะนำตัวเลือกที่ดีที่สุดทันทีโดยไม่ถามซ้ำอีก พร้อมระบุสมมติฐานที่ใช้ "
+        "(เช่น ขนาด/การใช้งานที่สันนิษฐานไว้) ให้ชัดเจนในคำตอบแทน\n"
+        "- ถ้าแบรนด์ที่ผู้ใช้ระบุมาไม่ได้ผลิตสินค้าประเภทนั้นจริงๆ ให้บอกตรงๆ และแนะนำแบรนด์อื่นที่ผลิตสินค้า"
+        "ประเภทนั้นจริงแทน ห้ามแต่งรุ่นปลอมขึ้นมาเด็ดขาด\n"
+        "- คำแนะนำสินค้า/รุ่น ให้จัดเป็นรายการลำดับเลข (1. 2. 3. ...) ไม่เกิน 5 รายการ แต่ละรายการระบุ: ชื่อรุ่น, "
+        "สเปกสำคัญ, ราคาโดยประมาณ, แหล่งที่มา\n"
+        "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ (เช่น ผู้ใช้เพิ่งตอบคำถามที่คุณถามไปก่อนหน้า) "
+        "ให้ใช้บริบทนั้นประกอบการตอบด้วยเสมอ ห้ามถามคำถามเดิมซ้ำอีก\n"
+        "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใช้ \"ค่ะ\" เด็ดขาด\n"
+        "- ห้ามใส่ข้อความ disclaimer ทางกฎหมายท้ายคำตอบ (ไม่เกี่ยวกับคำถามประเภทนี้)"
+    )
+
+
+def advisor_answer(
+    query: str, history: Optional[list] = None, user_id: Optional[int] = None, chat_id: Optional[int] = None,
+    active_docs: Optional[list] = None,
+) -> tuple[str, list]:
+    """คำตอบสำหรับเส้นทาง advisor (คำถามทั่วไป/แนะนำสินค้า ไม่ใช่กฎหมาย/เนื้อหาไฟล์เอกสารที่เปิดอยู่) — ไม่มี
+    context จากฐานความรู้กฎหมายเลย (ต่างจาก rag_answer) ใช้ system prompt แยกต่างหาก (ดู _advisor_system_prompt)
+    ส่งประวัติสนทนาล่าสุด (เหมือน rag_answer — สูงสุด MAX_HISTORY_MESSAGES ข้อความ) ให้ AI เข้าใจบริบทคำถามที่
+    เคยถามไปก่อนหน้า (เช่น ผู้ใช้เพิ่งตอบคำถามที่เคยถูกถามกลับ) เปิดใช้ web_search ทั่วไป (ไม่จำกัดโดเมน ต่างจาก
+    AVAILABLE_TOOLS — ดู ADVISOR_TOOLS) ไม่มีเครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้ (ฟีเจอร์ "แทนรายการด้วย
+    รุ่นที่เลือก" ยังไม่ต่อสายจริง — แค่เสนอข้อความท้ายคำตอบถ้าเข้าเงื่อนไข ดู _advisor_offer_line)
+
+    คืน (ข้อความคำตอบ, []) เสมอ (sources ว่างเสมอ — ไม่มี RAG chunk ให้แสดง เป็นเส้นทางที่ไม่ผ่านฐานความรู้เลย)"""
+    history = history or []
+    active_docs = active_docs or []
+    recent_history = history[-MAX_HISTORY_MESSAGES:] if history else []
+    messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    messages.append({"role": "user", "content": query})
+
+    raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
+        _advisor_system_prompt(), messages, user_id=user_id, chat_id=chat_id, tools_override=ADVISOR_TOOLS,
+    )
+    answer = _normalize_polite_particles(raw_answer)
+    answer += _advisor_offer_line(active_docs, chat_id, user_id, query)
+    return answer, []
+
+
 def rag_answer_stream(query, history=None, image_data=None, user_id=None):
     """เวอร์ชัน streaming จริง — yield คำตอบออกมาทีละ chunk ตามที่ Claude generate จริง
     (ไม่ใช่ generate เสร็จแล้วค่อยแบ่งส่งทีหลัง) ใช้กับ /ask/stream
@@ -3662,6 +3859,10 @@ async def ask_question(
     # จริง (เรียก rag_answer) อยู่นอก branch ที่ตั้งค่า ถ้าไม่ล็อกอิน/ไม่มี chat_id/มีภาพแนบมา ฯลฯ จะไม่เคยเข้า
     # branch นั้นเลยสักครั้ง (ดู run_agentic_tool_loop/rag_answer)
     structural_route = False
+    # รายการไฟล์ Excel ที่เปิดอยู่ในแชทนี้ — ตั้งค่าจริงใน branch ด้านล่าง (ถ้าล็อกอิน+มี chat_id+ไม่มีภาพแนบมา)
+    # ต้อง init ไว้ก่อนเสมอเพราะจุดที่ใช้งานจริง (ตัดสินเส้นทาง legal/advisor ก่อนเรียก rag_answer/advisor_answer)
+    # อยู่นอก branch ที่ตั้งค่า เหตุผลเดียวกับ structural_route ด้านบน
+    active_docs = []
 
     # สร้างแชทใหม่ตรงนี้เลยถ้าเป็นข้อความแรกสุด (ยังไม่มี chat_id มา) และไม่มีภาพแนบมา — ย้ายมาจากเดิมที่อยู่
     # หลังสุด (ก่อนเรียก rag_answer) เพราะทางลัดทั้งหมดด้านล่าง (เลือกข้อ/ย้อน/ปิด/เปิด) เช็ค
@@ -3752,6 +3953,16 @@ async def ask_question(
         # ข้อมูลนี้จับคู่ได้ ไม่ใช่แค่ชื่อไฟล์เหมือนเดิม (ดู _enrich_chat_documents)
         active_docs = _enrich_chat_documents(list_active_editable_documents_by_chat(chat_id, user_id))
 
+        # คำสั่ง export บทสนทนาเป็นไฟล์ ("ขอบทสนทนา"/"export แชท"/ฯลฯ) ดักก่อนเรียก LLM ใดๆ เสมอ — ไม่ต้องมี
+        # เอกสาร Excel เปิดอยู่เลยก็ใช้ได้ (ต่างจากคำสั่งย้อนการแก้/ปิดไฟล์ด้านล่าง ที่ผูกกับเอกสารที่เปิดอยู่)
+        if _is_chat_export_command(query):
+            answer = _build_chat_export_answer(chat_id)
+            print(f"[Route] chat={chat_id} branch=chat_export")
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         # คำสั่งย้อนการแก้ตรงๆ ("ย้อนการแก้"/"undo") ดักก่อนเรียก LLM ใดๆ เสมอ ย้อนไฟล์ที่โฟกัสอยู่ (หรือไฟล์
         # เดียวที่เปิดอยู่ถ้ามีแค่ไฟล์เดียว) ถ้ามีหลายไฟล์และไม่มีโฟกัส ให้ถามกลับแทนการเดา
         if active_docs and _is_undo_command(query):
@@ -3823,12 +4034,22 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอย่าง "อะไร"/"เท่าไร"/"บ้าง"/"ไหม"/"กี่"/"?"/"แสดง"/"ดู"/"สรุป") ขณะมี
-        # เอกสารเปิดอยู่ — ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก
-        # read_document_values เอง ห้ามให้ _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close)
-        # ตัดสินใจแทน เพราะคำถามแบบนี้ไม่เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า
-        # "ไม่พบ label ที่ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ
-        reading_question = bool(active_docs) and _is_document_reading_question(query)
+        # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
+        # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่ — ส่ง
+        # ตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง ห้ามให้
+        # _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close) ตัดสินใจแทน เพราะคำถามแบบนี้ไม่
+        # เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้"
+        # แทนที่จะตอบคำถามจริงๆ
+        reading_target_doc = None
+        if active_docs:
+            focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
+            reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
+                active_docs[0] if len(active_docs) == 1 else None
+            )
+        reading_question = bool(active_docs) and (
+            _is_document_reading_question(query)
+            or (reading_target_doc is not None and _query_mentions_table_item_or_label(query, reading_target_doc))
+        )
         # คำถามเนื้อหาไฟล์ "แท้ๆ" (ไม่มีคำเชิงกฎหมายปนมา — ดู _has_legal_keyword) ตอบตรงด้วย
         # read_document_values เลย ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย กันพึ่ง system prompt อย่างเดียวให้ AI
         # ตัดสินใจเรียก tool เอง (เคยพลาด) คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา (เช่น "ธุรกิจบัญชีสามมีอะไร
@@ -4061,10 +4282,27 @@ async def ask_question(
         title = saved_query.strip()[:50] or "แชทใหม่"
         chat_id = create_chat_session(user_id, title=title)
 
-    answer, sources = rag_answer(
-        query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id,
-        structural_route=structural_route,
-    )
+    # เลือกเส้นทางคำตอบสุดท้าย: "legal" (RAG ฐานความรู้กฎหมายเดิม ผ่าน rag_answer — คำสั่งแก้โครงสร้าง
+    # (structural_route) ต้องมาทางนี้เสมอ เพราะมี tool change_rate/update_table_item/ฯลฯ อยู่ใน system prompt
+    # เส้นทางนี้เท่านั้น) หรือ "advisor" (คำถามทั่วไป/แนะนำสินค้า ไม่มี context ฐานความรู้กฎหมายปนเลย ผ่าน
+    # advisor_answer — ดู _classify_question_route) ไม่ตัดสินเลยถ้าเป็นคำสั่งแก้โครงสร้าง หรือมีภาพแนบมา หรือ
+    # ข้อความว่างเปล่า (ไปทาง legal เหมือนพฤติกรรมเดิมก่อน PR นี้ทุกประการ — คำถามเกี่ยวกับไฟล์แท้ๆ ถูกดักไป
+    # ตั้งแต่ reading_question/document_content_question ก่อนถึงจุดนี้แล้วเสมอ ไม่มีทางหลุดมาถึง branch นี้)
+    if structural_route or image_data or not query.strip():
+        question_route = "legal"
+    else:
+        question_route = _classify_question_route(query)
+
+    if question_route == "advisor":
+        print(f"[Route] chat={chat_id} branch=advisor")
+        answer, sources = advisor_answer(
+            query, history=history, user_id=user_id, chat_id=chat_id, active_docs=active_docs,
+        )
+    else:
+        answer, sources = rag_answer(
+            query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id,
+            structural_route=structural_route,
+        )
     if image_data:
         # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง — Vision อ่านภาพคลาดเคลื่อนได้มากกว่าอ่านไฟล์จริง
         answer += IMAGE_ANSWER_DISCLAIMER
@@ -4343,6 +4581,57 @@ def get_chat(chat_id: int, user_id: int = Depends(require_user)):
         raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
     messages = get_chat_messages(chat_id)
     return {"chat": chat, "messages": messages}
+
+# ---------- Export บทสนทนาเป็นไฟล์ .txt ----------
+_CHAT_EXPORT_ROLE_LABELS = {"user": "ผู้ใช้", "assistant": "ThaiMeSook"}
+
+
+def _format_chat_export_timestamp(created_at: Optional[str]) -> str:
+    """แปลง created_at (ISO string จาก get_chat_messages — UTC naive เสมอ ดู db.py) เป็นเวลาไทย (Asia/Bangkok)
+    รูปแบบ "YYYY-MM-DD HH:MM" คืน "-" ถ้า parse ไม่ได้ (กันข้อความเดียว parse พลาดทำให้ export ทั้งไฟล์ล้ม)"""
+    if not created_at:
+        return "-"
+    try:
+        parsed = datetime.datetime.fromisoformat(created_at)
+    except ValueError:
+        return "-"
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M")
+
+
+def _build_chat_export_text(chat_title: str, messages: list[dict]) -> str:
+    """ประกอบเนื้อหาไฟล์ export (.txt) ของแชทหนึ่งแชท — header (ชื่อแชท + เวลา export เป็นเวลาไทย) ตามด้วยทุก
+    ข้อความเรียงตามเวลาจริง (get_chat_messages คืนเรียงตาม created_at อยู่แล้ว) รูปแบบ
+    "[YYYY-MM-DD HH:MM] ผู้ใช้/ThaiMeSook: เนื้อหา" คั่นแต่ละข้อความด้วยบรรทัดว่าง 1 บรรทัด ไม่ครอบ BOM ในนี้
+    (caller เป็นคนเติม BOM ตอน encode เป็น bytes — ดู export_chat_transcript)"""
+    exported_at = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M")
+    lines = [f"บทสนทนา: {chat_title}", f"ส่งออกเมื่อ: {exported_at} (เวลาไทย)", ""]
+    for m in messages:
+        role_label = _CHAT_EXPORT_ROLE_LABELS.get(m["role"], m["role"])
+        timestamp = _format_chat_export_timestamp(m.get("created_at"))
+        lines.append(f"[{timestamp}] {role_label}: {m['content']}")
+        lines.append("")
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+@app.get("/api/chat/{chat_id}/export.txt")
+def export_chat_transcript(chat_id: int, user_id: int = Depends(require_user)):
+    """ดาวน์โหลดบทสนทนาทั้งหมดของแชทนี้เป็นไฟล์ .txt (UTF-8 BOM — ให้ Notepad แสดงภาษาไทยถูกต้อง) ownership เช็ค
+    ผ่าน get_chat_session เหมือน endpoint อื่นๆ ของแชททั้งหมด (404 ถ้าไม่ใช่แชทของ user คนนี้)"""
+    chat = get_chat_session(chat_id, user_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
+    messages = get_chat_messages(chat_id)
+    text = _build_chat_export_text(chat["title"], messages)
+    data = text.encode("utf-8-sig")
+    filename = f"{chat['title']}.txt"
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": _content_disposition_attachment(filename)},
+    )
+
 
 @app.delete("/api/chats/{chat_id}")
 def remove_chat(chat_id: int, user_id: int = Depends(require_user)):
@@ -5802,6 +6091,11 @@ def _extract_excel_labels(raw: bytes) -> dict:
                     "value": _json_safe_cell_value(value_cell.value),
                     "format": value_cell.number_format,
                     "heading": heading_text,
+                    # ตำแหน่งเซลล์ป้าย (ไม่ใช่เซลล์ค่า) เก็บไว้แยกต่างหาก — ใช้โดย _current_label_display_name
+                    # อ่าน "ข้อความปัจจุบัน" ของป้ายนี้ย้อนหลังได้ (คนละเรื่องกับ key ของ label_map ที่แช่แข็งไว้
+                    # ตั้งแต่ extract ครั้งแรกเสมอ ดู docstring ของ _label_position)
+                    "label_row": label_cell.row,
+                    "label_col": label_cell.column,
                 })
 
         # ---- pass 2: ตัดสินใจ key สุดท้ายของทุก occurrence ในชีตนี้ ----
@@ -5830,6 +6124,8 @@ def _extract_excel_labels(raw: bytes) -> dict:
                     "col": occ["col"],
                     "current_value": occ["value"],
                     "number_format": occ["format"],
+                    "label_row": occ["label_row"],
+                    "label_col": occ["label_col"],
                 }
 
             label_seen_in_sheets.setdefault(label_text, []).append(sheet_name)
@@ -6495,12 +6791,15 @@ def create_new_version(document_id: int, mutate_fn, change_summary: Optional[str
     _match_and_apply_excel_edit เท่านั้น — เฟส 2 จะใช้ฟังก์ชันนี้กับการแก้ทุกชนิด เช่น เปลี่ยนสูตร เพิ่ม/ลบแถว)
     change_summary: ข้อความสั้นๆ อธิบายการแก้นี้ เก็บไว้ในเวอร์ชันโดยตรง (ดู DocumentVersion.change_summary) —
     ไม่ได้ใช้แสดงผลที่ไหนในเฟส 1 นี้ (ดู document_edit_log/get_recent_document_edits สำหรับประวัติที่แสดงจริง)
-    ต้องเรียกโดยที่ caller เช็ค ownership ของ document_id นี้มาแล้วเท่านั้น (ฟังก์ชันนี้ไม่เช็คเอง)"""
+    ต้องเรียกโดยที่ caller เช็ค ownership ของ document_id นี้มาแล้วเท่านั้น (ฟังก์ชันนี้ไม่เช็คเอง)
+
+    คืน "new_bytes" (ไฟล์เวอร์ชันใหม่) มาด้วยเสมอ — ใช้โดย _apply_single_queue_item อ่านข้อความป้ายปัจจุบันจริง
+    (ดู _current_label_display_name) โดยไม่ต้องเรียก get_working_copy ซ้ำอีกรอบ"""
     document = get_editable_document_raw(document_id)
     base_bytes, base_label_map = get_working_copy(document)
     new_bytes, new_label_map = _build_document_version(base_bytes, base_label_map, mutate_fn)
     version_id = create_document_version(document_id, new_bytes, new_label_map, change_summary=change_summary)
-    return {"label_map": new_label_map, "version_id": version_id}
+    return {"label_map": new_label_map, "version_id": version_id, "new_bytes": new_bytes}
 
 
 def _compute_table_amount_values(file_bytes: bytes, tables: list[dict]) -> None:
@@ -6547,7 +6846,10 @@ def read_document_values(document: dict) -> dict:
         is_formula = _is_label_cell_formula(base_bytes, info)
         value = info["current_value"]
         labels.append({
-            "label": label,
+            # ชื่อปัจจุบันจริงในเซลล์ป้าย ไม่ใช่ key ที่แช่แข็งไว้ตั้งแต่ extract ครั้งแรก (ดู
+            # _current_label_display_name) — เหตุการณ์จริงที่แก้: เปลี่ยน VAT 7% -> 25% แล้ว แต่ผลลัพธ์ของ
+            # read_document_values ยังโชว์ label เดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่ตลอดไป
+            "label": _current_label_display_name(base_bytes, label, info),
             "value": value,
             "is_formula": is_formula,
             "not_computable": is_formula and value is None,
@@ -6730,11 +7032,38 @@ def _find_label_by_position(label_map: dict, position: tuple) -> Optional[dict]:
     return None
 
 
-def _label_side_effects(old_label_map: dict, new_label_map: dict, exclude_position: Optional[tuple] = None) -> list[dict]:
+def _current_label_display_name(base_bytes: bytes, label: str, info: dict) -> str:
+    """คืนชื่อ label "ปัจจุบัน" จากข้อความจริงในเซลล์ป้าย (label_row/label_col — ดู _extract_excel_labels) แทน
+    key ของ label_map ที่แช่แข็งไว้ตั้งแต่ extract ครั้งแรกเสมอ (ดู docstring ของ _label_position/
+    _build_document_version) เหตุการณ์จริงที่แก้: เปลี่ยน VAT จาก 7% เป็น 25% สำเร็จ แต่ "ยอดล่าสุด"/ข้อความผล
+    ลัพธ์ยังโชว์ชื่อเดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่ตลอดไป ทั้งที่เซลล์ป้ายจริงถูกเขียนข้อความใหม่เป็น
+    "ภาษีมูลค่าเพิ่ม 25%" ไปแล้ว (ดู _build_rate_change_mutate_fn) — ใช้เฉพาะตอน "แสดงผล" ให้ผู้ใช้เห็นเท่านั้น
+    การจับคู่/ค้นหาภายในทุกจุดยังคงใช้ key เดิมของ label_map เป๊ะเหมือนเดิม ไม่เปลี่ยน
+
+    ไฟล์เก่าที่ label_map ยังไม่มี label_row/label_col (สร้างก่อน PR นี้) หรืออ่านเซลล์ไม่ได้ด้วยเหตุผลใดๆ ->
+    คืน key เดิม (label) ตรงๆ เป็น fallback เสมอ ไม่ raise"""
+    row = info.get("label_row")
+    col = info.get("label_col")
+    if row is None or col is None:
+        return label
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(base_bytes), data_only=False)
+        cell_value = wb[info["sheet"]].cell(row=row, column=col).value
+    except Exception:
+        return label
+    text = str(cell_value).strip() if cell_value is not None else ""
+    return text or label
+
+
+def _label_side_effects(
+    old_label_map: dict, new_label_map: dict, new_bytes: bytes, exclude_position: Optional[tuple] = None
+) -> list[dict]:
     """หา label ที่ค่าต่างไปจากเดิม (ผลข้างเคียงจากสูตรคำนวณใหม่ ไม่ใช่การแก้ตรงๆ) — ใช้ร่วมกันทุก action ใน
     เฟสนี้ (change_rate/update/delete/add_table_item) ตรรกะเดียวกับที่ _match_and_apply_excel_edit ใช้ จับคู่
-    label เก่า<->ใหม่ด้วยตำแหน่งเซลล์ (ดู _label_position) ไม่ใช่ชื่อ label คืน list [{"label": ชื่อปัจจุบัน
-    (จาก new_label_map), "old_value":, "new_value":}, ...] ไม่เกิน 3 รายการ (ตัดให้ caller แล้ว ไม่ต้องตัดเอง)"""
+    label เก่า<->ใหม่ด้วยตำแหน่งเซลล์ (ดู _label_position) ไม่ใช่ชื่อ label คืน list [{"label": ชื่อปัจจุบันจริง
+    ในเซลล์ป้าย (ดู _current_label_display_name — ไม่ใช่ key ที่แช่แข็งไว้), "old_value":, "new_value":}, ...]
+    ไม่เกิน 3 รายการ (ตัดให้ caller แล้ว ไม่ต้องตัดเอง) new_bytes: ไฟล์เวอร์ชันใหม่ (หลัง mutate) ใช้อ่านข้อความ
+    ป้ายปัจจุบันจริงของ new_label_map"""
     old_by_position = {_label_position(info): info["current_value"] for info in old_label_map.values()}
     results = []
     for new_lbl, new_info in new_label_map.items():
@@ -6743,7 +7072,8 @@ def _label_side_effects(old_label_map: dict, new_label_map: dict, exclude_positi
             continue
         old_value = old_by_position[position]
         if not _cell_values_equal(old_value, new_info["current_value"]):
-            results.append({"label": new_lbl, "old_value": old_value, "new_value": new_info["current_value"]})
+            display_label = _current_label_display_name(new_bytes, new_lbl, new_info)
+            results.append({"label": display_label, "old_value": old_value, "new_value": new_info["current_value"]})
     return results[:3]
 
 
@@ -7111,22 +7441,30 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
 
     version_result = create_new_version(document_id, mutate_fn, change_summary=change_summary)
     new_label_map = version_result["label_map"]
+    new_bytes = version_result["new_bytes"]
 
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
 
     exclude_position = (action["sheet"], action["row"], action["col"]) if action_type == "change_rate" else None
-    side_effects = _label_side_effects(label_map, new_label_map, exclude_position=exclude_position)
+    side_effects = _label_side_effects(label_map, new_label_map, new_bytes, exclude_position=exclude_position)
 
     if action_type == "change_rate":
         old_by_position = {_label_position(info): info["current_value"] for info in label_map.values()}
         old_value = old_by_position.get(exclude_position)
         new_info = _find_label_by_position(new_label_map, exclude_position)
         new_value = new_info["current_value"] if new_info is not None else old_value
+        # ใช้ข้อความปัจจุบันจริงในเซลล์ป้าย (เช่น "ภาษีมูลค่าเพิ่ม 25%") แทน action.get("label") ที่แช่แข็งเป็นชื่อ
+        # เดิมตอนก่อนแก้เสมอ (ดู _current_label_display_name) — เหตุการณ์จริงที่แก้: เปลี่ยน VAT 7% -> 25%
+        # สำเร็จ แต่ข้อความผลลัพธ์ยังโชว์ "'ภาษีมูลค่าเพิ่ม 7%'" ค้างอยู่
+        display_label = (
+            _current_label_display_name(new_bytes, action.get("label"), new_info)
+            if new_info is not None else action.get("label")
+        )
         edit_log_id = log_document_edit(document_id, action.get("label"), old_value, new_value, was_formula=True)
         link_edit_log_to_version(edit_log_id, version_result["version_id"])
         message = (
-            f"เปลี่ยนอัตราของ '{action.get('label')}' เป็น {_format_rate_number(action.get('new_rate'))}% แล้ว "
+            f"เปลี่ยนอัตราของ '{display_label}' เป็น {_format_rate_number(action.get('new_rate'))}% แล้ว "
             f"— ค่าเปลี่ยนจาก {old_value} เป็น {new_value}"
         )
     elif action_type == "update_table_item":
