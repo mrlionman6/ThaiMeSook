@@ -8,6 +8,22 @@ let forgotPasswordQuestions = null; // 2 คำถามที่สุ่มม
 let forgotPasswordUsername = null;
 const ROLE_LABELS_JS = { 1: "ระดับ 1", 2: "ระดับ 2", 3: "ระดับ 3" };
 
+// ลิงก์ทุกอันในคำตอบแชท (marked.parse — ดู appendChatMessage/typewriterReveal) ต้องเปิดแท็บใหม่เสมอ ไม่เปลี่ยน
+// หน้าเดิมทิ้ง URL ดิบที่ไม่ได้เขียนเป็น markdown link ชัดเจน (เช่น autolink ของ GFM ที่ marked แปลงให้เอง —
+// token.tokens จะมีข้อความเหมือน href เป๊ะในกรณีนี้) แสดงเป็นคำว่า "ลิงก์" แทน URL เต็มที่ยาวเกินจะอ่าน/ล้นกรอบ
+// ข้อความ — ยังคลิกได้ปกติ แค่ข้อความที่เห็นสั้นลง
+marked.use({
+    renderer: {
+        link(token) {
+            const href = token.href;
+            const titleAttr = token.title ? ` title="${token.title}"` : "";
+            const innerHtml = this.parser.parseInline(token.tokens);
+            const displayHtml = innerHtml.trim() === href ? "ลิงก์" : innerHtml;
+            return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${displayHtml}</a>`;
+        },
+    },
+});
+
 // =====================================================================
 // แนบไฟล์ (ต้อง login) — เลือกไฟล์แล้วโชว์ชื่อไฟล์เป็น chip เล็กๆ ใต้ช่องพิมพ์
 // รองรับ 3 ประเภท: ภาพ (Claude Vision ผ่าน /ask เดิม), excel แบบ Deal Screening
@@ -1529,7 +1545,7 @@ async function loadChatHistory() {
             const downloadBtn = document.createElement("button");
             downloadBtn.className = "side-chat-download";
             downloadBtn.textContent = "⬇";
-            downloadBtn.title = "ดาวน์โหลดบทสนทนานี้ (.txt)";
+            downloadBtn.title = "ดาวน์โหลดบทสนทนา";
             downloadBtn.onclick = (e) => {
                 e.stopPropagation();
                 window.open(`/api/chat/${chat.id}/export.txt`, "_blank");

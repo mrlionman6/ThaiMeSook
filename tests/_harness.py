@@ -17,6 +17,7 @@ import difflib
 import datetime
 import tempfile
 import concurrent.futures
+import urllib.parse
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -42,6 +43,7 @@ WANTED_MAIN_FUNCS = {
     "_compute_table_amount_values", "read_document_values", "_format_document_values_text", "_is_label_cell_formula",
     "_suggest_similar_labels", "_normalize_label",
     "_format_rate_number", "_rewrite_percent_text", "_rewrite_rate_formula", "_resolve_rate_formula",
+    "_split_rate_label_base_and_percent",
     "_build_rate_change_mutate_fn", "_label_side_effects", "_format_side_effect_lines",
     "_get_single_item_table",
     "_build_delete_table_item_mutate_fn", "_describe_table_item",
@@ -67,10 +69,14 @@ WANTED_MAIN_FUNCS = {
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
     "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
     "_advisor_target_doc", "_advisor_document_context",
-    "run_agentic_tool_loop", "_build_final_answer_with_citations",
+    "run_agentic_tool_loop", "_build_final_answer_with_citations", "_safe_execute_tool",
+    "execute_present_recommendations", "_render_recommendation_item_line", "_render_recommendations_answer",
+    "_extract_domain_from_url",
+    "_resolve_recommendation_command_dispatch", "_resolve_recommendation_replace_command",
+    "_resolve_recommendation_add_command", "_parse_recommendation_price_clause",
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_is_chat_export_command", "_build_chat_export_answer",
-    "_format_chat_export_timestamp", "_build_chat_export_text",
+    "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
     "_format_cell_display_text", "_cell_style_info", "_evaluate_preview_formula_cells",
     "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
@@ -99,8 +105,13 @@ WANTED_MAIN_CONSTS = {
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES", "MAX_TOOL_ITERATIONS",
     "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
+    "PRESENT_RECOMMENDATIONS_TOOL", "ADVISOR_MODEL", "_NO_VERIFIED_RECOMMENDATIONS_MESSAGE",
+    "_SEARCH_TOOL_BLOCK_TYPES",
+    "_RECOMMENDATION_REPLACE_RE", "_RECOMMENDATION_ADD_RE", "_RECOMMENDATION_QTY_CLAUSE_RE",
+    "_PRICE_CLAUSE_EXPLICIT_RE", "_PRICE_CLAUSE_ORIGINAL_RE", "_PRICE_CLAUSE_MARKUP_RE",
     "QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT",
     "_CHAT_EXPORT_ROLE_LABELS", "_CHAT_EXPORT_COMMAND_TEXTS",
+    "_MARKDOWN_LINK_RE", "_MARKDOWN_BOLD_RE", "_MARKDOWN_HEADING_RE",
     "_POLITE_PARTICLE_COMPOUND_RE", "_POLITE_PARTICLE_TRAILING_RE",
     "_THAI_DIGIT_WORDS", "_THAI_PLACE_WORDS",
     "_BAHTTEXT_FORMULA_RE", "_SIMPLE_CELL_REFERENCE_RE", "_PREVIEW_NOT_COMPUTABLE_TITLE",
@@ -125,6 +136,7 @@ class _FakeDb:
         self.edit_logs: dict[int, dict] = {}
         self.pending_actions: dict[int, list[dict]] = {}  # chat_id -> [{"id","action","preview_text","created_at"}, ...] เรียงเก่า->ใหม่
         self.focus: dict[int, int] = {}
+        self.last_recommendations: dict[int, list] = {}
         self.closed_ids: set[int] = set()
         self.library_files: dict[int, dict] = {}
         self._next_document_id = 1
@@ -207,6 +219,12 @@ class _FakeDb:
 
     def set_chat_document_focus(self, chat_id, document_id):
         self.focus[chat_id] = document_id
+
+    def set_chat_last_recommendations(self, chat_id, items):
+        self.last_recommendations[chat_id] = list(items)
+
+    def get_chat_last_recommendations(self, chat_id):
+        return self.last_recommendations.get(chat_id)
 
     def get_chat_document_focus(self, chat_id, user_id):
         document_id = self.focus.get(chat_id)
@@ -338,6 +356,34 @@ class _FakeAgenticResponse:
         self.stop_reason = stop_reason
 
 
+class _FakeAgenticOtherBlock:
+    """ตัวแทน content block ชนิดอื่นที่ไม่ใช่ text/tool_use (เช่น server_tool_use/web_search_tool_result) — ใช้
+    เฉพาะเทสต์ _build_final_answer_with_citations/run_agentic_tool_loop ตัวจริง ไม่ต้องมี field ครบเหมือนจริง
+    content: list ของผลลัพธ์ web_search (แต่ละชิ้นมี "url"/"title") ใช้เฉพาะตอน block_type ==
+    "web_search_tool_result" เท่านั้น"""
+
+    def __init__(self, block_type: str, content: Optional[list] = None):
+        self.type = block_type
+        self.content = content
+
+    def model_dump(self):
+        return {"type": self.type, "content": self.content}
+
+
+class _FakeAgenticToolUseBlock:
+    """ตัวแทน content block ชนิด "tool_use" — ใช้เฉพาะเทสต์ run_agentic_tool_loop ตัวจริงที่ต้องจำลอง Claude
+    เรียก custom tool (เช่น present_recommendations)"""
+
+    def __init__(self, tool_use_id: str, name: str, tool_input: dict):
+        self.type = "tool_use"
+        self.id = tool_use_id
+        self.name = name
+        self.input = tool_input
+
+    def model_dump(self):
+        return {"type": "tool_use", "id": self.id, "name": self.name, "input": self.input}
+
+
 class StorageNotConfiguredError(Exception):
     pass
 
@@ -380,10 +426,10 @@ class _FakeAgenticLoop:
     def set_response(self, text: str, receipts: list, structural_tool_called: bool) -> None:
         self.response = (text, receipts, structural_tool_called)
 
-    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None):
+    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None):
         self.last_call_args = {
             "system_prompt": system_prompt, "messages": initial_messages, "user_id": user_id, "chat_id": chat_id,
-            "tools_override": tools_override,
+            "tools_override": tools_override, "model": model,
         }
         return self.response
 
@@ -421,7 +467,7 @@ def build_namespace() -> dict:
         "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "html": html, "json": json, "zipfile": zipfile, "difflib": difflib,
-        "datetime": datetime, "ZoneInfo": ZoneInfo,
+        "datetime": datetime, "ZoneInfo": ZoneInfo, "urllib": urllib,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
@@ -437,6 +483,8 @@ def build_namespace() -> dict:
         "link_edit_log_to_version": fake_db.link_edit_log_to_version,
         "log_document_edit": fake_db.log_document_edit,
         "set_chat_document_focus": fake_db.set_chat_document_focus,
+        "set_chat_last_recommendations": fake_db.set_chat_last_recommendations,
+        "get_chat_last_recommendations": fake_db.get_chat_last_recommendations,
         "get_chat_document_focus": fake_db.get_chat_document_focus,
         "add_chat_pending_action": fake_db.add_chat_pending_action,
         "get_chat_pending_actions": fake_db.get_chat_pending_actions,
