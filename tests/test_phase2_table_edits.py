@@ -151,8 +151,9 @@ def test_apply_change_rate_to_10_percent(ns, doc1):
 
     expected_vat = round(FIXTURE_TOTAL * 0.10, 2)
     expected_total = FIXTURE_TOTAL + expected_vat
-    assert str(expected_vat) in result["message"]
-    assert str(expected_total) in result["message"]
+    # ตัวเลขเงินมีคอมมาคั่นหลักพันเสมอ (ดู _format_money_value) เช่น "8,822" ไม่ใช่ "8822.0"
+    assert ns["_format_money_value"](expected_vat) in result["message"]
+    assert ns["_format_money_value"](expected_total) in result["message"]
 
     data = _current(ns)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
@@ -165,22 +166,44 @@ def test_apply_change_rate_to_10_percent(ns, doc1):
 
 
 def test_apply_change_rate_message_and_values_show_current_label_not_stale_name(ns, doc1):
-    """เหตุการณ์จริงที่แก้ (2 รอบ): (1) read_document_values/ยอดล่าสุด เคยโชว์ชื่อเดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่
+    """เหตุการณ์จริงที่แก้ (3 รอบ): (1) read_document_values/ยอดล่าสุด เคยโชว์ชื่อเดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่
     ตลอดไปหลังเปลี่ยนเป็น 25% แล้ว (2) ข้อความผลลัพธ์เคยเขียน "เปลี่ยนอัตราของ 'ภาษีมูลค่าเพิ่ม 25%' เป็น 25%"
     (บอกว่าเปลี่ยนจาก 25% ทั้งที่จริงเปลี่ยนจาก 7%) ตอนนี้ต้องเขียน "เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%"
-    ชัดเจน และ "ยอดล่าสุด"/read_document_values ต้องโชว์ "ภาษีมูลค่าเพิ่ม 25%" (ชื่อปัจจุบันจริง)"""
+    ชัดเจน (3) label ที่ถูกแก้ตรงๆ (VAT) ไม่ต้องโผล่ซ้ำใต้หัวข้อ "ยอดล่าสุด:" อีก เพราะมีบรรทัด "เปลี่ยนจาก...เป็น..."
+    ของมันเองอยู่แล้วในข้อความหลัก (ดู _document_totals_lines exclude_labels) — read_document_values เอง (ไม่ผ่าน
+    exclude_labels) ยังโชว์ "ภาษีมูลค่าเพิ่ม 25%" (ชื่อปัจจุบันจริง) ตามปกติ"""
     result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 25)
     assert result["matched"] is True
     assert "✓ เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%" in result["message"]
     assert "ภาษีมูลค่าเพิ่ม 7%" not in result["message"]
     assert "ยอดล่าสุด" in result["message"]
-    assert "ภาษีมูลค่าเพิ่ม 25%:" in result["message"]
+    # VAT เองไม่ซ้ำใต้ "ยอดล่าสุด:" อีก (ถูกกันด้วย exclude_labels เพราะมีบรรทัดหลักของมันเองอยู่แล้ว)
+    assert "ภาษีมูลค่าเพิ่ม 25%:" not in result["message"]
+    # แต่ "รวมเงิน" (ไม่ได้ถูกกล่าวถึงที่ไหนเลย ไม่ใช่ผลข้างเคียงด้วย) ยังโผล่ใต้ "ยอดล่าสุด:" ตามปกติ
+    assert "รวมเงิน:" in result["message"]
 
     data = _current(ns)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
     assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
     expected_vat = round(FIXTURE_TOTAL * 0.25, 2)
     assert label_values["ภาษีมูลค่าเพิ่ม 25%"] == expected_vat
+
+
+@pytest.mark.parametrize("value, expected", [
+    (2.0, "2"), (2, "2"), (54436, "54,436"), (54436.0, "54,436"),
+    (3810.5, "3,810.50"), (58246.52, "58,246.52"), (0, "0"), (None, "None"), ("ชิ้น", "ชิ้น"),
+])
+def test_format_money_value(ns, value, expected):
+    assert ns["_format_money_value"](value) == expected
+
+
+def test_format_side_effect_lines_has_space_before_verb(ns):
+    """เหตุการณ์จริงที่แก้: เดิมติดกัน "ภาษีมูลค่าเพิ่ม 7%เปลี่ยนจาก..." (ไม่มีช่องว่างระหว่างชื่อ label กับ verb)
+    อ่านยาก ตอนนี้ต้องมีช่องว่างคั่นเสมอ และตัวเลขต้องมีคอมมาคั่นหลักพัน"""
+    side_effects = [{"label": "รวมราคาทั้งสิ้น", "old_value": 8581.4, "new_value": 10025}]
+    text = ns["_format_side_effect_lines"](side_effects, "เปลี่ยน")
+    assert "รวมราคาทั้งสิ้น เปลี่ยนจาก 8,581.40 เป็น 10,025" in text
+    assert "ทั้งสิ้นเปลี่ยนจาก" not in text  # ไม่ติดกันแบบเดิม
 
 
 def test_apply_change_rate_noop_when_already_at_target_rate(ns, doc1):
@@ -219,8 +242,8 @@ def test_apply_change_rate_position_based_lookup_matches_real_file_scale(ns):
 
     result = ns["apply_change_rate"](2, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
     assert result["matched"] is True
-    assert "5815" in result["message"]
-    assert "63965" in result["message"]
+    assert "5,815" in result["message"]  # คอมมาคั่นหลักพัน (ดู _format_money_value)
+    assert "63,965" in result["message"]
 
 
 # ---------- update_table_item (แก้ทันที) ----------
@@ -1169,19 +1192,28 @@ def test_recommendation_replace_command_changes_description_and_price_keeps_qty(
 
 
 def test_recommendation_replace_command_with_explicit_price(ns, box_doc):
+    """ผู้ใช้ระบุราคาเอง ("ราคา X") ถือว่าราคาเปลี่ยนจริงเสมอ (แม้บังเอิญตรงกับราคาเดิมเป๊ะ) ต้องมี "→" และ
+    วงเล็บ "(ราคาที่กำหนดเอง)" ไม่ใช่ "(ราคาอ้างอิงจาก ...)" เพราะไม่ได้มาจากเว็บ"""
     ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
     result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1 ราคา 5000", [box_doc], 1, 1)
     row = _current(ns)["tables"][0]["rows"][4]["values"]
     assert row["unit_price"] == 5000
-    assert "ราคา/หน่วย 5,000 → 5,000" in result["answer"]
+    assert "ราคา/หน่วย 5,000 → 5,000 (ราคาที่กำหนดเอง)" in result["answer"]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
 
 
-def test_recommendation_replace_command_with_original_price_only_changes_name(ns, box_doc):
+def test_recommendation_replace_command_with_original_price_shows_no_change_wording(ns, box_doc):
+    """เหตุการณ์จริงที่แก้: "ราคาเดิม" เคยโชว์ "ราคา/หน่วย 5,000 → 5,000 (ราคาอ้างอิงจาก ...)" ซึ่งชวนเข้าใจผิดว่า
+    ราคาเปลี่ยนไปแล้วทั้งที่ไม่ได้อ้างอิงเว็บอะไรเลย ตอนนี้ต้องโชว์ "ราคาเดิม 5,000 บาท" เฉยๆ ไม่มี "→"/วงเล็บเลย"""
     ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
-    ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1 ราคาเดิม", [box_doc], 1, 1)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1 ราคาเดิม", [box_doc], 1, 1)
     row = _current(ns)["tables"][0]["rows"][4]["values"]
     assert row["description"] == "Rack case 9U รุ่นประหยัด"
     assert row["unit_price"] == 5000  # ราคาเดิมไม่เปลี่ยน
+    assert "ราคาเดิม 5,000 บาท" in result["answer"]
+    assert "→" not in result["answer"].splitlines()[0]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
+    assert "ยังไม่ได้เปลี่ยนราคา" not in result["answer"]  # ผู้ใช้ตั้งใจเลือกไม่เปลี่ยนเอง ไม่ใช่ไม่มีราคาให้ใช้
 
 
 def test_recommendation_replace_command_with_markup_percent(ns, box_doc):
@@ -1191,17 +1223,20 @@ def test_recommendation_replace_command_with_markup_percent(ns, box_doc):
     )
     row = _current(ns)["tables"][0]["rows"][4]["values"]
     assert row["unit_price"] == 5286.00
-    assert "ราคา/หน่วย 5,000 → 5,286" in result["answer"]
+    assert "ราคา/หน่วย 5,000 → 5,286 (ราคาอ้างอิงจาก shop-a.com)" in result["answer"]
 
 
 def test_recommendation_replace_command_with_null_price_only_changes_name_and_notifies(ns, box_doc):
     """รุ่นที่ 2 (รุ่นพรีเมียม) price_thb เป็น null และผู้ใช้ไม่ได้ระบุราคาต่อท้ายคำสั่งเลย -> แก้แค่ชื่อ ราคาเดิม
-    คงอยู่ พร้อมข้อความแจ้งให้พิมพ์ราคาเอง"""
+    คงอยู่ พร้อมข้อความแจ้งให้พิมพ์ราคาเอง — receipt ต้องโชว์ "ราคาเดิม X บาท" เฉยๆ ไม่มี "→"/วงเล็บที่มาเลย"""
     ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
     result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 2", [box_doc], 1, 1)
     row = _current(ns)["tables"][0]["rows"][4]["values"]
     assert row["description"] == "Rack case 9U รุ่นพรีเมียม"
     assert row["unit_price"] == 5000  # ราคาเดิมยังไม่เปลี่ยน
+    assert "ราคาเดิม 5,000 บาท" in result["answer"]
+    assert "→" not in result["answer"].splitlines()[0]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
     assert "ยังไม่ได้เปลี่ยนราคา" in result["answer"]
     assert "≈ $423 ราคาต่างประเทศ" in result["answer"]
 
@@ -1212,6 +1247,9 @@ def test_recommendation_add_command_with_quantity(ns, doc1):
     ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
     result = ns["_resolve_recommendation_command_dispatch"]("เพิ่มรุ่นที่ 2 จำนวน 2", [doc1], 1, 1)
     assert result is not None
+    # qty parse มาเป็น float (2.0) เสมอ — ข้อความต้องโชว์ "จำนวน=2" ไม่ใช่ "จำนวน=2.0" (ดู _format_money_value)
+    assert "จำนวน=2" in result["answer"]
+    assert "จำนวน=2.0" not in result["answer"]
     data = _current(ns)
     filled = data["tables"][0]["rows"]
     assert len(filled) == 9

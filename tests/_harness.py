@@ -43,7 +43,7 @@ WANTED_MAIN_FUNCS = {
     "_compute_table_amount_values", "read_document_values", "_format_document_values_text", "_is_label_cell_formula",
     "_suggest_similar_labels", "_normalize_label",
     "_format_rate_number", "_rewrite_percent_text", "_rewrite_rate_formula", "_resolve_rate_formula",
-    "_split_rate_label_base_and_percent",
+    "_split_rate_label_base_and_percent", "_format_money_value",
     "_build_rate_change_mutate_fn", "_label_side_effects", "_format_side_effect_lines",
     "_get_single_item_table",
     "_build_delete_table_item_mutate_fn", "_describe_table_item",

@@ -7357,6 +7357,19 @@ def _format_rate_number(value) -> str:
     return f"{value:g}"
 
 
+def _format_money_value(value) -> str:
+    """จัดรูปตัวเลข (เงิน/จำนวน) ให้อ่านง่ายในข้อความผลลัพธ์ของคำสั่งแก้เอกสารทุกจุด — มีคอมมาคั่นหลักพันเสมอ และ
+    มีทศนิยมเท่าที่จำเป็นเท่านั้น (จำนวนเต็มไม่มี ".0" ต่อท้าย เช่น 2.0 -> "2", 54436 -> "54,436", 3810.5 ->
+    "3,810.50") ค่าที่ไม่ใช่ตัวเลข (เช่น None/ข้อความ/bool) คืนเป็น str(value) ตรงๆ ไม่แตะ — เหตุการณ์จริงที่แก้:
+    ตัวเลขเงินไม่มีคอมมาคั่นหลักพัน (อ่านยาก) และจำนวนที่เป็นจำนวนเต็มแสดงเป็น "2.0" แทน "2" (ค่า qty ที่ parse มา
+    จากข้อความผู้ใช้เป็น float เสมอ — ดู _resolve_recommendation_add_command)"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
+
+
 def _rewrite_percent_text(text: str, new_rate) -> str:
     """แทนที่ตัวเลข % ทุกตัวในข้อความ (เช่น label 'ภาษีมูลค่าเพิ่ม 7%') ด้วยอัตราใหม่ เช่น 'ภาษีมูลค่าเพิ่ม 10%'"""
     return _PERCENT_IN_TEXT_RE.sub(f"{_format_rate_number(new_rate)}%", text)
@@ -7489,10 +7502,14 @@ def _label_side_effects(
 
 def _format_side_effect_lines(side_effects: list[dict], verb: str) -> str:
     """ต่อท้ายข้อความ preview/ยืนยันด้วยรายการ label ที่เปลี่ยน (จาก _label_side_effects — ตัดไม่เกิน 3 รายการ
-    มาให้แล้ว) verb: 'จะเปลี่ยน'/'เปลี่ยน'"""
+    มาให้แล้ว) verb: 'จะเปลี่ยน'/'เปลี่ยน' — เว้นวรรคระหว่างชื่อ label กับ verb เสมอ (เดิมติดกัน เช่น
+    "ภาษีมูลค่าเพิ่ม 7%เปลี่ยนจาก..." อ่านยาก) ตัวเลขจัดรูปด้วย _format_money_value (คอมมาคั่นหลักพัน)"""
     if not side_effects:
         return ""
-    lines = [f"{e['label']}{verb}จาก {e['old_value']} เป็น {e['new_value']}" for e in side_effects]
+    lines = [
+        f"{e['label']} {verb}จาก {_format_money_value(e['old_value'])} เป็น {_format_money_value(e['new_value'])}"
+        for e in side_effects
+    ]
     return "\n\n" + " / ".join(lines)
 
 
@@ -7858,6 +7875,9 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
 
     exclude_position = (action["sheet"], action["row"], action["col"]) if action_type == "change_rate" else None
     side_effects = _label_side_effects(label_map, new_label_map, new_bytes, exclude_position=exclude_position)
+    # label ที่แสดงไปแล้วเป็นบรรทัด "X เปลี่ยนจาก A เป็น B" (ไม่ว่าจะเป็น label ที่ถูกแก้ตรงๆ หรือผลข้างเคียง) —
+    # กัน _document_totals_lines ด้านล่างแสดงค่าเดียวกันซ้ำอีกรอบใต้หัวข้อ "ยอดล่าสุด:"
+    already_shown_labels = {e["label"] for e in side_effects}
 
     if action_type == "change_rate":
         old_by_position = {_label_position(info): info["current_value"] for info in label_map.values()}
@@ -7872,11 +7892,17 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
         base_label, old_rate_text = _split_rate_label_base_and_percent(action.get("label") or "")
         new_rate_text = _format_rate_number(action.get("new_rate"))
         rate_change_text = f"จาก {old_rate_text}% เป็น {new_rate_text}%" if old_rate_text is not None else f"เป็น {new_rate_text}%"
-        message = f"✓ เปลี่ยน '{base_label}' {rate_change_text} — ค่าเปลี่ยนจาก {old_value} เป็น {new_value}"
+        message = (
+            f"✓ เปลี่ยน '{base_label}' {rate_change_text} — ค่าเปลี่ยนจาก "
+            f"{_format_money_value(old_value)} เป็น {_format_money_value(new_value)}"
+        )
+        if new_info is not None:
+            already_shown_labels.add(_current_label_display_name(new_bytes, action.get("label"), new_info))
     elif action_type == "update_table_item":
         desc = (action.get("identity") or {}).get("description")
         changed_fields = [
-            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} เปลี่ยนเป็น {v}" for k, v in (action.get("fields") or {}).items()
+            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} เปลี่ยนเป็น {_format_money_value(v)}"
+            for k, v in (action.get("fields") or {}).items()
         ]
         message = f"✓ แก้รายการ '{desc}' แล้ว: " + " / ".join(changed_fields)
     elif action_type == "delete_table_item":
@@ -7884,7 +7910,8 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
         message = f"✓ ลบรายการ '{desc}' แล้ว"
     elif action_type == "add_table_item":
         field_summary = ", ".join(
-            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={v}" for k, v in (action.get("fields") or {}).items()
+            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={_format_money_value(v)}"
+            for k, v in (action.get("fields") or {}).items()
         )
         message = f"✓ เพิ่มรายการใหม่ ({field_summary}) แล้ว"
     else:
@@ -7892,21 +7919,26 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
 
     message += _format_side_effect_lines(side_effects, "เปลี่ยน")
 
-    message_lines = [message] + _document_totals_lines(document_id) + ["", _UNDO_HINT_LINE]
+    message_lines = [message] + _document_totals_lines(document_id, exclude_labels=already_shown_labels) + ["", _UNDO_HINT_LINE]
     return {"matched": True, "message": "\n".join(message_lines)}
 
 
-def _document_totals_lines(document_id: int) -> list[str]:
+def _document_totals_lines(document_id: int, exclude_labels: Optional[set] = None) -> list[str]:
     """คืนบรรทัด "ยอดล่าสุด:" + label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ (เช่น รวมเงิน/ภาษีมูลค่าเพิ่ม/รวมราคาทั้งสิ้น)
     ของสถานะปัจจุบันจริงของเอกสารนี้หลังแก้เสร็จ — list ว่างถ้าไม่มี label แบบนั้นเลยหรือหาเอกสารไม่เจอ (ไม่
-    error) ใช้ต่อท้ายข้อความผลลัพธ์ของการแก้โครงสร้างทุกจุด (ดู _apply_structural_commands)"""
+    error) ใช้ต่อท้ายข้อความผลลัพธ์ของการแก้โครงสร้างทุกจุด (ดู _apply_structural_commands)
+
+    exclude_labels: ชื่อ label (ชื่อปัจจุบันจริง ตรงกับที่ read_document_values คืน) ที่ไม่ต้องแสดงซ้ำในนี้ —
+    ใช้โดย _apply_single_queue_item กันข้อมูลซ้ำกับบรรทัด "X เปลี่ยนจาก A เป็น B" ที่แสดงไปแล้วก่อนหน้า (เช่น
+    label ที่ถูกแก้ตรงๆ หรือ label ที่โดนผลข้างเคียงจาก _label_side_effects) ไม่ต้องโผล่ซ้ำใต้หัวข้อนี้อีก"""
     doc = get_editable_document_raw(document_id)
     if doc is None:
         return []
     data = read_document_values(doc)
+    exclude_labels = exclude_labels or set()
     totals = [
-        f"- {l['label']}: {l['value']}" for l in data["labels"]
-        if "รวม" in l["label"] or "ภาษี" in l["label"]
+        f"- {l['label']}: {_format_money_value(l['value'])}" for l in data["labels"]
+        if ("รวม" in l["label"] or "ภาษี" in l["label"]) and l["label"] not in exclude_labels
     ]
     if not totals:
         return []
@@ -7987,8 +8019,11 @@ def _resolve_recommendation_replace_command(
     โค้ดล้วนๆ ไม่ผ่าน LLM เลย (รูปแบบเดียวกับ _parse_direct_structural_commands) คืน {"matched": bool, "message":
     str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่น/ตกไปที่ agent ต่อ)
 
-    receipt รูปแบบตายตัว: "✓ แทนรายการที่ N (<รายละเอียดเดิม>) ด้วย <ชื่อรุ่นใหม่> — ราคา/หน่วย <เดิม> -> <ใหม่>
-    (ราคาอ้างอิงจาก <โดเมน>)" ต่อท้ายด้วยยอดล่าสุด + คำแนะนำ "ย้อนการแก้" เหมือน apply_update_table_item ปกติ (ใช้
+    receipt: ราคาเปลี่ยนจริง (ระบุ "ราคา X"/"บวกกำไร P%"/ไม่ระบุแต่รุ่นมี price_thb) -> "✓ แทนรายการที่ N
+    (<เดิม>) ด้วย <ชื่อรุ่น> — ราคา/หน่วย <เดิม> → <ใหม่> (ราคาที่กำหนดเอง)" (ระบุราคาเอง) หรือ "...(ราคาอ้างอิงจาก
+    <โดเมน>)" (ใช้ price_thb ของรุ่น/บวกกำไร) ไม่เปลี่ยนราคาเลย ("ราคาเดิม"/ไม่ระบุราคาและรุ่นไม่มี price_thb) ->
+    "...ด้วย <ชื่อรุ่น> — ราคาเดิม <ราคา> บาท" (ไม่มี "→"/วงเล็บที่มาเลย กันเข้าใจผิดว่าราคาเปลี่ยนไปแล้วทั้งที่
+    ไม่ได้อ้างอิงเว็บอะไรเลย) ต่อท้ายด้วยยอดล่าสุด + คำแนะนำ "ย้อนการแก้" เหมือน apply_update_table_item ปกติ (ใช้
     apply_update_table_item จริงเบื้องหลัง แค่แทนที่บรรทัดแรกของข้อความผลลัพธ์ด้วย receipt เฉพาะของคำสั่งนี้)"""
     m = _RECOMMENDATION_REPLACE_RE.match(query.strip())
     if m is None:
@@ -8033,24 +8068,35 @@ def _resolve_recommendation_replace_command(
 
     filled_rows = [r for r in table["rows"] if not r["is_empty"]]
     old_unit_price = filled_rows[target["item_no"] - 1]["values"].get("unit_price")
+    price_changed = "unit_price" in fields
 
     result = apply_update_table_item(document_id, user_id, target["item_no"], fields)
     if result.get("matched"):
-        if "unit_price" not in fields and model.get("price_thb") is None:
+        if not price_changed and model.get("price_thb") is None:
             result["message"] += (
                 f"\n\nยังไม่ได้เปลี่ยนราคา ({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'}) "
                 "พิมพ์ราคาที่ต้องการได้เลยครับ"
             )
-        new_unit_price = fields.get("unit_price", old_unit_price)
-        domain = _extract_domain_from_url(model.get("source_url"))
-        receipt_line = (
-            f"✓ แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']} — "
-            f"ราคา/หน่วย {old_unit_price:,.0f} → {new_unit_price:,.0f}" if old_unit_price is not None
-            and new_unit_price is not None else
-            f"✓ แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']}"
-        )
-        if domain:
-            receipt_line += f" (ราคาอ้างอิงจาก {domain})"
+        base_line = f"✓ แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']}"
+        if price_changed:
+            # ราคาถูกกำหนดจริง (explicit/markup/none ที่ใช้ price_thb ของรุ่นตรงๆ) ถึงจะมี "→" + วงเล็บที่มา —
+            # เหตุการณ์จริงที่แก้: ไม่ได้เปลี่ยนราคาเลย (null/ราคาเดิม) แต่ยังโชว์ "X → X (ราคาอ้างอิงจาก ...)"
+            # ซึ่งชวนเข้าใจผิดว่าราคาเปลี่ยนไปแล้วจริงๆ ทั้งที่ไม่ได้อ้างอิงเว็บอะไรเลย
+            new_unit_price = fields["unit_price"]
+            if price_mode == "explicit":
+                price_tag = "(ราคาที่กำหนดเอง)"
+            else:
+                domain = _extract_domain_from_url(model.get("source_url"))
+                price_tag = f"(ราคาอ้างอิงจาก {domain})" if domain else ""
+            receipt_line = (
+                f"{base_line} — ราคา/หน่วย {_format_money_value(old_unit_price)} → "
+                f"{_format_money_value(new_unit_price)}"
+            )
+            if price_tag:
+                receipt_line += f" {price_tag}"
+        else:
+            price_text = f"{_format_money_value(old_unit_price)} บาท" if old_unit_price is not None else "ไม่ระบุ"
+            receipt_line = f"{base_line} — ราคาเดิม {price_text}"
         message_lines = result["message"].splitlines()
         message_lines[0] = receipt_line
         result["message"] = "\n".join(message_lines)

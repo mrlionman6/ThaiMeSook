@@ -8,18 +8,44 @@ let forgotPasswordQuestions = null; // 2 คำถามที่สุ่มม
 let forgotPasswordUsername = null;
 const ROLE_LABELS_JS = { 1: "ระดับ 1", 2: "ระดับ 2", 3: "ระดับ 3" };
 
+// อนุญาตเฉพาะ href ที่เป็น http(s):// หรือ path ภายในเว็บนี้เอง ("/" นำหน้า) เท่านั้น — กัน scheme อันตราย เช่น
+// javascript:/data:/vbscript: ที่อาจหลุดมาปนในคำตอบ (Claude เขียนข้อความเอง ไม่ใช่ HTML ที่ควบคุมได้เต็มที่)
+// เช็คตั้งแต่ renderer เองเป็นชั้นป้องกันที่สอง ไม่พึ่ง DOMPurify (ที่ sanitize ซ้ำอีกชั้นอยู่แล้ว) เพียงอย่างเดียว
+// แยกเป็นฟังก์ชันเดี่ยวๆ ตั้งใจให้ทดสอบแยกได้ง่าย (เช่น ด้วย node สั้นๆ) ไม่ต้องพึ่ง DOM/marked จริง
+function isSafeHref(href) {
+    if (typeof href !== "string") return false;
+    // "/" เดี่ยวๆ = path ภายในเว็บนี้เอง ปลอดภัย แต่ "//" (protocol-relative URL เช่น "//evil.com") เบราว์เซอร์
+    // จะเติม scheme ปัจจุบันให้เองแล้วเด้งออกไปโดเมนอื่นจริงๆ ต้องแยกเช็คไม่ให้หลุดผ่านเป็น "path ภายใน" ไปได้
+    return /^https?:\/\//i.test(href) || (href.startsWith("/") && !href.startsWith("//"));
+}
+
+// escape ค่าที่จะใส่ใน HTML attribute (href/title) ก่อนแทรกลง template string ตรงๆ — กัน " ในค่าปิด attribute
+// ก่อนกำหนดแล้วแทรก attribute อื่นเพิ่มเอง (เช่น onerror=) หรือ </> ปิดเปิดแท็กใหม่
+function escapeHtmlAttribute(text) {
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+}
+
 // ลิงก์ทุกอันในคำตอบแชท (marked.parse — ดู appendChatMessage/typewriterReveal) ต้องเปิดแท็บใหม่เสมอ ไม่เปลี่ยน
 // หน้าเดิมทิ้ง URL ดิบที่ไม่ได้เขียนเป็น markdown link ชัดเจน (เช่น autolink ของ GFM ที่ marked แปลงให้เอง —
 // token.tokens จะมีข้อความเหมือน href เป๊ะในกรณีนี้) แสดงเป็นคำว่า "ลิงก์" แทน URL เต็มที่ยาวเกินจะอ่าน/ล้นกรอบ
-// ข้อความ — ยังคลิกได้ปกติ แค่ข้อความที่เห็นสั้นลง
+// ข้อความ — ยังคลิกได้ปกติ แค่ข้อความที่เห็นสั้นลง href ที่ไม่ใช่ http(s)/path ภายใน -> แสดงเป็นข้อความธรรมดา
+// ไม่ใช่ลิงก์ที่คลิกได้เลย (ดู isSafeHref)
 marked.use({
     renderer: {
         link(token) {
             const href = token.href;
-            const titleAttr = token.title ? ` title="${token.title}"` : "";
             const innerHtml = this.parser.parseInline(token.tokens);
+            if (!isSafeHref(href)) {
+                return innerHtml;
+            }
+            const escapedHref = escapeHtmlAttribute(href);
+            const titleAttr = token.title ? ` title="${escapeHtmlAttribute(token.title)}"` : "";
             const displayHtml = innerHtml.trim() === href ? "ลิงก์" : innerHtml;
-            return `<a href="${href}"${titleAttr} target="_blank" rel="noopener noreferrer">${displayHtml}</a>`;
+            return `<a href="${escapedHref}"${titleAttr} target="_blank" rel="noopener noreferrer">${displayHtml}</a>`;
         },
     },
 });
