@@ -13,6 +13,7 @@ import openpyxl
 from _harness import (
     build_namespace, build_fixture_workbook, inject_formula_cache,
     FIXTURE_TOTAL, FIXTURE_VAT, FIXTURE_GRAND_TOTAL,
+    _FakeCitation, _FakeAgenticTextBlock, _FakeAgenticResponse,
 )
 
 
@@ -959,6 +960,72 @@ def test_advisor_answer_does_not_offer_replacement_when_question_unrelated_to_op
         "แนะนำ Rack case server 12U", history=[], user_id=1, chat_id=1, active_docs=[box_doc],
     )
     assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] not in answer
+
+
+# ---------- feat/advisor-route (review fix): web_search แยกคำตอบเป็นหลาย text block กลางประโยค + pause_turn ----------
+# เหตุการณ์จริงที่แก้: web_search ทำให้ Claude แบ่งคำตอบเป็นหลาย text block ตรงจุดอ้างอิงแหล่งที่มา (มักกลาง
+# ประโยค) เดิมต่อ text block ด้วย "\n\n" ทำให้ประโยคแตกเป็นย่อหน้าใหม่กลางคัน — กระทบเส้นทาง advisor ที่ค้นเว็บบ่อย
+# ที่สุด แต่ใช้ฟังก์ชันร่วมกับเส้นทางกฎหมายเดิมด้วย (ดู _build_final_answer_with_citations) และ stop_reason
+# "pause_turn" (server tool อย่าง web_search ใช้เวลานาน) เดิมถูกตีความเป็น "จบเทิร์นแล้ว" (break) ทั้งที่ต้องส่ง
+# messages เดิมกลับไปเรียกต่อในรอบถัดไป (ดู run_agentic_tool_loop)
+
+def test_build_final_answer_with_citations_joins_text_blocks_without_breaking_sentences(ns):
+    blocks = [
+        _FakeAgenticTextBlock("กล้องรุ่น A ราคาประมาณ"),
+        _FakeAgenticTextBlock(" 1,500 บาท", citations=[_FakeCitation("https://a.com", "ร้าน A")]),
+        _FakeAgenticTextBlock(" ตามที่ประกาศไว้", citations=[_FakeCitation("https://a.com", "ร้าน A")]),
+        _FakeAgenticTextBlock(" และยังมีอีกร้านที่เสนอราคา"),
+        _FakeAgenticTextBlock(" 1,450 บาท", citations=[_FakeCitation("https://b.com", "ร้าน B")]),
+    ]
+    text = ns["_build_final_answer_with_citations"](blocks)
+
+    # ต่อกันเป็นประโยคเดียวต่อเนื่อง ไม่มี "\n\n" คั่นกลางประโยคจาก citation เลย ("\n\n" ก่อนหัวข้อ "แหล่งที่มา:"
+    # เป็นตัวคั่นที่ตั้งใจเติมเอง ไม่ใช่สิ่งที่ต้องเช็ค — ตัดส่วนท้ายนั้นออกก่อน)
+    body = text.split("\n\nแหล่งที่มา:")[0]
+    assert body == "กล้องรุ่น A ราคาประมาณ 1,500 บาท ตามที่ประกาศไว้ และยังมีอีกร้านที่เสนอราคา 1,450 บาท"
+    assert "\n\n" not in body
+
+    # citation ตัดซ้ำตาม url (https://a.com เจอ 2 ครั้งแต่นับครั้งเดียว) ไม่เกิน 5 แหล่ง
+    assert text.count("แหล่งที่มา:") == 1
+    assert "1. ร้าน A — https://a.com" in text
+    assert "2. ร้าน B — https://b.com" in text
+    assert text.count("ร้าน A —") == 1
+
+
+def test_build_final_answer_with_citations_caps_at_five_sources(ns):
+    blocks = [
+        _FakeAgenticTextBlock(f"ข้อความที่ {i}", citations=[_FakeCitation(f"https://site{i}.com", f"แหล่ง {i}")])
+        for i in range(8)
+    ]
+    text = ns["_build_final_answer_with_citations"](blocks)
+    assert text.count(" — https://site") == 5
+    assert "https://site5.com" not in text  # index 0-4 เท่านั้น (5 แหล่งแรก)
+
+
+def test_build_final_answer_with_citations_no_source_heading_without_any_citation(ns):
+    blocks = [_FakeAgenticTextBlock("คำตอบธรรมดา"), _FakeAgenticTextBlock(" ไม่มีการอ้างอิงเว็บเลย")]
+    text = ns["_build_final_answer_with_citations"](blocks)
+    assert text == "คำตอบธรรมดา ไม่มีการอ้างอิงเว็บเลย"
+    assert "แหล่งที่มา" not in text
+
+
+def test_run_agentic_tool_loop_continues_after_pause_turn_then_ends_on_second_call(ns):
+    """stop_reason="pause_turn" (server tool เช่น web_search ยังทำงานไม่เสร็จ) ต้องไม่ break ทันที ต้องเรียก API
+    ต่อในรอบถัดไปจนกว่าจะได้ stop_reason อื่น (ในเทสต์นี้คือ end_turn ในรอบที่สอง)"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse([_FakeAgenticTextBlock("กำลังค้นหาข้อมูลเพิ่มเติม...")], stop_reason="pause_turn"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("พบรุ่นที่แนะนำแล้วครับ")], stop_reason="end_turn"),
+    ]
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำกล้องหน่อย"}],
+        user_id=None, chat_id=None, tools_override=[],
+    )
+    assert answer == "พบรุ่นที่แนะนำแล้วครับ"
+    assert fake_client.call_count == 2
+    assert receipts == []
+    assert structural is False
 
 
 # ---------- feat/advisor-route: ส่งตารางรายการเป็น context + เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขาย ----------

@@ -67,6 +67,7 @@ WANTED_MAIN_FUNCS = {
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
     "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
     "_advisor_target_doc", "_advisor_document_context",
+    "run_agentic_tool_loop", "_build_final_answer_with_citations",
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text",
@@ -95,7 +96,8 @@ WANTED_MAIN_CONSTS = {
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
     "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
-    "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES",
+    "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES", "MAX_TOOL_ITERATIONS",
+    "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
     "QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT",
     "_CHAT_EXPORT_ROLE_LABELS", "_CHAT_EXPORT_COMMAND_TEXTS",
@@ -276,21 +278,64 @@ class _FakeAnthropicMessages:
 
     def create(self, **kwargs):
         self._client.last_call_kwargs = kwargs
+        self._client.call_count += 1
         if self._client.raise_on_create is not None:
             raise self._client.raise_on_create
+        if self._client.response_queue:
+            return self._client.response_queue.pop(0)
         return _FakeAnthropicResponse(self._client.response_text)
 
 
 class _FakeAnthropicClient:
     """ตัวแทน anthropic.Client — คืนข้อความคงที่ (ตั้งค่าได้) เสมอ ไม่เรียก API จริงเลย เก็บ kwargs ของการเรียก
     ล่าสุดไว้ด้วย (last_call_kwargs) ให้เทสต์ตรวจสอบได้ว่าส่ง system/messages อะไรเข้าไป ตั้ง raise_on_create
-    เป็น Exception instance เพื่อจำลอง API ล้ม/timeout ได้"""
+    เป็น Exception instance เพื่อจำลอง API ล้ม/timeout ได้ response_queue: ถ้าใส่ไว้ (ดู _FakeAgenticResponse —
+    ใช้เฉพาะเทสต์ run_agentic_tool_loop ตัวจริงที่ต้องควบคุม stop_reason/content หลายรอบ) ให้ pop ออกมาคืนทีละ
+    รายการตามลำดับที่เรียก create() แทนที่จะคืน response_text คงที่ซ้ำทุกครั้ง — ว่างเปล่า (ค่าเริ่มต้น) ไม่กระทบ
+    เทสต์เดิมที่ใช้ response_text เลยสักจุด"""
 
     def __init__(self, response_text: str = "คำตอบจำลองจาก LLM"):
         self.response_text = response_text
         self.last_call_kwargs = None
         self.raise_on_create: Exception | None = None
         self.messages = _FakeAnthropicMessages(self)
+        self.response_queue: list = []
+        self.call_count = 0
+
+
+class _FakeCitation:
+    """ตัวแทน citation ที่ Anthropic แนบมากับ text block ตอนอ้างอิงผลค้นจาก web_search (url/title) — ใช้เฉพาะ
+    เทสต์ _build_final_answer_with_citations/run_agentic_tool_loop ตัวจริงเท่านั้น"""
+
+    def __init__(self, url: str, title: str):
+        self.url = url
+        self.title = title
+
+    def model_dump(self):
+        return {"url": self.url, "title": self.title}
+
+
+class _FakeAgenticTextBlock:
+    """ตัวแทน content block ชนิด "text" ของ Claude พร้อม .citations ที่ควบคุมได้ (ดู _FakeCitation) — ต่างจาก
+    _FakeAnthropicContentBlock ธรรมดาด้านบน (ใช้กับ response.content[0].text.strip() แบบ classifier อื่นๆ
+    เท่านั้น ไม่มี .type/.model_dump()/.citations) ใช้เฉพาะเทสต์ run_agentic_tool_loop ตัวจริง"""
+
+    def __init__(self, text: str, citations: Optional[list] = None):
+        self.type = "text"
+        self.text = text
+        self.citations = citations or []
+
+    def model_dump(self):
+        return {"type": "text", "text": self.text, "citations": [c.model_dump() for c in self.citations]}
+
+
+class _FakeAgenticResponse:
+    """ตัวแทน response ของ client.messages.create() ที่ควบคุม content blocks + stop_reason ได้ตรงๆ จากเทสต์ —
+    ใช้เฉพาะเทสต์ run_agentic_tool_loop ตัวจริง (ดู response_queue ของ _FakeAnthropicClient)"""
+
+    def __init__(self, content_blocks: list, stop_reason: str = "end_turn"):
+        self.content = content_blocks
+        self.stop_reason = stop_reason
 
 
 class StorageNotConfiguredError(Exception):
@@ -408,6 +453,13 @@ def build_namespace() -> dict:
     db_tree = ast.parse(DB_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
+
+    # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
+    # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง
+    # เหมือนกัน) ต้องเรียก "ตัวปลอม" ที่ควบคุมผลลัพธ์ได้ง่ายกว่าแทน (ดู _FakeAgenticLoop) — เก็บของจริงไว้ใต้ชื่อ
+    # แยกต่างหากก่อน แล้วค่อยทับคืนด้วยตัวปลอมในชื่อเดิม (ลำดับสำคัญ: ต้องทับ "หลัง" _extract เสมอ)
+    ns["_real_run_agentic_tool_loop"] = ns["run_agentic_tool_loop"]
+    ns["run_agentic_tool_loop"] = fake_agentic_loop
 
     ns["_fake_db"] = fake_db
     ns["_fake_client"] = fake_client

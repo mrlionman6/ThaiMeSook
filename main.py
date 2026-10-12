@@ -2669,6 +2669,45 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
     return None
 
 
+_MAX_ANSWER_CITATIONS = 5
+
+
+def _build_final_answer_with_citations(content_blocks: list) -> str:
+    """ประกอบคำตอบสุดท้ายจาก text block ทั้งหมดของ response (ดู run_agentic_tool_loop) — ต่อกันด้วย "" ตรงๆ
+    (ไม่ใช่ "\\n\\n") แล้ว strip เพราะ web_search ทำให้ Claude แบ่งคำตอบเป็นหลาย text block ตรงจุดอ้างอิงแหล่งที่มา
+    (citation) ซึ่งมักอยู่กลางประโยค — ต่อด้วย "\\n\\n" แบบเดิมทำให้ประโยคเดียวกันแตกเป็นสองย่อหน้าโดยไม่ตั้งใจ
+    (เหตุการณ์จริงที่แก้ — กระทบเส้นทาง advisor ที่ค้นเว็บบ่อยที่สุด แต่ใช้ร่วมกับเส้นทางกฎหมายเดิมด้วย)
+
+    เก็บ citations จากทุก text block (block.citations — Anthropic แนบมาเองตอนอ้างอิงผลค้นจาก web_search แต่ละ
+    ชิ้น มี url/title) ตัดซ้ำตาม url (เก็บรายการแรกที่เจอ คงลำดับเดิม) ไม่เกิน _MAX_ANSWER_CITATIONS แหล่ง ต่อท้าย
+    คำตอบเป็นหัวข้อ "แหล่งที่มา:" ก็ต่อเมื่อมีอย่างน้อย 1 รายการเท่านั้น — คำตอบที่ไม่ได้ใช้ web_search เลย (ไม่มี
+    citation ติดมาด้วยสักอัน) ไม่ต่อท้ายอะไรเพิ่มเลย"""
+    text_parts = [block.text for block in content_blocks if block.type == "text"]
+    final_text = "".join(text_parts).strip()
+
+    seen_urls = set()
+    citations: list[tuple[str, str]] = []
+    for block in content_blocks:
+        if block.type != "text":
+            continue
+        for citation in (getattr(block, "citations", None) or []):
+            url = getattr(citation, "url", None)
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            citations.append((getattr(citation, "title", None) or url, url))
+            if len(citations) >= _MAX_ANSWER_CITATIONS:
+                break
+        if len(citations) >= _MAX_ANSWER_CITATIONS:
+            break
+
+    if not citations:
+        return final_text
+
+    source_lines = [f"{i}. {title} — {url}" for i, (title, url) in enumerate(citations, start=1)]
+    return final_text + "\n\nแหล่งที่มา:\n" + "\n".join(source_lines)
+
+
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
     tools_override: Optional[list] = None,
@@ -2738,6 +2777,13 @@ def run_agentic_tool_loop(
 
         # แปลงเป็น dict ชัดเจนก่อนส่งกลับเข้า messages กัน serialize พลาด (ปลอดภัยกว่าพึ่ง SDK แปลงให้เอง)
         messages.append({"role": "assistant", "content": [block.model_dump() for block in response.content]})
+
+        if response.stop_reason == "pause_turn":
+            # server tool (เช่น web_search ที่ใช้เวลาค้นนาน) ยังทำงานไม่เสร็จในเทิร์นนี้ — ไม่ใช่ tool_use ที่
+            # เราต้อง execute เอง และไม่ใช่ end_turn จริง ส่ง messages เดิม (รวม assistant content ล่าสุดที่เพิ่ง
+            # ต่อไปด้านบน) กลับเข้า loop เพื่อเรียกต่อในรอบถัดไปโดยไม่แก้ไขอะไรเพิ่ม (นับรวมเป็น 1 รอบใน
+            # MAX_TOOL_ITERATIONS เหมือนเดิม กันวนไม่รู้จบถ้า pause_turn ไม่เคยจบสักที)
+            continue
 
         if response.stop_reason != "tool_use":
             break  # Claude ตอบจบแล้วจริงๆ (end_turn) ไม่ต้องเรียก tool อะไรต่อ
@@ -2914,8 +2960,7 @@ def run_agentic_tool_loop(
         # Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด (ดู docstring ด้านบน)
         return "\n\n".join(applied_messages), action_receipts, structural_tool_called
 
-    text_parts = [block.text for block in response.content if block.type == "text"]
-    final_text = "\n\n".join(text_parts).strip()
+    final_text = _build_final_answer_with_citations(response.content)
     if not final_text:
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
