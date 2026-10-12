@@ -106,11 +106,7 @@ from db import (
     log_document_edit,
     get_recent_document_edits,
     get_document_edit_count,
-    add_chat_pending_action,
     get_chat_pending_actions,
-    delete_chat_pending_action,
-    clear_chat_pending_actions,
-    update_chat_pending_action_version,
 )
 
 import os
@@ -1448,12 +1444,11 @@ CHAT_DOCUMENT_TOOLS = [
     {
         "name": "change_rate",
         "description": (
-            "เสนอเปลี่ยนอัตรา (เช่น VAT 7% เป็น 10%) ของช่องที่เป็นสูตรคำนวณในไฟล์ที่เปิดอยู่ในแชทนี้ รองรับเฉพาะ"
-            "สูตรรูปแบบ *N/100, *N%, *0.0N, /100*N เท่านั้น ยังไม่แก้ไฟล์จริงทันที — ระบบจะแสดง preview ต่อท้ายคิว"
-            "ให้ผู้ใช้พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/'ยืนยันล่าสุด' หรือ 'ยกเลิก' เองก่อนเสมอ ถ้าคำสั่งระบุอัตรา/"
-            "label ชัดเจนอยู่แล้ว (เช่น 'เปลี่ยน VAT เป็น 10%') เรียกได้เลยไม่ต้องเรียก read_document_values ก่อน "
-            "แต่ถ้าไม่แน่ใจชื่อ label ที่ถูกต้อง ให้เรียก read_document_values ก่อนเพื่อยืนยัน ต้องเป็น document_id "
-            "ที่ได้จาก list_chat_documents เท่านั้น"
+            "แก้ไฟล์ทันที — เปลี่ยนอัตรา (เช่น VAT 7% เป็น 10%) ของช่องที่เป็นสูตรคำนวณในไฟล์ที่เปิดอยู่ในแชทนี้ "
+            "รองรับเฉพาะสูตรรูปแบบ *N/100, *N%, *0.0N, /100*N เท่านั้น undo ได้เสมอ (บอกผู้ใช้ว่าพิมพ์ 'ย้อนการ"
+            "แก้' ถ้าต้องการยกเลิก) ถ้าคำสั่งระบุอัตรา/label ชัดเจนอยู่แล้ว (เช่น 'เปลี่ยน VAT เป็น 10%') เรียกได้"
+            "เลยไม่ต้องเรียก read_document_values ก่อน แต่ถ้าไม่แน่ใจชื่อ label ที่ถูกต้อง ให้เรียก "
+            "read_document_values ก่อนเพื่อยืนยัน ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
         ),
         "input_schema": {
             "type": "object",
@@ -1468,11 +1463,10 @@ CHAT_DOCUMENT_TOOLS = [
     {
         "name": "update_table_item",
         "description": (
-            "เสนอแก้ค่าคอลัมน์ input (ลำดับ/รายละเอียด/จำนวน/หน่วย/ราคาต่อหน่วย — ไม่ใช่จำนวนเงินซึ่งเป็นสูตร) "
-            "ของรายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ ยังไม่แก้จริงทันที — ระบบจะแสดง "
-            "preview ต่อท้ายคิวให้ผู้ใช้พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/'ยืนยันล่าสุด' หรือ 'ยกเลิก' เองก่อนเสมอ "
-            "ต้องเรียก read_document_values ก่อนเพื่อยืนยัน item_no ที่ถูกต้อง ต้องเป็น document_id ที่ได้จาก "
-            "list_chat_documents เท่านั้น"
+            "แก้ไฟล์ทันที — แก้ค่าคอลัมน์ input (ลำดับ/รายละเอียด/จำนวน/หน่วย/ราคาต่อหน่วย — ไม่ใช่จำนวนเงินซึ่ง"
+            "เป็นสูตร) ของรายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ undo ได้เสมอ (บอกผู้ใช้ว่า"
+            "พิมพ์ 'ย้อนการแก้' ถ้าต้องการยกเลิก) ต้องเรียก read_document_values ก่อนเพื่อยืนยัน item_no ที่"
+            "ถูกต้อง ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
         ),
         "input_schema": {
             "type": "object",
@@ -1490,11 +1484,11 @@ CHAT_DOCUMENT_TOOLS = [
     {
         "name": "delete_table_item",
         "description": (
-            "เสนอลบรายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ (รายการถัดไปจะเลื่อนขึ้นมาแทน) "
-            "ยังไม่ลบจริงทันที — ระบบจะแสดง preview ต่อท้ายคิวให้ผู้ใช้พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/"
-            "'ยืนยันล่าสุด' หรือ 'ยกเลิก' เองก่อนเสมอ ถ้าคำสั่งระบุเลขรายการชัดเจนอยู่แล้ว (เช่น 'ลบรายการที่ 3') "
-            "เรียกได้เลยไม่ต้องเรียก read_document_values ก่อน แต่ถ้าไม่แน่ใจเลข item_no ที่ถูกต้อง ให้เรียก "
-            "read_document_values ก่อนเพื่อยืนยัน ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
+            "แก้ไฟล์ทันที — ลบรายการที่ item_no ในตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ (รายการถัดไปจะเลื่อนขึ้น"
+            "มาแทน) undo ได้เสมอ (บอกผู้ใช้ว่าพิมพ์ 'ย้อนการแก้' ถ้าต้องการยกเลิก) ถ้าคำสั่งระบุเลขรายการชัดเจน"
+            "อยู่แล้ว (เช่น 'ลบรายการที่ 3') เรียกได้เลยไม่ต้องเรียก read_document_values ก่อน แต่ถ้าไม่แน่ใจเลข "
+            "item_no ที่ถูกต้อง ให้เรียก read_document_values ก่อนเพื่อยืนยัน ต้องเป็น document_id ที่ได้จาก "
+            "list_chat_documents เท่านั้น"
         ),
         "input_schema": {
             "type": "object",
@@ -1508,10 +1502,9 @@ CHAT_DOCUMENT_TOOLS = [
     {
         "name": "add_table_item",
         "description": (
-            "เสนอเพิ่มรายการใหม่ในแถวว่างแรกของตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ ยังไม่เพิ่มจริงทันที — "
-            "ระบบจะแสดง preview ต่อท้ายคิวให้ผู้ใช้พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/'ยืนยันล่าสุด' หรือ 'ยกเลิก' "
-            "เองก่อนเสมอ ถ้าตารางเต็มแล้วจะไม่เสนอและแจ้งว่าตารางเต็ม ต้องเป็น document_id ที่ได้จาก "
-            "list_chat_documents เท่านั้น"
+            "แก้ไฟล์ทันที — เพิ่มรายการใหม่ในแถวว่างแรกของตารางรายการของไฟล์ที่เปิดอยู่ในแชทนี้ undo ได้เสมอ "
+            "(บอกผู้ใช้ว่าพิมพ์ 'ย้อนการแก้' ถ้าต้องการยกเลิก) ถ้าตารางเต็มแล้วจะไม่เพิ่มและแจ้งว่าตารางเต็ม "
+            "ต้องเป็น document_id ที่ได้จาก list_chat_documents เท่านั้น"
         ),
         "input_schema": {
             "type": "object",
@@ -1795,40 +1788,39 @@ def execute_read_document_values(tool_input: dict, user_id: int, chat_id: int) -
 
 
 def execute_change_rate(tool_input: dict, user_id: int, chat_id: int) -> dict:
-    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_change_rate — เสนอ preview เท่านั้น
-    ยังไม่แก้ไฟล์จริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก apply_change_rate — แก้ไฟล์ทันที (ไม่มีขั้น
+    ยืนยัน/คิวอีกต่อไป — undo ได้เสมอผ่าน create_new_version)"""
     doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
     if doc is None:
         return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
-    return propose_change_rate(doc["id"], user_id, chat_id, tool_input.get("label"), tool_input.get("new_rate"))
+    return apply_change_rate(doc["id"], user_id, tool_input.get("label"), tool_input.get("new_rate"))
 
 
 def execute_update_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
-    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_update_table_item — เสนอ preview เท่านั้น
-    ยังไม่แก้จริง (ต้องยืนยันก่อนเหมือนรายการอื่นในคิว ดูส่วน 1 ของ task — เปลี่ยนจากเวอร์ชันก่อนหน้าที่แก้ทันที
-    ไม่ต้องยืนยัน เพื่อให้ลำดับในคิวสม่ำเสมอ)"""
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก apply_update_table_item — แก้ไฟล์ทันที (ไม่มีขั้น
+    ยืนยัน/คิวอีกต่อไป — undo ได้เสมอผ่าน create_new_version)"""
     doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
     if doc is None:
         return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
-    return propose_update_table_item(doc["id"], user_id, chat_id, tool_input.get("item_no"), tool_input.get("fields") or {})
+    return apply_update_table_item(doc["id"], user_id, tool_input.get("item_no"), tool_input.get("fields") or {})
 
 
 def execute_delete_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
-    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_delete_table_item — เสนอ preview
-    เท่านั้น ยังไม่ลบจริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก apply_delete_table_item — แก้ไฟล์ทันที (ไม่มีขั้น
+    ยืนยัน/คิวอีกต่อไป — undo ได้เสมอผ่าน create_new_version)"""
     doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
     if doc is None:
         return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
-    return propose_delete_table_item(doc["id"], user_id, chat_id, tool_input.get("item_no"))
+    return apply_delete_table_item(doc["id"], user_id, tool_input.get("item_no"))
 
 
 def execute_add_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict:
-    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก propose_add_table_item — เสนอ preview เท่านั้น
-    ยังไม่เพิ่มจริง (ต้องยืนยันก่อน ดูส่วน D ของ task)"""
+    """ตรวจ ownership ผ่าน _get_active_chat_document แล้วเรียก apply_add_table_item — แก้ไฟล์ทันที (ไม่มีขั้น
+    ยืนยัน/คิวอีกต่อไป — undo ได้เสมอผ่าน create_new_version)"""
     doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
     if doc is None:
         return {"error": "ไม่พบไฟล์นี้ในแชทนี้ — เรียก list_chat_documents ใหม่อีกครั้งเพื่อยืนยัน document_id"}
-    return propose_add_table_item(doc["id"], user_id, chat_id, tool_input.get("fields") or {})
+    return apply_add_table_item(doc["id"], user_id, tool_input.get("fields") or {})
 
 
 _UNDO_COMMAND_TEXTS = ("ย้อนการแก้", "undo")
@@ -1916,7 +1908,7 @@ def _is_structural_edit_command(query: str) -> bool:
 
 
 # จับ "ลบรายการที่ N" ตรงๆ (เลขชัดเจน ไม่กำกวม) และ "เปลี่ยน/แก้ VAT/ภาษี(มูลค่าเพิ่ม) เป็น/= N%" (อัตราชัดเจน) —
-# ใช้โดย _parse_direct_structural_command ด้านล่างเท่านั้น (parse คำสั่งแบบไม่กำกวมด้วยโค้ดตรงๆ ไม่ผ่าน LLM เลย)
+# ใช้โดย _match_structural_clause ด้านล่างเท่านั้น (parse คำสั่งแบบไม่กำกวมด้วยโค้ดตรงๆ ไม่ผ่าน LLM เลย)
 _STRUCTURAL_DIRECT_DELETE_RE = re.compile(r"ลบรายการที่\s*(\d+)")
 _STRUCTURAL_DIRECT_RATE_RE = re.compile(
     r"(?:เปลี่ยน|แก้)\s*(?:VAT|ภาษีมูลค่าเพิ่ม|ภาษี)\s*(?:เป็น|=)\s*(\d+(?:\.\d+)?)\s*%"
@@ -1936,35 +1928,163 @@ def _find_single_rate_label(base_bytes: bytes, label_map: dict) -> Optional[str]
     return candidates[0] if len(candidates) == 1 else None
 
 
-def _parse_direct_structural_command(query: str, base_bytes: bytes, label_map: dict) -> Optional[dict]:
-    """parse คำสั่งแก้โครงสร้างรูปแบบชัดเจนมากด้วยโค้ดล้วนๆ (ไม่ผ่าน LLM เลยสักครั้ง) — เฉพาะ 2 รูปแบบที่ไม่กำกวม
-    เท่านั้น: "ลบรายการที่ N" (ตัวเลขชัดเจน) และ "เปลี่ยน/แก้ VAT/ภาษี(มูลค่าเพิ่ม) เป็น/= N%" (ตัวเลขอัตราชัดเจน
-    + หา label อัตราได้ตัวเดียวพอดีด้วยโค้ด — ดู _find_single_rate_label) คำสั่งกำกวมกว่านี้ (เช่น "เปลี่ยน Box
-    4x4 เป็น 7x7" หรือไฟล์มี label อัตรามากกว่า 1 ตัว) ยังต้องผ่าน agent/LLM เหมือนเดิม (คืน None)
+# แยก "ประโยคย่อย" หลายคำสั่งในข้อความเดียว เช่น "เปลี่ยน VAT เป็น 10% และลบรายการที่ 3" — ดู
+# _parse_direct_structural_commands (คั่นด้วยคำว่า "และ" เท่านั้น ไม่รองรับคำเชื่อมอื่น)
+_STRUCTURAL_CLAUSE_SPLIT_RE = re.compile(r"\s*และ\s*")
 
-    เหตุการณ์จริงที่แก้: "ลบรายการที่ 3" ขณะมีไฟล์เดียวเปิดอยู่ ถูกจัดเป็น structural_route แล้วส่งต่อให้ Claude
-    ตัดสินใจเรียก delete_table_item เอง แต่ Claude บางครั้งไม่เรียก tool เลย (ตอบ fallback คงที่แทน) ทั้งที่
-    คำสั่งนี้ไม่กำกวมเลยสักนิด โค้ดรู้คำตอบได้เองอยู่แล้วโดยไม่ต้องถาม LLM
+# "รายการที่ N" ใช้เป็นเป้าหมายตรงๆ ได้ทั้งใน (b)/(c) ด้านล่าง (ไม่ต้องพึ่งข้อความ "รายละเอียด" เลย)
+_STRUCTURAL_ITEM_NO_TARGET_RE = re.compile(r"^รายการที่\s*(\d+)$")
 
-    คืน {"type": "delete_table_item", "item_no": int} หรือ {"type": "change_rate", "label": str, "new_rate":
-    float} หรือ None ถ้าไม่ตรงรูปแบบไหนเลย/กำกวมเกินไป"""
-    delete_match = _STRUCTURAL_DIRECT_DELETE_RE.search(query)
+# (b) "เปลี่ยน/แก้ (จำนวน|ราคาต่อหน่วย|ราคา|หน่วย) (ของ)? <เป้าหมาย> เป็น/= <ค่า>" — แก้ฟิลด์เดียวของรายการใน
+# ตาราง ("ราคาต่อหน่วย" ต้องมาก่อน "ราคา" ในลำดับ alternation เสมอ กัน "ราคา" แย่งจับคู่ก่อนจนเหลือ "ต่อหน่วย"
+# ค้างอยู่ในข้อความเป้าหมายแทน)
+_STRUCTURAL_DIRECT_FIELD_RE = re.compile(
+    r"^(?:เปลี่ยน|แก้)\s*(จำนวน|ราคาต่อหน่วย|ราคา|หน่วย)\s*(?:ของ)?\s*(.+?)\s*(?:เป็น|=)\s*(.+)$"
+)
+_STRUCTURAL_FIELD_NAME_MAP = {"จำนวน": "qty", "ราคาต่อหน่วย": "unit_price", "ราคา": "unit_price", "หน่วย": "unit"}
+
+# (a) "เปลี่ยน/แก้ <เป้าหมาย> เป็น/= <ค่า>" ทั่วไป — แก้ "รายละเอียด" ของรายการในตาราง ลองรูปแบบนี้ "หลังสุด" เสมอ
+# (กว้างกว่า (b) มาก จะ match ทับ (b) ได้ถ้าลองก่อน — ดู _match_structural_clause)
+_STRUCTURAL_DIRECT_DESCRIPTION_RE = re.compile(r"^(?:เปลี่ยน|แก้)\s*(.+?)\s*(?:เป็น|=)\s*(.+)$")
+
+
+def _normalize_structural_target_text(text: str) -> str:
+    """normalize ข้อความเป้าหมายก่อนเทียบกับ "รายละเอียด" ของรายการในตาราง — ตัดช่องว่างทุกชนิดออกทั้งหมด, เป็น
+    ตัวพิมพ์เล็กหมด, และรวม "x"/"×" ให้เป็นตัวเดียวกัน (ขนาดสินค้าในไฟล์จริงเขียนปนกันทั้งสองแบบ เช่น "Box 4x4"
+    กับ "Box 4×4") กันคำสั่งผู้ใช้พิมพ์ช่องว่าง/ตัวพิมพ์/ตัว x ไม่ตรงกับในไฟล์เป๊ะแล้วไม่เจอรายการที่ต้องการ"""
+    return re.sub(r"\s+", "", text).lower().replace("×", "x")
+
+
+def _resolve_table_target(target_text: str, table: dict) -> Optional[dict]:
+    """หาแถวในตารางที่ target_text (ข้อความเป้าหมายจากคำสั่งผู้ใช้) ชี้ถึง — "รายการที่ N" ชัดเจนตรงๆ หรือจับคู่
+    กับ "รายละเอียด" ของรายการด้วยข้อความ normalize แล้ว (ดู _normalize_structural_target_text) คืน {"item_no":,
+    "description":} ถ้าเจอรายการเดียวชัดเจนเท่านั้น คืน None ถ้าไม่เจอเลย หรือเจอมากกว่า 1 รายการ (กำกวมเกินจะ
+    เดา ปล่อยให้ agent/LLM ตัดสินใจแทนทั้งข้อความ)"""
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+
+    item_no_match = _STRUCTURAL_ITEM_NO_TARGET_RE.match(target_text.strip())
+    if item_no_match:
+        item_no = int(item_no_match.group(1))
+        if 1 <= item_no <= len(filled_rows):
+            return {"item_no": item_no, "description": filled_rows[item_no - 1]["values"].get("description")}
+        return None
+
+    normalized_target = _normalize_structural_target_text(target_text)
+    matches = [
+        (i, r) for i, r in enumerate(filled_rows)
+        if _normalize_structural_target_text(str(r["values"].get("description") or "")) == normalized_target
+    ]
+    if len(matches) != 1:
+        return None
+    index, row = matches[0]
+    return {"item_no": index + 1, "description": row["values"].get("description")}
+
+
+def _combine_description_replacement(old_description: str, new_value_text: str) -> str:
+    """ประกอบ "รายละเอียด" ใหม่จากค่าเดิม + ค่าที่ผู้ใช้ระบุ — ถ้าค่าใหม่สั้นกว่าเดิม (คำน้อยกว่า) ถือว่าเป็นแค่
+    "ส่วนท้ายที่ต่าง" (เช่น เดิม "Box 4x4" ผู้ใช้พิมพ์ "7x7" -> เอาคำหน้าของเดิมที่เหลือมาต่อ -> "Box 7x7") ถ้าค่า
+    ใหม่มีจำนวนคำเท่ากับหรือมากกว่าเดิม ถือว่าผู้ใช้ตั้งใจพิมพ์ชื่อเต็มมาเองแล้ว ใช้ค่าใหม่ตรงๆ (เช่น เดิม "Box
+    4x4" ผู้ใช้พิมพ์ "Box 7x7" -> ใช้ "Box 7x7" ตรงๆ ไม่เอาคำหน้าของเดิมมาต่อซ้ำ)"""
+    old_words = old_description.split()
+    new_words = new_value_text.split()
+    if len(new_words) < len(old_words):
+        prefix_words = old_words[: len(old_words) - len(new_words)]
+        return " ".join(prefix_words + [new_value_text]) if prefix_words else new_value_text
+    return new_value_text
+
+
+def _parse_structural_number(text: str) -> Optional[float]:
+    try:
+        return float(text.strip())
+    except ValueError:
+        return None
+
+
+def _match_structural_clause(clause: str, base_bytes: bytes, label_map: dict, table: Optional[dict]) -> Optional[dict]:
+    """ลองจับคู่ "ประโยคย่อย" (clause) หนึ่งอันกับรูปแบบคำสั่งแก้โครงสร้างที่ชัดเจนที่สุดรูปแบบหนึ่ง เรียงจาก
+    เฉพาะเจาะจงที่สุดไปทั่วไปที่สุดเสมอ (ลบ/เปลี่ยนอัตรา -> แก้ฟิลด์เดียว -> แก้รายละเอียดทั่วไป) คืน parsed
+    command dict หรือ None ถ้าไม่ตรงรูปแบบไหนเลย/กำกวมเกินไป (ปล่อยให้ agent/LLM ตัดสินใจทั้งข้อความแทน)"""
+    clause = clause.strip()
+
+    delete_match = _STRUCTURAL_DIRECT_DELETE_RE.search(clause)
     if delete_match:
         return {"type": "delete_table_item", "item_no": int(delete_match.group(1))}
 
-    rate_match = _STRUCTURAL_DIRECT_RATE_RE.search(query)
+    rate_match = _STRUCTURAL_DIRECT_RATE_RE.search(clause)
     if rate_match:
         label = _find_single_rate_label(base_bytes, label_map)
         if label is not None:
             return {"type": "change_rate", "label": label, "new_rate": float(rate_match.group(1))}
+        return None  # กำกวม (หา label อัตราได้ไม่ตัวเดียว) ปล่อยให้ agent/LLM ตัดสินใจแทน
+
+    if table is None:
+        return None  # ไม่มีตารางรายการในไฟล์เลย ไม่มีอะไรให้จับคู่รูปแบบ (b)/(a) ด้านล่างได้
+
+    field_match = _STRUCTURAL_DIRECT_FIELD_RE.match(clause)
+    if field_match:
+        field_name_text, target_text, value_text = field_match.groups()
+        field = _STRUCTURAL_FIELD_NAME_MAP.get(field_name_text)
+        target = _resolve_table_target(target_text, table)
+        if target is None:
+            return None
+        if field == "unit":
+            value = value_text.strip()
+        else:
+            value = _parse_structural_number(value_text)
+            if value is None:
+                return None
+        return {"type": "update_table_item", "item_no": target["item_no"], "fields": {field: value}}
+
+    desc_match = _STRUCTURAL_DIRECT_DESCRIPTION_RE.match(clause)
+    if desc_match:
+        target_text, value_text = desc_match.groups()
+        target = _resolve_table_target(target_text, table)
+        if target is None:
+            return None
+        new_description = _combine_description_replacement(target["description"] or "", value_text.strip())
+        return {
+            "type": "update_table_item", "item_no": target["item_no"],
+            "fields": {"description": new_description},
+        }
 
     return None
+
+
+def _parse_direct_structural_commands(query: str, base_bytes: bytes, label_map: dict) -> Optional[list[dict]]:
+    """parse คำสั่งแก้โครงสร้างรูปแบบชัดเจนด้วยโค้ดล้วนๆ (ไม่ผ่าน LLM เลยสักครั้ง) รองรับหลายคำสั่งในข้อความ
+    เดียว คั่นด้วย "และ" (เช่น "เปลี่ยน VAT เป็น 10% และลบรายการที่ 3") — ทุก "ประโยคย่อย" (clause) ต้องตรงกับ
+    รูปแบบที่รู้จักรูปแบบใดรูปแบบหนึ่งทั้งหมดถึงจะถือว่า parse สำเร็จ (มีประโยคย่อยไหนกำกวม/ไม่ตรงเลย ปล่อยทั้ง
+    ข้อความให้ agent/LLM ตัดสินใจแทน ไม่ทำแค่บางส่วนตามที่เข้าใจไปเอง)
+
+    รูปแบบที่รองรับต่อประโยคย่อย (ดู _match_structural_clause): "ลบรายการที่ N", "เปลี่ยน/แก้ VAT/ภาษี
+    (มูลค่าเพิ่ม) เป็น/= N%" (หา label อัตราได้ตัวเดียวพอดีด้วยโค้ด), "เปลี่ยน/แก้ (จำนวน/ราคา/ราคาต่อหน่วย/
+    หน่วย) (ของ)? <เป้าหมาย> เป็น/= <ค่า>" (แก้ฟิลด์เดียวของรายการในตาราง), "เปลี่ยน/แก้ <เป้าหมาย> เป็น/= <ค่า>"
+    (แก้ "รายละเอียด" ของรายการในตาราง — เป้าหมายคือ "รายการที่ N" หรือข้อความที่ตรงกับรายละเอียดรายการใด
+    รายการหนึ่งในตารางเป๊ะ หลัง normalize ช่องว่าง/ตัวพิมพ์/x-× พอดีรายการเดียวเท่านั้น)
+
+    เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น 7x7"/"ลบรายการที่ 3" ขณะมีไฟล์เดียวเปิดอยู่ ถูกส่งต่อให้ Claude
+    ตัดสินใจเรียก tool เอง แต่ Claude บางครั้งไม่เรียก tool เลย (ตอบ fallback คงที่แทน) ทั้งที่คำสั่งเหล่านี้ไม่
+    กำกวมเลยสักนิด โค้ดรู้คำตอบได้เองอยู่แล้วโดยไม่ต้องถาม LLM
+
+    คืน list ของ parsed command dict (อย่างน้อย 1 รายการ) หรือ None ถ้ามีประโยคย่อยไหนไม่ตรงรูปแบบ/กำกวมเลย"""
+    table = _get_single_item_table(base_bytes)
+    clauses = [c for c in _STRUCTURAL_CLAUSE_SPLIT_RE.split(query) if c.strip()]
+    if not clauses:
+        return None
+
+    parsed_commands = []
+    for clause in clauses:
+        parsed = _match_structural_clause(clause, base_bytes, label_map, table)
+        if parsed is None:
+            return None
+        parsed_commands.append(parsed)
+    return parsed_commands
 
 
 # ข้อความคงที่ใช้แทนคำตอบของ Claude เมื่อตรวจพบว่า Claude "แต่ง" ผลการแก้ไฟล์เอง (ไม่ได้มาจาก tool จริง) — ดู
 # docstring ของ rag_answer ส่วน guard ทั้งสองจุด (structural_no_tool / fabricated_edit_claim_blocked)
 _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE = (
-    "ยังไม่ได้แก้ไขไฟล์ครับ กรุณาระบุให้ชัดขึ้น เช่น 'เปลี่ยน Box 4x4 เป็น 7x7' หรือ 'ลบรายการที่ 3'"
+    "ยังไม่ได้แก้ไขไฟล์ครับ ลองพิมพ์เช่น 'ลบรายการที่ 3' หรือ 'เปลี่ยนจำนวนรายการที่ 2 เป็น 15'"
 )
 
 # คำที่บ่งบอกว่าคำตอบอ้างว่า "ทำสำเร็จแล้ว" กับสิ่งของในเอกสารโดยเฉพาะ (ไม่ใช่แค่กริยาลอยๆ — เวอร์ชันแรกกว้างไป
@@ -2090,12 +2210,14 @@ def _normalize_pending_queue_command_text(query: str) -> str:
 
 
 def _classify_pending_queue_command(query: str) -> Optional[str]:
-    """เช็คว่าข้อความนี้เป็นคำสั่งต่อคิว pending action (ดู ChatPendingAction) แบบไหน — ต้องตรงกับชุดคำที่กำหนด
-    ไว้เป๊ะหลัง normalize (ตัดคำลงท้าย/สร้อยคำพูดออกก่อนเสมอ ดู _normalize_pending_queue_command_text) เท่านั้น
-    ไม่ใช่แค่มีคำนั้นปนอยู่ที่ไหนก็ได้ (กันเคส "ไม่ยืนยัน"/"ยังไม่ยืนยัน"/"ไม่ยกเลิก" ถูกนับผิด — คำปฏิเสธพวกนี้ไม่
-    ลงท้ายด้วยสร้อยคำพูดที่ตัดได้ จึงไม่มีทางกลายเป็นข้อความที่ตรงชุดคำด้านบนได้) คืนอย่างใดอย่างหนึ่ง:
-    "confirm_all" | "confirm_latest" | "confirm_single" | "cancel_latest" | "cancel_all" | None (ไม่ตรงคำสั่งคิว
-    เลย — ไม่ใช่ error แค่ไม่ใช่คำสั่งนี้)"""
+    """เช็คว่าข้อความนี้ "ดูเหมือน" คำสั่งยืนยัน/ยกเลิกแบบไหน (ชื่อ/ชนิดคืนค่าเหลือไว้จากยุคที่ยังมีคิว pending
+    action จริงๆ — ตอนนี้ไม่มีขั้นยืนยัน/คิวอีกต่อไปแล้ว ทุกการแก้โครงสร้างทำทันที ใช้ฟังก์ชันนี้แค่เป็น "ตัวตรวจจับ"
+    ว่าข้อความนี้ควรได้คำตอบคงที่ "ตอนนี้ระบบแก้ทันทีแล้วครับ..." แทนที่จะส่งเข้า LLM เท่านั้น — ดู ask_question())
+    ต้องตรงกับชุดคำที่กำหนดไว้เป๊ะหลัง normalize (ตัดคำลงท้าย/สร้อยคำพูดออกก่อนเสมอ ดู
+    _normalize_pending_queue_command_text) เท่านั้น ไม่ใช่แค่มีคำนั้นปนอยู่ที่ไหนก็ได้ (กันเคส "ไม่ยืนยัน"/
+    "ยังไม่ยืนยัน"/"ไม่ยกเลิก" ถูกนับผิด — คำปฏิเสธพวกนี้ไม่ลงท้ายด้วยสร้อยคำพูดที่ตัดได้ จึงไม่มีทางกลายเป็น
+    ข้อความที่ตรงชุดคำด้านบนได้) คืนอย่างใดอย่างหนึ่ง: "confirm_all" | "confirm_latest" | "confirm_single" |
+    "cancel_latest" | "cancel_all" | None (ไม่ตรงรูปแบบคำสั่งยืนยัน/ยกเลิกเลย)"""
     stripped = _normalize_pending_queue_command_text(query)
     if stripped in _CONFIRM_ALL_TEXTS:
         return "confirm_all"
@@ -2116,12 +2238,12 @@ _PENDING_QUEUE_NEGATION_RE = re.compile(r"(?:ไม่|ยัง\s*ไม่|อ
 
 
 def _mentions_pending_queue_intent(query: str) -> bool:
-    """เช็คว่าข้อความนี้ "ดูเหมือน" ตั้งใจจะสั่งคิว pending action (มีคำว่า "ยืนยัน"/"ยกเลิก" ปนอยู่) แต่ไม่ตรง
+    """เช็คว่าข้อความนี้ "ดูเหมือน" ตั้งใจจะยืนยัน/ยกเลิกการแก้ไฟล์ (มีคำว่า "ยืนยัน"/"ยกเลิก" ปนอยู่) แต่ไม่ตรง
     รูปแบบคำสั่งที่ชัดเจนเป๊ะเลย (ดู _classify_pending_queue_command) — ไม่นับคำปฏิเสธ (ดู
     _PENDING_QUEUE_NEGATION_RE) และไม่นับข้อความที่ดูเหมือนคำถามจริงๆ (มีคำเชิงคำถามอย่าง "ไหม"/"อะไร"/"ต้อง" ปน
     มา — ใช้ชุดคำเดียวกับ _OPEN_COMMAND_QUESTION_WORDS กัน เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษีไหม" ถูกเข้าใจผิดเป็น
-    ความตั้งใจจะสั่งคิวทั้งที่เป็นคำถามกฎหมายทั่วไป) ใช้เป็นด่านดักคำสั่งคิวที่พิมพ์แปลกไปจากรูปแบบที่รู้จัก (เช่น
-    "ยืนยันแบบนั้นแหละ") ก่อนปล่อยให้ LLM ตีความ ซึ่งเคยไปวิเคราะห์/propose ซ้ำคิวเองแทนที่จะทำตามจริง"""
+    ความตั้งใจจะยืนยัน/ยกเลิกทั้งที่เป็นคำถามกฎหมายทั่วไป) ใช้เป็นด่านดักข้อความทำนองนี้ที่พิมพ์แปลกไปจากรูปแบบ
+    ที่รู้จัก (เช่น "ยืนยันแบบนั้นแหละ") ให้ได้คำตอบคงที่ "ตอนนี้ระบบแก้ทันทีแล้วครับ..." แทนที่จะส่งเข้า LLM"""
     if _PENDING_QUEUE_NEGATION_RE.search(query):
         return False
     if "ยืนยัน" not in query and "ยกเลิก" not in query:
@@ -2131,43 +2253,13 @@ def _mentions_pending_queue_intent(query: str) -> bool:
     return True
 
 
-_PENDING_QUEUE_EMPTY_MESSAGE = "ไม่มีรายการรอยืนยันครับ"
-
-
-PENDING_ACTION_TTL_SECONDS = 600  # 10 นาที — นับจาก "รายการล่าสุดของคิว" เสมอ (ดู _is_pending_queue_fresh)
-
-
-def _is_pending_queue_fresh(pending_queue: list[dict]) -> bool:
-    """เช็คว่าคิว pending action นี้ (จาก get_chat_pending_actions) ยังไม่หมดอายุไหม — นับจาก created_at ของ
-    "รายการล่าสุด" ของคิวเท่านั้น (รายการใหม่ต่อท้ายคิวต่ออายุให้ทั้งคิวโดยปริยาย) คิวว่าง -> False เสมอ รองรับ
-    ทั้ง created_at แบบ tz-aware (Postgres คอลัมน์ DateTime(timezone=True) คืนค่าแบบนี้ของจริง) และ naive (เช่น
-    จากการทดสอบที่ใช้ datetime.utcnow() ตรงๆ) — naive ถือเป็น UTC เสมอ"""
-    if not pending_queue:
-        return False
-    created_at = pending_queue[-1]["created_at"]
-    now = datetime.datetime.now(datetime.timezone.utc) if created_at.tzinfo is not None else datetime.datetime.utcnow()
-    return (now - created_at).total_seconds() <= PENDING_ACTION_TTL_SECONDS
-
-
 def _get_document_version_marker(document: dict) -> Optional[int]:
     """คืน id ของเวอร์ชันล่าสุดของไฟล์นี้ (หรือ None ถ้ายังไม่เคยมีเวอร์ชันเลย — ยังใช้ต้นฉบับอยู่) ใช้เป็น
-    "ลายเซ็น" ของสถานะไฟล์ก่อนเริ่มยืนยันคิว (ดู _apply_pending_queue) กันกรณีมีการแก้/undo จากนอกคิวแทรกเข้ามา
-    ระหว่างที่คิวค้างอยู่ — เช็คครั้งเดียวตอนเริ่ม ไม่เช็คเป๊ะทีละรายการ เพราะระหว่างทำคิวเองเวอร์ชันเปลี่ยนไป
-    เรื่อยๆ (แต่ละรายการสร้างเวอร์ชันของตัวเอง) เป็นเรื่องปกติอยู่แล้ว ไม่ใช่การแทรกจากภายนอก"""
+    "ลายเซ็น" ของสถานะไฟล์ปัจจุบัน — ตอนนี้ใช้เฉพาะเป็น cache key ของ endpoint preview เท่านั้น (ดู
+    preview_excel_editor_document) หลังจากเลิกขั้นยืนยัน/คิวแล้ว (ทุกการแก้โครงสร้างทำทันทีเลย ไม่มีคิวให้ต้อง
+    ตรวจสอบว่ามีอะไรแทรกจากนอกคิวอีกต่อไป)"""
     latest = get_latest_document_version(document["id"])
     return latest["id"] if latest is not None else None
-
-
-def _describe_pending_queue(pending_queue: list[dict]) -> str:
-    """สร้างข้อความแสดงรายการที่ค้างอยู่ในคิวทั้งหมด (เลข 1..n ตามลำดับที่เสนอ) ใช้ตอนผู้ใช้พิมพ์ "ยืนยัน" เฉยๆ
-    ทั้งที่คิวมีมากกว่า 1 รายการ (กำกวมว่าจะยืนยันอันไหน — ให้เลือกระหว่าง 'ยืนยันทั้งหมด'/'ยืนยันล่าสุด' แทน)"""
-    lines = [f"ตอนนี้มีรายการรอยืนยันอยู่ {len(pending_queue)} รายการ:"]
-    for i, item in enumerate(pending_queue, start=1):
-        first_line = item["preview_text"].splitlines()[0] if item["preview_text"] else ""
-        lines.append(f"{i}. {first_line}")
-    lines.append("")
-    lines.append("พิมพ์ 'ยืนยันทั้งหมด', 'ยืนยันล่าสุด' หรือ 'ยกเลิก'")
-    return "\n".join(lines)
 
 
 _OPEN_COMMAND_PREFIXES = ("เปิดไฟล์", "เปิด")  # "เปิดไฟล์" ก่อนเสมอ (ยาวกว่า เฉพาะเจาะจงกว่า) ค่อย "เปิด" เฉยๆ
@@ -2472,8 +2564,10 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
     แต่ละ tool มีฟิลด์บอกความสำเร็จคนละชื่อกัน (ไม่ได้มี schema กลางเดียว):
     - open_library_file/select_list_item (ตอนเปิดไฟล์): สำเร็จดูจาก "opened" เป็น True
     - close_chat_document: สำเร็จดูจาก "closed" เป็น True
-    - edit_chat_document/undo_last_edit: สำเร็จดูจาก "matched" เป็น True ("matched": False ไม่ใช่ exception
-      แต่เป็นความล้มเหลวทางตรรกะ (เช่น หา label ไม่เจอ) ข้อความอธิบายอยู่ใน "message" ไม่ใช่ "error")
+    - edit_chat_document/undo_last_edit/change_rate/update_table_item/delete_table_item/add_table_item: สำเร็จ
+      ดูจาก "matched" เป็น True (4 ตัวหลังแก้ไฟล์ทันทีแล้ว — ไม่มีขั้นยืนยัน/คิวอีกต่อไป ใช้ schema เดียวกับ
+      edit_chat_document พอดี) "matched": False ไม่ใช่ exception แต่เป็นความล้มเหลวทางตรรกะ (เช่น หา label ไม่
+      เจอ/ไม่มีอะไรเปลี่ยน) ข้อความอธิบายอยู่ใน "message" ไม่ใช่ "error"
     ทุก tool ล้มเหลวแบบ exception/error ตรงๆ ดูจาก key "error" เสมอ"""
     if tool_name in ("open_library_file", "select_list_item"):
         if result.get("opened") is True:
@@ -2491,21 +2585,13 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
             return f"✗ {result['error']}"
         return None
 
-    if tool_name in ("edit_chat_document", "undo_last_edit"):
+    if tool_name in (
+        "edit_chat_document", "undo_last_edit",
+        "change_rate", "update_table_item", "delete_table_item", "add_table_item",
+    ):
         message = result.get("message") or ""
         first_line = message.splitlines()[0] if message else ""
         if result.get("matched") is True:
-            return f"✓ {first_line}" if first_line else None
-        if "error" in result:
-            return f"✗ {result['error']}"
-        return f"✗ {first_line}" if first_line else None
-
-    if tool_name in ("change_rate", "update_table_item", "delete_table_item", "add_table_item"):
-        # tool กลุ่มนี้แค่ "เสนอ" (proposed) preview ต่อท้ายคิวไว้รอยืนยัน ยังไม่แก้ไฟล์จริง (update_table_item
-        # เปลี่ยนมาต้องยืนยันด้วยเหมือนกันแล้ว — ดูส่วน 1 ของ task)
-        message = result.get("message") or ""
-        first_line = message.splitlines()[0] if message else ""
-        if result.get("proposed") is True:
             return f"✓ {first_line}" if first_line else None
         if "error" in result:
             return f"✗ {result['error']}"
@@ -2531,39 +2617,35 @@ def run_agentic_tool_loop(
     คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด, มี structural tool ถูกเรียกในเทิร์นนี้ไหม) เสมอ — รายการใบยืนยัน
     มาจาก _build_action_receipt() เฉพาะ tool ที่เปลี่ยนข้อมูลจริง (open_library_file, select_list_item ตอนเปิด
     ไฟล์, edit_chat_document, close_chat_document, undo_last_edit, change_rate/update_table_item/
-    delete_table_item/add_table_item ตอนเสนอ preview สำเร็จ) เรียงตามลำดับที่เกิดขึ้นจริง ไม่ซ้ำบรรทัดเดิม (เผื่อ
+    delete_table_item/add_table_item ตอนล้มเหลว — สำเร็จไม่ออกใบยืนยันแยก เพราะกลายเป็นคำตอบสุดท้ายเองอยู่แล้ว
+    ดูด้านล่าง) เรียงตามลำดับที่เกิดขึ้นจริง ไม่ซ้ำบรรทัดเดิม (เผื่อ
     tool เดียวกันถูกเรียกซ้ำด้วยผลเหมือนกันในหลายรอบของ loop นี้) caller (rag_answer) เป็นคนต่อท้ายคำตอบสุดท้าย
     เอง ไม่ทำในนี้ เพราะฟังก์ชันนี้ไม่รู้ว่าคำตอบรอบนี้จะผ่าน LanguageGuard retry หรือถูกทิ้งแล้วลองใหม่
 
-    change_rate/update_table_item/delete_table_item/add_table_item ("propose" tool ทั้งหมด — ไม่เคยแก้ไฟล์
-    จริงทันที แค่เสนอ preview รอยืนยัน): ถ้าสำเร็จ (result["proposed"] is True) ในเทิร์นนี้ คำตอบสุดท้ายที่คืน
-    ต้องเป็น preview_text จากโค้ดตรงๆ เท่านั้น (ต่อท้ายด้วยสรุปจำนวนรายการที่ค้างอยู่ในคิว) ไม่ให้ Claude
-    เรียบเรียงคำตอบของตัวเองแทนเด็ดขาด — เหตุการณ์จริงที่แก้: Claude เรียก tool แล้วแต่งคำตอบเองทับ (เช่น
-    แต่งราคาใหม่ผิดๆ) แทนที่จะพูดตาม preview ที่ tool คืนมาจริงๆ"""
+    change_rate/update_table_item/delete_table_item/add_table_item (แก้ไฟล์ทันที ไม่มีขั้นยืนยัน/คิวอีกต่อไป):
+    ถ้าสำเร็จ (result["matched"] is True) ในเทิร์นนี้ คำตอบสุดท้ายที่คืนต้องเป็นข้อความผลลัพธ์จากโค้ดตรงๆ เท่านั้น
+    ไม่ให้ Claude เรียบเรียงคำตอบของตัวเองแทนเด็ดขาด — เหตุการณ์จริงที่แก้: Claude เรียก tool แล้วแต่งคำตอบเองทับ
+    (เช่น แต่งราคาใหม่ผิดๆ) แทนที่จะพูดตามผลที่ tool คืนมาจริงๆ"""
     messages = [dict(m) for m in initial_messages]  # copy กันแก้ list เดิมโดยไม่ตั้งใจ
     response = None
     action_receipts: list[str] = []
     structural_tool_called = False
-    proposed_previews: list[str] = []
-    latest_queue_count: Optional[int] = None
+    applied_messages: list[str] = []
 
     def _add_receipt(tool_name: str, result: dict) -> None:
         receipt = _build_action_receipt(tool_name, result)
         if receipt and receipt not in action_receipts:
             action_receipts.append(receipt)
 
-    def _track_propose_result(tool_name: str, result: dict) -> None:
-        """จัดการผลของ propose tool (change_rate/update_table_item/delete_table_item/add_table_item) —
-        สำเร็จ: เก็บ preview_text ไว้ใน proposed_previews เพื่อใช้แทนคำตอบของ Claude ทั้งหมด (ดู docstring ของ
-        run_agentic_tool_loop) ไม่ออกใบยืนยัน ✓ ด้วย เพราะ preview_text ที่จะกลายเป็นคำตอบสุดท้ายอยู่แล้วมีบรรทัด
-        แรกเหมือนกันเป๊ะ ออกซ้ำไปจะเห็นบรรทัดแรกซ้ำกันสองที (เหตุการณ์จริงที่แก้)
-        ล้มเหลว (dedup/no-op/error ฯลฯ): ยังออกใบยืนยัน ✗ ตามปกติ เพราะคำตอบสุดท้ายรอบนี้ไม่ได้ถูกแทนที่ด้วย
-        preview_text ใดๆ เลย (proposed_previews ไม่ได้ถูกเติม) ผู้ใช้ควรเห็นว่าทำไมไม่มีอะไรเกิดขึ้น"""
-        nonlocal latest_queue_count
-        if result.get("proposed") is True:
-            proposed_previews.append(result["message"])
-            if "queue_count" in result:
-                latest_queue_count = result["queue_count"]
+    def _track_applied_result(tool_name: str, result: dict) -> None:
+        """จัดการผลของ tool ที่แก้โครงสร้างไฟล์ทันที (change_rate/update_table_item/delete_table_item/
+        add_table_item) — สำเร็จ: เก็บข้อความผลลัพธ์จากโค้ดไว้ใน applied_messages เพื่อใช้แทนคำตอบของ Claude
+        ทั้งหมด (ดู docstring ของ run_agentic_tool_loop) ไม่ออกใบยืนยัน ✓ แยกต่างหาก เพราะข้อความนี้จะกลายเป็น
+        คำตอบสุดท้ายเองอยู่แล้วมีบรรทัดแรกเหมือนกันเป๊ะ ออกซ้ำไปจะเห็นซ้ำกันสองที (เหตุการณ์จริงที่แก้)
+        ล้มเหลว (no-op/error ฯลฯ): ยังออกใบยืนยัน ✗ ตามปกติเหมือน edit_chat_document เพราะคำตอบสุดท้ายรอบนี้ไม่ได้
+        ถูกแทนที่ด้วยอะไรเลย"""
+        if result.get("matched") is True:
+            applied_messages.append(result["message"])
         else:
             _add_receipt(tool_name, result)
 
@@ -2708,7 +2790,7 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "change_rate" and user_id and chat_id:
                 structural_tool_called = True
                 result = _safe_execute_tool("change_rate", execute_change_rate, block.input, user_id, chat_id)
-                _track_propose_result("change_rate", result)
+                _track_applied_result("change_rate", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2717,7 +2799,7 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "update_table_item" and user_id and chat_id:
                 structural_tool_called = True
                 result = _safe_execute_tool("update_table_item", execute_update_table_item, block.input, user_id, chat_id)
-                _track_propose_result("update_table_item", result)
+                _track_applied_result("update_table_item", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2726,7 +2808,7 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "delete_table_item" and user_id and chat_id:
                 structural_tool_called = True
                 result = _safe_execute_tool("delete_table_item", execute_delete_table_item, block.input, user_id, chat_id)
-                _track_propose_result("delete_table_item", result)
+                _track_applied_result("delete_table_item", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2735,7 +2817,7 @@ def run_agentic_tool_loop(
             elif block.type == "tool_use" and block.name == "add_table_item" and user_id and chat_id:
                 structural_tool_called = True
                 result = _safe_execute_tool("add_table_item", execute_add_table_item, block.input, user_id, chat_id)
-                _track_propose_result("add_table_item", result)
+                _track_applied_result("add_table_item", result)
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -2753,13 +2835,10 @@ def run_agentic_tool_loop(
         if response.stop_reason == "tool_use":
             return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
 
-    if proposed_previews:
-        # มี propose tool สำเร็จในเทิร์นนี้ — ใช้ preview_text จากโค้ดตรงๆ เป็นคำตอบสุดท้ายเสมอ ไม่ให้ Claude
-        # เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด (ดู docstring ด้านบน)
-        final_text = "\n\n".join(proposed_previews)
-        if latest_queue_count is not None:
-            final_text += f"\n\n(ตอนนี้มี {latest_queue_count} รายการรอยืนยัน)"
-        return final_text, action_receipts, structural_tool_called
+    if applied_messages:
+        # มี tool แก้โครงสร้างไฟล์สำเร็จในเทิร์นนี้ — ใช้ข้อความผลลัพธ์จากโค้ดตรงๆ เป็นคำตอบสุดท้ายเสมอ ไม่ให้
+        # Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด (ดู docstring ด้านบน)
+        return "\n\n".join(applied_messages), action_receipts, structural_tool_called
 
     text_parts = [block.text for block in response.content if block.type == "text"]
     final_text = "\n\n".join(text_parts).strip()
@@ -3581,7 +3660,7 @@ async def ask_question(
     # True เมื่อเส้นทางนี้ถูกตัดสิน (ด้วยโค้ดหรือ LLM classifier) ว่าเป็นคำสั่งแก้โครงสร้างไฟล์ (เปลี่ยนอัตรา/
     # ลบ-เพิ่ม-แก้รายการในตาราง) — ตั้งค่าจริงใน branch ด้านล่าง (ถ้ามี) ต้อง init ไว้ก่อนเสมอเพราะจุดที่ใช้งาน
     # จริง (เรียก rag_answer) อยู่นอก branch ที่ตั้งค่า ถ้าไม่ล็อกอิน/ไม่มี chat_id/มีภาพแนบมา ฯลฯ จะไม่เคยเข้า
-    # branch นั้นเลยสักครั้ง (ดู _handle_pending_queue_command/run_agentic_tool_loop/rag_answer)
+    # branch นั้นเลยสักครั้ง (ดู run_agentic_tool_loop/rag_answer)
     structural_route = False
 
     # สร้างแชทใหม่ตรงนี้เลยถ้าเป็นข้อความแรกสุด (ยังไม่มี chat_id มา) และไม่มีภาพแนบมา — ย้ายมาจากเดิมที่อยู่
@@ -3727,41 +3806,18 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        # ยืนยัน/ยกเลิกการแก้โครงสร้าง (เปลี่ยนอัตรา/ลบ/เพิ่ม/แก้ค่าของรายการในตาราง) ที่ค้างอยู่ในคิว (ดู
-        # ChatPendingAction) ดักก่อนเรียก LLM ใดๆ เสมอ เหมือนคำสั่งย้อนการแก้/ปิดไฟล์ด้านบน — ต้องเช็คก่อนเข้า
-        # branch ตัดสินใจของ Excel editor เสมอ กัน "ยืนยัน" ถูกตีความเป็นคำสั่งแก้ค่าปกติ (intent="edit")
-        #
-        # pending_command ตรงรูปแบบคำสั่งคิวที่ชัดเจนเป๊ะ (หลัง normalize ตัดสร้อยคำพูด — ดู
-        # _classify_pending_queue_command) ส่วน loose_pending_intent ดักคำสั่งที่ "ดูเหมือน" ตั้งใจจะสั่งคิวแต่
-        # พิมพ์แปลกไปจากรูปแบบที่รู้จัก (เช่น "ยืนยันทั้งหมดเลย" ที่ normalize ไม่ครอบคลุม หรือ "ยืนยันแบบนั้นแหละ")
-        # — ทั้งสองแบบห้ามปล่อยตกไปให้ LLM ตีความเด็ดขาด (เหตุการณ์จริงที่แก้: "ยืนยันทั้งหมดเลย" ตกไปให้ LLM
-        # ซึ่งไปเรียก propose ซ้ำของเดิมในคิวแทนที่จะ apply จริง แล้วพอพิมพ์ซ้ำอีกครั้ง LLM กลับเขียนวิเคราะห์คิว
-        # เองแทนที่จะตอบด้วยโค้ด)
-        pending_command = _classify_pending_queue_command(query) if query.strip() else None
-        loose_pending_intent = (
-            pending_command is None and bool(active_docs) and bool(query.strip())
-            and _mentions_pending_queue_intent(query)
+        # ไม่มีขั้นยืนยัน/คิวอีกต่อไป (ทุกการแก้โครงสร้างทำทันที — ดู apply_change_rate และเพื่อน) ถ้าผู้ใช้พิมพ์
+        # ข้อความที่ "ดูเหมือน" คำสั่งยืนยัน/ยกเลิกแบบเดิม (ไม่ว่าจะตรงรูปแบบเป๊ะ — ดู _classify_pending_queue_command
+        # — หรือแค่คล้ายๆ อย่าง "ยืนยันแบบนั้นแหละ" — ดู _mentions_pending_queue_intent) ขณะมีเอกสารเปิดอยู่ ตอบคงที่
+        # ตรงๆ ว่าไม่ต้องยืนยันแล้ว ห้ามส่งเข้า LLM เด็ดขาด — ทั้งสองฟังก์ชันนี้ยังกันคำปฏิเสธ ("ไม่ยืนยัน") และคำถาม
+        # กฎหมายทั่วไปที่บังเอิญมีคำว่า "ยืนยัน"/"ยกเลิก" ปนมา (เช่น "ต้องยืนยันตัวตนอย่างไร") ได้แม่นเหมือนเดิมทุก
+        # ประการ แค่เปลี่ยนจาก "ไปจัดการคิว" เป็น "บอกว่าไม่มีคิวให้จัดการแล้ว"
+        is_confirm_or_cancel_phrase = bool(active_docs) and bool(query.strip()) and (
+            _classify_pending_queue_command(query) is not None or _mentions_pending_queue_intent(query)
         )
-
-        if pending_command is not None or loose_pending_intent:
-            pending_queue = get_chat_pending_actions(chat_id)
-            queue_is_actionable = bool(pending_queue) and _is_pending_queue_fresh(pending_queue)
-
-            if pending_command in ("confirm_all", "confirm_latest", "confirm_single"):
-                answer = (
-                    _handle_pending_queue_command(pending_command, pending_queue, user_id, chat_id)
-                    if queue_is_actionable else _PENDING_QUEUE_EMPTY_MESSAGE
-                )
-            elif pending_command in ("cancel_all", "cancel_latest"):
-                answer = (
-                    _handle_pending_queue_command(pending_command, pending_queue, user_id, chat_id)
-                    if pending_queue else _PENDING_QUEUE_EMPTY_MESSAGE
-                )
-            else:
-                # loose_pending_intent เท่านั้น (pending_command เป็น None) — ตอบด้วยโค้ดเสมอ ห้ามส่งเข้า LLM
-                print(f"[Route] chat={chat_id} branch=pending_queue_fallback")
-                answer = _describe_pending_queue(pending_queue) if queue_is_actionable else _PENDING_QUEUE_EMPTY_MESSAGE
-
+        if is_confirm_or_cancel_phrase:
+            answer = "ตอนนี้ระบบแก้ทันทีแล้วครับ ถ้าต้องการยกเลิกการแก้ล่าสุด พิมพ์ 'ย้อนการแก้'"
+            print(f"[Route] chat={chat_id} branch=confirm_cancel_no_queue")
             add_chat_message(chat_id, "user", query)
             add_chat_message(chat_id, "assistant", answer)
             touch_chat_session(chat_id)
@@ -3791,39 +3847,31 @@ async def ask_question(
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
 
+        # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
+        # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
+        # _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น 7x7"/"เปลี่ยนจำนวน
+        # Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/"อัตรา"/"รายการที่ N"/
+        # "ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง ทั้งที่ parse ได้ชัดเจนด้วย
+        # โค้ดเฉยๆ
+        direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+        if direct_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+            answer = direct_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         # ด่านกันด้วยโค้ดก่อนเรียก classifier เลย (ไม่พึ่ง LLM อย่างเดียว) — เหตุการณ์จริงที่แก้: "เปลี่ยน VAT
         # เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียวเปิดอยู่ ถูก
         # _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียนค่า
         # ทับเซลล์สูตรตรงๆ (สูตร VAT กลายเป็นค่าคงที่) โดยไม่มี preview/ยืนยันเลย ดู _is_structural_edit_command
+        # (ถึงจุดนี้ได้แปลว่า direct dispatch ด้านบนคืน None แล้ว — ไม่มีเอกสารเป้าหมายชัดเจน หรือ parse ไม่ได้
+        # เลย ต้องพึ่ง agent/LLM แทน)
         structural_route = bool(active_docs) and _is_structural_edit_command(query)
         if structural_route:
             focus_doc = get_chat_document_focus(chat_id, user_id)
             direct_target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
-
-            # คำสั่งรูปแบบชัดเจนมาก ("ลบรายการที่ N"/"เปลี่ยน VAT เป็น N%") parse ด้วยโค้ดแล้วเรียก propose_*
-            # ตรงๆ เลย ไม่ต้องผ่าน agent/LLM เลยสักครั้ง — เหตุการณ์จริงที่แก้: คำสั่งแบบนี้ไม่กำกวมเลย แต่บางครั้ง
-            # Claude ไม่เรียก tool เลย (ตอบ fallback คงที่แทน) ทั้งที่โค้ดรู้คำตอบได้เองอยู่แล้ว ดู
-            # _parse_direct_structural_command
-            if direct_target_doc is not None:
-                direct_base_bytes, direct_label_map = get_working_copy(direct_target_doc)
-                direct_action = _parse_direct_structural_command(query, direct_base_bytes, direct_label_map)
-                if direct_action is not None:
-                    print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_target_doc['id']}")
-                    if direct_action["type"] == "delete_table_item":
-                        result = propose_delete_table_item(
-                            direct_target_doc["id"], user_id, chat_id, direct_action["item_no"]
-                        )
-                    else:
-                        result = propose_change_rate(
-                            direct_target_doc["id"], user_id, chat_id,
-                            direct_action["label"], direct_action["new_rate"],
-                        )
-                    answer = result["message"]
-                    add_chat_message(chat_id, "user", query)
-                    add_chat_message(chat_id, "assistant", answer)
-                    touch_chat_session(chat_id)
-                    return {"answer": answer, "sources": [], "chat_id": chat_id}
-
             log_doc_id = direct_target_doc["id"] if direct_target_doc else None
             print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
 
@@ -6592,7 +6640,7 @@ _PERCENT_IN_TEXT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
 
 _TABLE_INPUT_FIELDS = ("no", "description", "qty", "unit", "unit_price")  # "amount" เป็นสูตรเสมอ ห้ามแตะ
 
-# ชื่อฟิลด์ภาษาไทยที่โชว์ให้ผู้ใช้เห็นในข้อความ preview/receipt (ดู propose_update_table_item/propose_add_table_item/
+# ชื่อฟิลด์ภาษาไทยที่โชว์ให้ผู้ใช้เห็นในข้อความผลลัพธ์ (ดู apply_update_table_item/apply_add_table_item/
 # _apply_single_queue_item) — ชื่อฟิลด์ดิบ (no/description/qty/...) เป็นแค่ key ภายในที่ AI ใช้เรียก tool เท่านั้น
 # ไม่ควรโผล่ให้ผู้ใช้เห็นตรงๆ
 _TABLE_FIELD_THAI_NAMES = {
@@ -6618,7 +6666,7 @@ def _rewrite_percent_text(text: str, new_rate) -> str:
 def _rewrite_rate_formula(formula: str, new_rate) -> Optional[str]:
     """เปลี่ยนค่าคงที่ตัวเลขอัตราในสูตร Excel เป็นอัตราใหม่ — รองรับเฉพาะ 4 รูปแบบใน _RATE_FORMULA_PATTERNS
     เท่านั้น (ใช้ regex แทนที่เฉพาะตัวเลขอัตรา ไม่แตะส่วนอื่นของสูตรเลย) คืน None ถ้าสูตรไม่ตรงรูปแบบที่รู้จักเลย
-    สักแบบ (ห้ามเดา — ดู docstring ของ propose_change_rate)"""
+    สักแบบ (ห้ามเดา — ดู docstring ของ apply_change_rate)"""
     for pattern, kind in _RATE_FORMULA_PATTERNS:
         m = pattern.search(formula)
         if not m:
@@ -6637,9 +6685,8 @@ def _rewrite_rate_formula(formula: str, new_rate) -> Optional[str]:
 
 def _resolve_rate_formula(base_bytes: bytes, label_info: dict, new_rate) -> tuple[Optional[str], Optional[str]]:
     """คืน (new_formula, error_message) — error_message ไม่ None แปลว่าทำต่อไม่ได้ (new_formula เป็น None เสมอ
-    ในกรณีนั้น) ใช้ร่วมกันทั้ง propose_change_rate (preview) และ _resolve_and_build_mutate_fn (ตอน apply จริง/
-    dry-run replay คิว) กันตรรกะตรวจสูตรไม่ตรงกันระหว่างจุดต่างๆ อ่านสูตรดิบด้วย data_only=False เสมอ (ไม่พึ่ง
-    ค่า cache)"""
+    ในกรณีนั้น) ใช้ร่วมกันทั้ง apply_change_rate (ก่อน apply จริง) และ _resolve_and_build_mutate_fn กันตรรกะ
+    ตรวจสูตรไม่ตรงกันระหว่างจุดต่างๆ อ่านสูตรดิบด้วย data_only=False เสมอ (ไม่พึ่งค่า cache)"""
     wb_raw = openpyxl.load_workbook(io.BytesIO(base_bytes), data_only=False)
     cell_value = wb_raw[label_info["sheet"]].cell(row=label_info["row"], column=label_info["col"]).value
     if not (isinstance(cell_value, str) and cell_value.startswith("=")):
@@ -6807,7 +6854,7 @@ def _table_has_non_formula_amount_value(table: dict) -> bool:
 
 
 def _build_add_table_item_mutate_fn(table: dict, target_row: int, fields: dict):
-    """สร้าง mutate_fn เพิ่มรายการใหม่ที่ target_row (แถวว่างแรกของตาราง — ดู propose_add_table_item): เขียนค่า
+    """สร้าง mutate_fn เพิ่มรายการใหม่ที่ target_row (แถวว่างแรกของตาราง — ดู apply_add_table_item): เขียนค่า
     fields ลงคอลัมน์ input (ข้าม "amount" ถ้าหลุดมา เป็นสูตรเสมอ) คอลัมน์ "ลำดับ": auto-assign เป็นเลขถัดไป
     ถ้าเป็นค่าคงที่ (ไม่สนค่าที่ fields ส่งมาสำหรับคอลัมน์นี้ ถ้ามี) ถ้าเป็นสูตรไม่แตะเลย"""
     no_col = table["columns"].get("no")
@@ -6912,11 +6959,12 @@ def _resolve_and_build_mutate_fn(action: dict, current_bytes: bytes, current_lab
 
 def _replay_pending_queue(base_bytes: bytes, base_label_map: dict, queue: list[dict]) -> tuple[bytes, dict]:
     """คำนวณ "สถานะเสมือน" ของไฟล์ถ้าคิวทั้งหมด (ที่ยังไม่ถูกยืนยันจริง) ถูกนำไปใช้แล้ว โดย dry-run ไล่ทำทีละ
-    รายการต่อกัน (ผ่าน _build_document_version — ไม่บันทึกลง DB เลยสักขั้น) ใช้เป็น "ฐาน" ตอนเสนอ preview ของ
-    รายการถัดไปในคิว (ดู propose_change_rate/propose_update_table_item/propose_delete_table_item/
-    propose_add_table_item) เพื่อให้ยอด/ตำแหน่งที่แสดงต่อเนื่องกันถูกต้อง (เช่น เสนอลบรายการที่ 3 หลังจากเสนอ
-    แก้ VAT ไปแล้ว ต้องเห็นยอดหลัง VAT เปลี่ยนด้วย ไม่ใช่ยอดดั้งเดิม) รายการไหน re-resolve ไม่ได้แม้แต่ตอน
-    dry-run (ไม่ควรเกิดถ้าคิวสร้างถูกต้องตั้งแต่แรก) ข้ามไปเงียบๆ ไม่ทำให้ chain พังทั้งเส้น"""
+    รายการต่อกัน (ผ่าน _build_document_version — ไม่บันทึกลง DB เลยสักขั้น) เหลือไว้จากยุคที่ยังมีขั้นยืนยัน/คิว
+    (ตอนนี้ไม่มีการ apply ผ่านคิวแล้ว — ทุกการแก้ทำทันที ดู apply_change_rate และเพื่อน) ใช้เฉพาะโดย endpoint
+    preview mode="pending" เท่านั้น (ดู _resolve_preview_mode_bytes) ซึ่งคิวที่ส่งเข้ามาจะว่างเปล่าเสมอในทาง
+    ปฏิบัติ (ไม่มีใครต่อคิวอีกแล้ว) ฟังก์ชันนี้จึงแค่คืน base_bytes/base_label_map เดิมกลับไปเฉยๆ เก็บไว้เผื่อ
+    กลไกคิวถูกนำกลับมาใช้อีกในอนาคต รายการไหน re-resolve ไม่ได้แม้แต่ตอน dry-run ข้ามไปเงียบๆ ไม่ทำให้ chain
+    พังทั้งเส้น"""
     bytes_acc, label_map_acc = base_bytes, base_label_map
     for item in queue:
         mutate_fn, error, _ = _resolve_and_build_mutate_fn(item["action"], bytes_acc, label_map_acc)
@@ -6926,300 +6974,123 @@ def _replay_pending_queue(base_bytes: bytes, base_label_map: dict, queue: list[d
     return bytes_acc, label_map_acc
 
 
-def _find_duplicate_queue_action(pending_queue: list[dict], candidate_action: dict) -> Optional[int]:
-    """หาตำแหน่ง (1-based ตามลำดับที่เสนอ) ของรายการในคิวที่ "ซ้ำ" กับ candidate_action เป๊ะ (type เดียวกัน +
-    เป้าหมายเดียวกัน + ค่าใหม่เดียวกันทุกช่อง) คืน None ถ้าไม่ซ้ำกับรายการไหนเลย — เรียกจาก propose_* ทุกตัว
-    "ก่อน" ต่อท้ายคิวเสมอ (ดู docstring ของแต่ละ propose_*) เหตุการณ์จริงที่กัน: "ยืนยันทั้งหมดเลย" ไม่ตรงคำสั่งคิว
-    เป๊ะ ตกไปให้ LLM ตีความ แล้ว LLM ไปเรียก propose ซ้ำของเดิมที่อยู่ในคิวอยู่แล้วทุกตัว ทำให้คิวบวมขึ้นเรื่อยๆ
-    ด้วย action ที่ไม่มีความหมายอะไรเพิ่ม (preview ที่ได้ก็เป็น no-op เช่น "จาก 5815.0 เป็น 5815.0")
-
-    เป้าหมายเทียบแบบนี้ต่อ type:
-    - change_rate: ตำแหน่งเซลล์เดียวกัน (sheet/row/col) + new_rate เท่ากัน (เทียบเป็น float กัน 10 vs 10.0)
-    - update_table_item: identity (description) เดียวกัน + fields เหมือนกันทุกช่อง
-    - delete_table_item: identity (description) เดียวกัน (ไม่ต้องเทียบค่าอะไรเพิ่ม — เป้าหมายเดียวกันก็ซ้ำแล้ว)
-    - add_table_item: fields เหมือนกันทุกช่องเป๊ะ (ไม่มี identity ให้เทียบ เพราะยังไม่มีอยู่จริงในตาราง)"""
-    candidate_type = candidate_action.get("type")
-    for index, item in enumerate(pending_queue, start=1):
-        existing = item["action"]
-        if existing.get("type") != candidate_type:
-            continue
-
-        if candidate_type == "change_rate":
-            same_target = (
-                existing.get("sheet") == candidate_action.get("sheet")
-                and existing.get("row") == candidate_action.get("row")
-                and existing.get("col") == candidate_action.get("col")
-            )
-            if same_target and float(existing.get("new_rate")) == float(candidate_action.get("new_rate")):
-                return index
-
-        elif candidate_type in ("update_table_item", "delete_table_item"):
-            existing_desc = (existing.get("identity") or {}).get("description")
-            candidate_desc = (candidate_action.get("identity") or {}).get("description")
-            same_target = existing_desc == candidate_desc
-            if candidate_type == "delete_table_item":
-                if same_target:
-                    return index
-            elif same_target and existing.get("fields") == candidate_action.get("fields"):
-                return index
-
-        elif candidate_type == "add_table_item":
-            if existing.get("fields") == candidate_action.get("fields"):
-                return index
-
-    return None
-
-
-def propose_change_rate(document_id: int, user_id: int, chat_id: int, label: str, new_rate) -> dict:
-    """เสนอเปลี่ยนอัตรา (preview เท่านั้น ไม่แก้ไฟล์จริง) — คำนวณต่อจากสำเนาทำงานปัจจุบัน "บวก" ทุกรายการที่ยังค้าง
-    อยู่ในคิว (dry-run ผ่าน _replay_pending_queue — ไม่บันทึกลง DB) เพื่อให้ยอด/preview ต่อเนื่องกันถูกต้อง แล้ว
-    ต่อท้ายคิว (ไม่ทับของเดิม — ดู ChatPendingAction) รอผู้ใช้พิมพ์ 'ยืนยัน'/'ยืนยันทั้งหมด'/'ยืนยันล่าสุด'/
-    'ยกเลิก' ถ้ามี action แบบเดียวกัน (เซลล์เดียวกัน + อัตราใหม่เดียวกัน) อยู่ในคิวแล้ว หรือ dry-run แล้วค่าไม่
-    เปลี่ยนเลย (อัตราเดิมอยู่แล้วเมื่อนับรวมคิวที่ค้างอยู่ด้วย) -> ไม่ต่อคิวซ้ำ (ดู _find_duplicate_queue_action)
-    คืน {"proposed": bool, "message": str, "queue_count": int} เสมอ"""
+def apply_change_rate(document_id: int, user_id: int, label: str, new_rate) -> dict:
+    """แก้อัตรา (เช่น VAT) ทันที — ไม่มีขั้นยืนยัน/คิวอีกต่อไป ผ่าน create_new_version เสมอ (undo ได้ทีละขั้น — ดู
+    undo_last_edit) เช็ค no-op ก่อนเสมอ (อัตราเดิมอยู่แล้ว -> ไม่สร้างเวอร์ชันเปล่าๆ ตอบกลับตรงๆ แทน) คืน
+    {"matched": bool, "message": str} เสมอ (รูปแบบเดียวกับ edit_chat_document/undo_last_edit)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
-        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
 
     base_bytes, label_map = get_working_copy(doc)
-    pending_queue = get_chat_pending_actions(chat_id)
-    virtual_bytes, virtual_label_map = _replay_pending_queue(base_bytes, label_map, pending_queue)
-
-    if label not in virtual_label_map:
-        suggestions = _suggest_similar_labels(label or "", virtual_label_map)
+    if label not in label_map:
+        suggestions = _suggest_similar_labels(label or "", label_map)
         suggestion_text = f" label ที่ใกล้เคียง: {', '.join(suggestions)}" if suggestions else ""
-        return {"proposed": False, "message": f"ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}'{suggestion_text}"}
+        return {"matched": False, "message": f"ไม่พบ label '{label}' ในไฟล์ '{doc['filename']}'{suggestion_text}"}
 
-    label_info = virtual_label_map[label]
-    new_formula, error = _resolve_rate_formula(virtual_bytes, label_info, new_rate)
-    if error:
-        return {"proposed": False, "message": error}
-
-    candidate_action = {
+    label_info = label_map[label]
+    action = {
         "type": "change_rate", "document_id": document_id, "label": label, "new_rate": new_rate,
         "sheet": label_info["sheet"], "row": label_info["row"], "col": label_info["col"],
     }
-    duplicate_index = _find_duplicate_queue_action(pending_queue, candidate_action)
-    if duplicate_index is not None:
-        return {
-            "proposed": False,
-            "message": f"รายการนี้อยู่ในคิวรอยืนยันแล้วครับ (ข้อ {duplicate_index})\n\n{_describe_pending_queue(pending_queue)}",
-            "queue_count": len(pending_queue),
-        }
+    mutate_fn, error, _ = _resolve_and_build_mutate_fn(action, base_bytes, label_map)
+    if error:
+        return {"matched": False, "message": error}
 
-    mutate_fn = _build_rate_change_mutate_fn(label_info, new_formula, new_rate)
-    _, preview_label_map = _build_document_version(virtual_bytes, virtual_label_map, mutate_fn)
-
+    _, preview_label_map = _build_document_version(base_bytes, label_map, mutate_fn)
     position = _label_position(label_info)
     old_value = label_info["current_value"]
     new_info = _find_label_by_position(preview_label_map, position)
     new_value = new_info["current_value"] if new_info is not None else old_value
-
     if _cell_values_equal(old_value, new_value):
-        return {
-            "proposed": False,
-            "message": f"'{label}' เป็น {_format_rate_number(new_rate)}% อยู่แล้ว (รวมรายการที่รอยืนยัน) ไม่ต้องแก้ครับ",
-            "queue_count": len(pending_queue),
-        }
+        return {"matched": False, "message": f"'{label}' เป็น {_format_rate_number(new_rate)}% อยู่แล้วครับ"}
 
-    side_effects = _label_side_effects(virtual_label_map, preview_label_map, exclude_position=position)
-
-    preview_text = (
-        f"จะเปลี่ยนอัตราของ '{label}' เป็น {_format_rate_number(new_rate)}% "
-        f"— ค่าจะเปลี่ยนจาก {old_value} เป็น {new_value}"
-    )
-    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
-    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
-
-    action = dict(candidate_action, version_id_at_propose=_get_document_version_marker(doc))
-    add_chat_pending_action(chat_id, action, preview_text)
-    return {"proposed": True, "message": preview_text, "queue_count": len(pending_queue) + 1}
+    return _apply_single_queue_item(action, user_id)
 
 
-def propose_update_table_item(document_id: int, user_id: int, chat_id: int, item_no: int, fields: dict) -> dict:
-    """เสนอแก้ค่าคอลัมน์ input ของรายการที่ item_no ในตาราง (preview เท่านั้น ไม่แก้จริงทันที — เปลี่ยนจาก
-    เวอร์ชันก่อนหน้าที่แก้ทันทีไม่ต้องยืนยัน เป็นต้องยืนยันเหมือนรายการอื่นในคิว เพื่อให้ลำดับ/การ re-resolve
-    ของทั้งคิวสม่ำเสมอ) item_no นับจากรายการที่ไม่ว่างรายการแรก = 1 ของ "สถานะเสมือน" หลังจากคิวที่ค้างอยู่
-    ก่อนหน้า (ดู _replay_pending_queue) คอลัมน์ "amount" (จำนวนเงิน) เป็นสูตรเสมอ ห้ามแก้ตรงๆ คืน {"proposed":
-    bool, "message": str, "queue_count": int} เสมอ"""
+def apply_update_table_item(document_id: int, user_id: int, item_no: int, fields: dict) -> dict:
+    """แก้ค่าคอลัมน์ input ของรายการที่ item_no ในตารางทันที — ไม่มีขั้นยืนยัน/คิวอีกต่อไป ผ่าน
+    create_new_version เสมอ (undo ได้) เช็ค no-op ก่อนเสมอ คอลัมน์ "amount" (จำนวนเงิน) เป็นสูตรเสมอ ห้ามแก้ตรงๆ
+    คืน {"matched": bool, "message": str} เสมอ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
-        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
 
     if not fields:
-        return {"proposed": False, "message": "ไม่ได้ระบุค่าที่จะแก้"}
+        return {"matched": False, "message": "ไม่ได้ระบุค่าที่จะแก้"}
     invalid_fields = [k for k in fields if k not in _TABLE_INPUT_FIELDS]
     if invalid_fields:
-        return {"proposed": False, "message": f"แก้คอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
+        return {"matched": False, "message": f"แก้คอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
 
     base_bytes, label_map = get_working_copy(doc)
-    pending_queue = get_chat_pending_actions(chat_id)
-    virtual_bytes, virtual_label_map = _replay_pending_queue(base_bytes, label_map, pending_queue)
-
-    table = _get_single_item_table(virtual_bytes)
+    table = _get_single_item_table(base_bytes)
     if table is None:
-        return {"proposed": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
+        return {"matched": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
 
     filled_rows = [r for r in table["rows"] if not r["is_empty"]]
     if item_no is None or item_no < 1 or item_no > len(filled_rows):
-        return {"proposed": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
+        return {"matched": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
 
     target_row_info = filled_rows[item_no - 1]
     identity = {"row": target_row_info["row"], "description": target_row_info["values"].get("description")}
-
-    candidate_action = {
-        "type": "update_table_item", "document_id": document_id, "fields": fields, "identity": identity,
-    }
-    duplicate_index = _find_duplicate_queue_action(pending_queue, candidate_action)
-    if duplicate_index is not None:
-        return {
-            "proposed": False,
-            "message": f"รายการนี้อยู่ในคิวรอยืนยันแล้วครับ (ข้อ {duplicate_index})\n\n{_describe_pending_queue(pending_queue)}",
-            "queue_count": len(pending_queue),
-        }
 
     all_unchanged = all(
         _cell_values_equal(target_row_info["values"].get(field), value) for field, value in fields.items()
     )
     if all_unchanged:
-        return {
-            "proposed": False,
-            "message": f"รายการที่ {item_no} ({identity['description']}) เป็นค่านี้อยู่แล้ว (รวมรายการที่รอยืนยัน) ไม่ต้องแก้ครับ",
-            "queue_count": len(pending_queue),
-        }
+        return {"matched": False, "message": f"รายการที่ {item_no} ({identity['description']}) เป็นค่านี้อยู่แล้วครับ"}
 
-    def _mutate(wb):
-        ws = wb[table["sheet"]]
-        for field, value in fields.items():
-            col = table["columns"].get(field)
-            if col is None:
-                continue
-            cell = _merged_cell_top_left(ws, ws.cell(row=target_row_info["row"], column=col))
-            cell.value = value
-
-    _, preview_label_map = _build_document_version(virtual_bytes, virtual_label_map, _mutate)
-    side_effects = _label_side_effects(virtual_label_map, preview_label_map)
-
-    changed_fields = [
-        f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} จะเปลี่ยนจาก {target_row_info['values'].get(k)} เป็น {v}"
-        for k, v in fields.items()
-    ]
-    preview_text = f"จะแก้รายการที่ {item_no} ({identity['description']}): " + " / ".join(changed_fields)
-    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
-    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
-
-    action = dict(candidate_action, version_id_at_propose=_get_document_version_marker(doc))
-    add_chat_pending_action(chat_id, action, preview_text)
-    return {"proposed": True, "message": preview_text, "queue_count": len(pending_queue) + 1}
+    action = {"type": "update_table_item", "document_id": document_id, "fields": fields, "identity": identity}
+    return _apply_single_queue_item(action, user_id)
 
 
-def propose_delete_table_item(document_id: int, user_id: int, chat_id: int, item_no: int) -> dict:
-    """เสนอลบรายการที่ item_no (preview เท่านั้น ไม่ลบจริง) — คำนวณต่อจากคิวที่ค้างอยู่ก่อนหน้าเหมือน
-    propose_change_rate คืน {"proposed": bool, "message": str, "queue_count": int} เสมอ"""
+def apply_delete_table_item(document_id: int, user_id: int, item_no: int) -> dict:
+    """ลบรายการที่ item_no ในตารางทันที (รายการถัดไปจะเลื่อนขึ้นมาแทน) — ไม่มีขั้นยืนยัน/คิวอีกต่อไป ผ่าน
+    create_new_version เสมอ (undo ได้) คืน {"matched": bool, "message": str} เสมอ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
-        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
 
     base_bytes, label_map = get_working_copy(doc)
-    pending_queue = get_chat_pending_actions(chat_id)
-    virtual_bytes, virtual_label_map = _replay_pending_queue(base_bytes, label_map, pending_queue)
-
-    table = _get_single_item_table(virtual_bytes)
+    table = _get_single_item_table(base_bytes)
     if table is None:
-        return {"proposed": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
-    if _table_has_non_formula_amount_value(table):
-        return {"proposed": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
+        return {"matched": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
 
     filled_rows = [r for r in table["rows"] if not r["is_empty"]]
     if item_no is None or item_no < 1 or item_no > len(filled_rows):
-        return {"proposed": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
+        return {"matched": False, "message": f"ไม่พบรายการที่ {item_no} ในตาราง (มีทั้งหมด {len(filled_rows)} รายการ)"}
 
     target_row_info = filled_rows[item_no - 1]
     identity = {"row": target_row_info["row"], "description": target_row_info["values"].get("description")}
-    item_summary = _describe_table_item(target_row_info)
 
-    candidate_action = {"type": "delete_table_item", "document_id": document_id, "identity": identity}
-    duplicate_index = _find_duplicate_queue_action(pending_queue, candidate_action)
-    if duplicate_index is not None:
-        return {
-            "proposed": False,
-            "message": f"รายการนี้อยู่ในคิวรอยืนยันแล้วครับ (ข้อ {duplicate_index})\n\n{_describe_pending_queue(pending_queue)}",
-            "queue_count": len(pending_queue),
-        }
-
-    mutate_fn = _build_delete_table_item_mutate_fn(table, filled_rows, item_no)
-    _, preview_label_map = _build_document_version(virtual_bytes, virtual_label_map, mutate_fn)
-    side_effects = _label_side_effects(virtual_label_map, preview_label_map)
-
-    preview_text = f"จะลบรายการที่ {item_no} ({item_summary})"
-    if item_no < len(filled_rows):
-        preview_text += f" รายการ {item_no + 1}–{len(filled_rows)} จะเลื่อนขึ้นมาแทน"
-    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
-    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
-
-    action = dict(candidate_action, version_id_at_propose=_get_document_version_marker(doc))
-    add_chat_pending_action(chat_id, action, preview_text)
-    return {"proposed": True, "message": preview_text, "queue_count": len(pending_queue) + 1}
+    action = {"type": "delete_table_item", "document_id": document_id, "identity": identity}
+    return _apply_single_queue_item(action, user_id)
 
 
-def propose_add_table_item(document_id: int, user_id: int, chat_id: int, fields: dict) -> dict:
-    """เสนอเพิ่มรายการใหม่ในแถวว่างแรกของตาราง (preview เท่านั้น ไม่เพิ่มจริง) — คำนวณต่อจากคิวที่ค้างอยู่ก่อน
-    หน้าเหมือน propose_change_rate ตารางเต็มแล้ว (นับรวมผลของคิวที่ค้างอยู่ด้วย) -> ไม่เสนอ ไม่ต่อคิวเลย
-    รายงานตรงๆ ทันที คืน {"proposed": bool, "message": str, "queue_count": int} เสมอ"""
+def apply_add_table_item(document_id: int, user_id: int, fields: dict) -> dict:
+    """เพิ่มรายการใหม่ในแถวว่างแรกของตารางทันที — ไม่มีขั้นยืนยัน/คิวอีกต่อไป ผ่าน create_new_version เสมอ (undo
+    ได้) ตารางเต็มแล้ว -> ไม่เพิ่ม รายงานตรงๆ ทันที คืน {"matched": bool, "message": str} เสมอ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
-        return {"proposed": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
+        return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
 
     if not fields:
-        return {"proposed": False, "message": "ไม่ได้ระบุรายการที่จะเพิ่ม"}
+        return {"matched": False, "message": "ไม่ได้ระบุรายการที่จะเพิ่ม"}
     invalid_fields = [k for k in fields if k not in _TABLE_INPUT_FIELDS]
     if invalid_fields:
-        return {"proposed": False, "message": f"ระบุคอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
+        return {"matched": False, "message": f"ระบุคอลัมน์ {', '.join(invalid_fields)} ไม่ได้ (เป็นคอลัมน์สูตรหรือไม่รู้จัก)"}
 
-    base_bytes, label_map = get_working_copy(doc)
-    pending_queue = get_chat_pending_actions(chat_id)
-    virtual_bytes, virtual_label_map = _replay_pending_queue(base_bytes, label_map, pending_queue)
-
-    table = _get_single_item_table(virtual_bytes)
-    if table is None:
-        return {"proposed": False, "message": f"ไม่พบตารางรายการในไฟล์ '{doc['filename']}'"}
-    if _table_has_non_formula_amount_value(table):
-        return {"proposed": False, "message": _TABLE_NON_FORMULA_AMOUNT_ERROR}
-
-    capacity = table["last_row"] - table["first_row"] + 1
-    empty_row = next((r for r in table["rows"] if r["is_empty"]), None)
-    if empty_row is None:
-        return {"proposed": False, "message": f"ตารางเต็มแล้ว ({capacity} แถว) เพิ่มไม่ได้ครับ"}
-
-    candidate_action = {"type": "add_table_item", "document_id": document_id, "fields": fields}
-    duplicate_index = _find_duplicate_queue_action(pending_queue, candidate_action)
-    if duplicate_index is not None:
-        return {
-            "proposed": False,
-            "message": f"รายการนี้อยู่ในคิวรอยืนยันแล้วครับ (ข้อ {duplicate_index})\n\n{_describe_pending_queue(pending_queue)}",
-            "queue_count": len(pending_queue),
-        }
-
-    mutate_fn = _build_add_table_item_mutate_fn(table, empty_row["row"], fields)
-    _, preview_label_map = _build_document_version(virtual_bytes, virtual_label_map, mutate_fn)
-    side_effects = _label_side_effects(virtual_label_map, preview_label_map)
-
-    field_summary = ", ".join(f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={v}" for k, v in fields.items())
-    preview_text = f"จะเพิ่มรายการใหม่ ({field_summary}) ที่แถวว่างแรกของตาราง"
-    preview_text += _format_side_effect_lines(side_effects, "จะเปลี่ยน")
-    preview_text += "\n\nพิมพ์ 'ยืนยัน' เพื่อดำเนินการ หรือ 'ยกเลิก'"
-
-    action = dict(candidate_action, version_id_at_propose=_get_document_version_marker(doc))
-    add_chat_pending_action(chat_id, action, preview_text)
-    return {"proposed": True, "message": preview_text, "queue_count": len(pending_queue) + 1}
+    action = {"type": "add_table_item", "document_id": document_id, "fields": fields}
+    return _apply_single_queue_item(action, user_id)
 
 
 def _apply_single_queue_item(action: dict, user_id: int) -> dict:
-    """ทำ pending action 1 รายการจริง (ไม่ว่าจะเป็น change_rate/update/delete/add_table_item) ผ่าน
-    create_new_version เสมอ (undo ได้ ทีละขั้น) — re-resolve เป้าหมายใหม่จากสำเนาทำงานปัจจุบันเสมอ (ดู
-    _resolve_and_build_mutate_fn) ไม่พึ่งตำแหน่ง/เลขรายการที่บันทึกไว้ตอนเสนอตรงๆ (คิวทำให้โครงสร้างเปลี่ยนไป
-    ระหว่างทางได้จากรายการก่อนหน้าที่ apply ไปแล้วจริง) หาเป้าหมายไม่เจอ/ไม่ตรงแล้ว -> ข้ามรายการนี้ไปเลย (ไม่
-    raise ไม่แก้ไฟล์ผิดจุด) คืน {"matched": bool, "message": str} เสมอ"""
+    """ทำการแก้โครงสร้าง 1 รายการจริง (ไม่ว่าจะเป็น change_rate/update/delete/add_table_item) ผ่าน
+    create_new_version เสมอ (undo ได้ทีละขั้น) — re-resolve เป้าหมายจากสำเนาทำงานปัจจุบันเสมอ (ดู
+    _resolve_and_build_mutate_fn แทนที่จะพึ่งตำแหน่ง/เลขรายการที่ caller ส่งมาตรงๆ — ทนทานกว่า เช่น update
+    description หลังจากตารางเพิ่งถูกแก้แถวอื่นไปก่อนหน้าในคำสั่งเดียวกัน) เรียกจาก apply_change_rate และเพื่อน
+    เท่านั้น (ชื่อฟังก์ชันเหลือไว้จากยุคที่ยังมีคิว pending action จริงๆ) หาเป้าหมายไม่เจอ/ไม่ตรง -> คืน
+    {"matched": False, ...} (ไม่ raise ไม่แก้ไฟล์ผิดจุด) คืน {"matched": bool, "message": str} เสมอ"""
     document_id = action.get("document_id")
     doc = get_editable_document(document_id, user_id)
     if doc is None:
@@ -7276,106 +7147,86 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
         message = "ทำรายการนี้เรียบร้อยแล้ว"
 
     message += _format_side_effect_lines(side_effects, "เปลี่ยน")
-    return {"matched": True, "message": message}
+
+    message_lines = [message] + _document_totals_lines(document_id) + ["", _UNDO_HINT_LINE]
+    return {"matched": True, "message": "\n".join(message_lines)}
 
 
-def _apply_pending_queue(items: list[dict], user_id: int, chat_id: int) -> str:
-    """apply รายการในคิวตามลำดับ (เก่า->ใหม่) ทีละรายการเป็นเวอร์ชันของตัวเอง (undo ทีละขั้นได้) ลบออกจากคิว
-    ทันทีไม่ว่าจะสำเร็จหรือไม่ (ไม่ค้างให้พยายามซ้ำ) คืนข้อความสรุปทุกบรรทัด (✓/✗ จากโค้ดล้วนๆ) + ยอดล่าสุด
-    (label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ) หลังทำครบทุกรายการ
+def _document_totals_lines(document_id: int) -> list[str]:
+    """คืนบรรทัด "ยอดล่าสุด:" + label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ (เช่น รวมเงิน/ภาษีมูลค่าเพิ่ม/รวมราคาทั้งสิ้น)
+    ของสถานะปัจจุบันจริงของเอกสารนี้หลังแก้เสร็จ — list ว่างถ้าไม่มี label แบบนั้นเลยหรือหาเอกสารไม่เจอ (ไม่
+    error) ใช้ต่อท้ายข้อความผลลัพธ์ของการแก้โครงสร้างทุกจุด (ดู _apply_structural_commands)"""
+    doc = get_editable_document_raw(document_id)
+    if doc is None:
+        return []
+    data = read_document_values(doc)
+    totals = [
+        f"- {l['label']}: {l['value']}" for l in data["labels"]
+        if "รวม" in l["label"] or "ภาษี" in l["label"]
+    ]
+    if not totals:
+        return []
+    return ["", "ยอดล่าสุด:"] + totals
 
-    items อาจเป็นแค่ "บางส่วน" ของคิวทั้งหมด (เช่น confirm_latest ที่ apply แค่รายการสุดท้าย) — รายการอื่นที่เหลือ
-    ค้างอยู่ในคิวของแชทนี้ (ไม่ได้อยู่ใน items) ต้องขยับ version_id_at_propose ของมันตามไปด้วยทุกครั้งที่ apply
-    สำเร็จจริง (เอกสารขยับเวอร์ชัน) ไม่งั้น _pending_queue_baseline_valid รอบถัดไปจะเข้าใจผิดว่ามีการแก้นอกคิว
-    แทรกเข้ามา ทั้งที่จริงคือ apply รายการอื่นในคิวเดียวกันตามปกติ (บั๊กจริงที่เจอจาก review: confirm_latest แล้ว
-    confirm_single รายการที่เหลือไม่ได้เลย คิวถูกล้างทิ้งทั้งที่ไม่มีอะไรแทรกจากนอกคิวเลย)"""
-    if not items:
-        return "ไม่มีรายการรอยืนยันแล้วครับ"
 
-    applying_ids = {item["id"] for item in items}
+_UNDO_HINT_LINE = "พิมพ์ 'ย้อนการแก้' ถ้าต้องการยกเลิก"
+
+
+def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: list[dict]) -> str:
+    """apply คำสั่งแก้โครงสร้างที่ parse ได้จากข้อความเดียว (ดู _parse_direct_structural_commands — อาจมีมากกว่า
+    1 คำสั่ง เช่น "เปลี่ยน VAT เป็น 10% และลบรายการที่ 3") ทีละคำสั่งตามลำดับ แต่ละคำสั่งเป็นเวอร์ชันแยกของตัวเอง
+    (undo ทีละขั้นได้ — ย้อนครั้งเดียวย้อนแค่คำสั่งสุดท้าย ไม่ใช่ทั้งชุด) ต่อท้ายด้วยยอดล่าสุด (ถ้ามี) และคำแนะนำ
+    "ย้อนการแก้" ครั้งเดียวท้ายสุดเสมอ ไม่ว่าจะมีกี่คำสั่งก็ตาม — ใช้โดย ask_question() เท่านั้น (เส้นทาง direct
+    parse — เส้นทาง agent/tool เรียก apply_change_rate และเพื่อนตรงๆ ทีละตัวแทน ไม่ผ่านฟังก์ชันนี้)"""
     lines = []
-    last_document_id = None
-    for item in items:
-        action = item["action"]
-        last_document_id = action.get("document_id")
-        result = _apply_single_queue_item(action, user_id)
-        delete_chat_pending_action(item["id"])
+    for command in parsed_commands:
+        command_type = command["type"]
+        if command_type == "change_rate":
+            result = apply_change_rate(document_id, user_id, command["label"], command["new_rate"])
+        elif command_type == "delete_table_item":
+            result = apply_delete_table_item(document_id, user_id, command["item_no"])
+        elif command_type == "update_table_item":
+            result = apply_update_table_item(document_id, user_id, command["item_no"], command["fields"])
+        else:
+            result = {"matched": False, "message": "คำสั่งนี้ไม่รองรับ"}
         mark = "✓" if result.get("matched") else "✗"
         first_line = (result.get("message") or "").splitlines()[0] if result.get("message") else ""
         lines.append(f"{mark} {first_line}")
 
-        if result.get("matched"):
-            current_doc = get_editable_document_raw(last_document_id)
-            new_marker = _get_document_version_marker(current_doc) if current_doc is not None else None
-            if new_marker is not None:
-                for remaining in get_chat_pending_actions(chat_id):
-                    if remaining["id"] in applying_ids:
-                        continue  # รายการอื่นในชุด apply เดียวกันนี้ จะถูกจัดการ/ลบในลูปนี้เองอยู่แล้ว
-                    if remaining["action"].get("document_id") != last_document_id:
-                        continue
-                    if remaining["action"].get("version_id_at_propose") != new_marker:
-                        update_chat_pending_action_version(remaining["id"], new_marker)
-
-    if last_document_id is not None:
-        final_doc = get_editable_document_raw(last_document_id)
-        if final_doc is not None:
-            data = read_document_values(final_doc)
-            totals_lines = [
-                f"- {l['label']}: {l['value']}" for l in data["labels"]
-                if "รวม" in l["label"] or "ภาษี" in l["label"]
-            ]
-            if totals_lines:
-                lines.append("")
-                lines.append("ยอดล่าสุด:")
-                lines.extend(totals_lines)
-
+    lines.extend(_document_totals_lines(document_id))
+    lines.append("")
+    lines.append(_UNDO_HINT_LINE)
     return "\n".join(lines)
 
 
-def _pending_queue_baseline_valid(pending_queue: list[dict], user_id: int) -> bool:
-    """เช็คว่าตั้งแต่รายการแรกในคิวถูกเสนอ ไม่มีอะไรมาแก้ไฟล์แทรกจากนอกคิวเลย (เช่น undo, หรือทางอื่นที่ไม่ผ่าน
-    คิว) — เทียบ version_id_at_propose ของรายการแรก (เก่าสุด) ในคิวกับเวอร์ชันปัจจุบันจริง เนื่องจากรายการทุก
-    รายการในคิวที่ยังไม่ถูกยืนยันจะมี version_id_at_propose เดียวกันเสมอตามปกติ (ไม่มีอะไรถูก apply จริงเลย
-    จนกว่าจะยืนยัน) ค่าที่ไม่ตรงกันจึงหมายถึงมีการแก้จากนอกคิวแทรกเข้ามาจริง"""
-    if not pending_queue:
-        return True
-    first_action = pending_queue[0]["action"]
-    document_id = first_action.get("document_id")
-    doc = get_editable_document_raw(document_id)
-    if doc is None:
-        return False
-    return _get_document_version_marker(doc) == first_action.get("version_id_at_propose")
+def _resolve_direct_structural_dispatch(
+    query: str, active_docs: list[dict], chat_id: int, user_id: int
+) -> Optional[dict]:
+    """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งแก้โครงสร้างที่ชัดเจนได้ไหม (ไม่ต้องพึ่ง _is_structural_edit_command
+    เลยสักนิด) แล้ว apply ทันทีถ้าใช่ — แยกออกมาจาก ask_question() เป็นฟังก์ชันเดี่ยวๆ เพื่อให้ทดสอบ "ระดับ
+    routing" ได้โดยไม่ต้องพึ่ง FastAPI/Request จริง (ดู review PR #31 — เดิม direct parse ถูกเรียกเฉพาะเมื่อ
+    _is_structural_edit_command(query) เป็น True เท่านั้น ทำให้คำสั่งที่ parse ได้ชัดเจนมากอย่าง "เปลี่ยน Box
+    4x4 เป็น 7x7"/"เปลี่ยนจำนวน Box 4x4 เป็น 30" ไม่เคยถูกลองเลยสักครั้ง เพราะไม่มีคำที่
+    _is_structural_edit_command รู้จัก — ต้องลอง parse ก่อนเช็ค gate นั้นเสมอ)
 
+    เป้าหมาย: เอกสารที่โฟกัสอยู่ในแชทนี้ หรือเปิดอยู่ไฟล์เดียวพอดี (ไม่มีทั้งสองอย่าง — เช่น เปิดหลายไฟล์พร้อมกัน
+    ไม่มีโฟกัส — ถือว่ากำกวมเกินจะเดา ไม่ลอง parse เลย คืน None ทันที)
 
-def _handle_pending_queue_command(command: str, pending_queue: list[dict], user_id: int, chat_id: int) -> str:
-    """จัดการคำสั่งต่อคิว pending action (confirm_all/confirm_latest/confirm_single/cancel_latest/cancel_all —
-    ดู _classify_pending_queue_command) ยกเลิกทำได้เสมอไม่ต้องเช็คอะไรเพิ่ม ส่วนยืนยัน (ทุกแบบ) ต้องเช็คก่อนว่า
-    ไม่มีการแก้/undo จากนอกคิวแทรกเข้ามา (ดู _pending_queue_baseline_valid) ถ้าไม่ตรง ล้างคิวทั้งหมดทิ้งแล้วแจ้ง
-    ผู้ใช้แทนที่จะเสี่ยงแก้ทับของเก่าที่ไม่ตรงกับ preview ที่เคยโชว์ไปแล้ว"""
-    if command == "cancel_all":
-        clear_chat_pending_actions(chat_id)
-        return "ยกเลิกการแก้ไขที่ค้างอยู่ทั้งหมดแล้วครับ"
+    คืน {"document_id":, "answer":} ถ้า parse ได้และ apply จริงไปแล้ว (เรียก _apply_structural_commands จริง —
+    ไฟล์ถูกแก้แล้ว) หรือ None ถ้าไม่มีเอกสารเป้าหมายชัดเจน หรือ parse ไม่ได้เลย (ให้ ask_question() ปล่อยตกไป
+    ทำงานปกติ — เช็ค _is_structural_edit_command/classifier/agent ต่อเหมือนเดิมทุกประการ)"""
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    direct_target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    if direct_target_doc is None:
+        return None
 
-    if command == "cancel_latest":
-        delete_chat_pending_action(pending_queue[-1]["id"])
-        return "ยกเลิกรายการล่าสุดที่ค้างอยู่แล้วครับ"
+    base_bytes, label_map = get_working_copy(direct_target_doc)
+    commands = _parse_direct_structural_commands(query, base_bytes, label_map)
+    if commands is None:
+        return None
 
-    if not _pending_queue_baseline_valid(pending_queue, user_id):
-        clear_chat_pending_actions(chat_id)
-        return "เอกสารเปลี่ยนไปหลังจากเสนอการแก้ไขในคิว กรุณาสั่งใหม่อีกครั้งครับ"
-
-    if command == "confirm_single":
-        if len(pending_queue) == 1:
-            return _apply_pending_queue(pending_queue, user_id, chat_id)
-        return _describe_pending_queue(pending_queue)
-
-    if command == "confirm_latest":
-        return _apply_pending_queue([pending_queue[-1]], user_id, chat_id)
-
-    if command == "confirm_all":
-        return _apply_pending_queue(pending_queue, user_id, chat_id)
-
-    return "คำสั่งนี้ไม่รองรับแล้ว กรุณาลองสั่งใหม่อีกครั้งครับ"
+    answer = _apply_structural_commands(direct_target_doc["id"], user_id, commands)
+    return {"document_id": direct_target_doc["id"], "answer": answer}
 
 
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:

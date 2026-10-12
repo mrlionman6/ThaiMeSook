@@ -334,17 +334,22 @@ def test_resolve_preview_mode_bytes_pending_with_queue_replays_virtually(ns):
     assert _cell_text(window, 27, 7) == "5,815.00"
 
 
-def test_preview_after_propose_change_rate_pending_vs_current(ns):
-    """สถานการณ์เต็ม (เทียบเท่าสิ่งที่ endpoint preview ทำจริงทั้งสอง mode): propose เปลี่ยน VAT เป็น 10% (ยังไม่
-    ยืนยัน) -> mode=pending ต้องเห็นค่าใหม่ (5,815.00) พร้อมไฮไลต์ว่าเปลี่ยน / mode=current ต้องยังเป็นค่าเดิม
-    (4,070.50) เป๊ะ ไม่ถูกกระทบเลยจนกว่าจะยืนยันจริง"""
+def test_preview_pending_vs_current_with_queued_change_rate(ns):
+    """สถานการณ์เต็ม (เทียบเท่าสิ่งที่ endpoint preview ทำจริงทั้งสอง mode): มีรายการค้างอยู่ในคิว pending action
+    (ฟีเจอร์ขั้นยืนยันถูกถอดออกจาก ask_question แล้ว — ไม่มีใครต่อคิวนี้อีกต่อไปในทางปฏิบัติ แต่กลไก
+    mode="pending" ของ preview ยังรองรับอยู่เสมอ ดู _resolve_preview_mode_bytes — จำลองรายการในคิวตรงๆ ผ่าน
+    fake_db แทนการเรียก propose_* ซึ่งถูกลบไปแล้ว) เปลี่ยน VAT เป็น 10% (ยังไม่ยืนยัน) -> mode=pending ต้องเห็น
+    ค่าใหม่ (5,815.00) พร้อมไฮไลต์ว่าเปลี่ยน / mode=current ต้องยังเป็นค่าเดิม (4,070.50) เป๊ะ"""
     fake_db = ns["_fake_db"]
     raw = _build_quote_workbook()
     label_map = ns["_extract_excel_labels"](raw)
     fake_db.add_document(1, "quote.xlsx", raw, label_map, chat_id=1, user_id=1)
 
-    propose_result = ns["propose_change_rate"](1, 1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
-    assert propose_result["proposed"] is True
+    vat_info = label_map["ภาษีมูลค่าเพิ่ม 7%"]
+    fake_db.add_chat_pending_action(1, {
+        "type": "change_rate", "document_id": 1, "label": "ภาษีมูลค่าเพิ่ม 7%", "new_rate": 10,
+        "sheet": vat_info["sheet"], "row": vat_info["row"], "col": vat_info["col"],
+    }, "จะเปลี่ยนอัตราของ 'ภาษีมูลค่าเพิ่ม 7%' เป็น 10%")
 
     doc = fake_db.get_editable_document_raw(1)
     base_bytes, base_label_map = ns["get_working_copy"](doc)
