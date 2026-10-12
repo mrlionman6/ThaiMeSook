@@ -40,6 +40,22 @@
         </div>
     </aside>
 
+    <!-- พื้นหลังมืดตอนแผง preview เอกสารเปิด (ทุกขนาดจอ — ดู style.css) -->
+    <div id="docPreviewBackdrop" hidden></div>
+
+    <!-- แผง preview เอกสาร Excel (ขวา กว้างกว่าแผงไฟล์ — เปิดจากการคลิกไฟล์ในแผงไฟล์ ดู openDocPreview ใน script.js) -->
+    <aside id="docPreviewDrawer" aria-hidden="true">
+        <div class="doc-preview-header">
+            <h3 id="docPreviewTitle"></h3>
+            <button id="docPreviewCloseBtn" aria-label="ปิด preview">✕</button>
+        </div>
+        <div id="docPreviewSheetTabs" class="doc-preview-sheet-tabs" hidden></div>
+        <div id="docPreviewBody" class="doc-preview-body"></div>
+        <div class="doc-preview-footer">
+            <button type="button" id="docPreviewLoadMoreBtn" class="button_base_1" hidden>โหลดเพิ่ม</button>
+        </div>
+    </aside>
+
     <!-- Sidebar -->
     <nav id="sideMenu" aria-hidden="true">
         <div class="side-top">

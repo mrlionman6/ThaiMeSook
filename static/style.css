@@ -1987,3 +1987,160 @@ button {
     color: #b42318;
     border-color: #f3c6c2;
 }
+
+.file-card-name-clickable {
+    cursor: pointer;
+}
+
+.file-card-name-clickable:hover {
+    text-decoration: underline;
+}
+
+/* ---------- Preview เอกสาร Excel (ขวา กว้างกว่าแผงไฟล์ — ดู openDocPreview ใน script.js) ---------- */
+#docPreviewBackdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.35);
+    z-index: 30;
+    display: none;
+}
+
+#docPreviewBackdrop:not([hidden]) {
+    display: block;
+}
+
+#docPreviewDrawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100%;
+    width: 900px;
+    max-width: 90vw;
+    box-sizing: border-box;
+    background: white;
+    border-left: 2px solid var(--color-sky);
+    z-index: 31;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: translateX(100%);
+    transition: transform 0.2s ease;
+}
+
+#docPreviewDrawer.open {
+    transform: translateX(0);
+}
+
+@media (max-width: 768px) {
+    #docPreviewDrawer {
+        width: 100vw;
+        max-width: 100vw;
+        border-left: none;
+    }
+}
+
+.doc-preview-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px;
+    border-bottom: 1px solid #eee;
+    gap: 10px;
+}
+
+.doc-preview-header h3 {
+    margin: 0;
+    font-size: 16px;
+    overflow-wrap: anywhere;
+}
+
+#docPreviewCloseBtn {
+    background: none;
+    border: none;
+    font-size: 16px;
+    cursor: pointer;
+    padding: 4px 8px;
+    flex-shrink: 0;
+}
+
+.doc-preview-sheet-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 8px 16px 0;
+    overflow-x: auto;
+    flex-shrink: 0;
+}
+
+.doc-preview-sheet-tab {
+    font-size: 13px;
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    background: #fafafa;
+    color: #555;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.doc-preview-sheet-tab.active {
+    background: white;
+    color: var(--color-primary);
+    font-weight: bold;
+    border-color: var(--color-sky);
+}
+
+.doc-preview-body {
+    flex: 1;
+    overflow: auto;
+    box-sizing: border-box;
+    padding: 0;
+}
+
+.doc-preview-footer {
+    border-top: 1px solid #eee;
+    padding: 12px 16px;
+    flex-shrink: 0;
+}
+
+#docPreviewLoadMoreBtn {
+    width: 100%;
+    font-size: 13px;
+    padding: 8px;
+}
+
+.doc-preview-table {
+    border-collapse: collapse;
+    font-size: 12px;
+    white-space: pre-wrap;
+}
+
+.doc-preview-cell {
+    border: 1px solid #e5e5e5;
+    padding: 3px 6px;
+    vertical-align: top;
+    overflow-wrap: anywhere;
+}
+
+.doc-preview-cell-bold {
+    font-weight: bold;
+}
+
+.doc-preview-cell-uncomputable {
+    color: #999;
+    cursor: help;
+}
+
+.doc-preview-cell-changed {
+    background: #fff3b0 !important;
+    cursor: help;
+}
+
+.doc-preview-align-left { text-align: left; }
+.doc-preview-align-center { text-align: center; }
+.doc-preview-align-right { text-align: right; }
+
+.doc-preview-border-top { border-top: 1.5px solid #888; }
+.doc-preview-border-bottom { border-bottom: 1.5px solid #888; }
+.doc-preview-border-left { border-left: 1.5px solid #888; }
+.doc-preview-border-right { border-right: 1.5px solid #888; }

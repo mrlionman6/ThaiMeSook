@@ -607,6 +607,10 @@ function renderFilesPanel(state) {
     }
 
     documents.forEach(doc => body.appendChild(buildFileCard(doc)));
+
+    // แผงไฟล์รีเฟรชทุกครั้งที่มีคำตอบใหม่/แก้ไฟล์/คิวเปลี่ยน (ดูจุดเรียก loadChatFilesPanel ทั้งหมด) — ใช้จุด
+    // เดียวกันนี้รีเฟรช preview ที่เปิดค้างอยู่ด้วยเลย (ถ้ามี) กันข้อมูลเก่าค้างจอหลังแก้ไฟล์ที่กำลังดูอยู่
+    refreshDocPreviewIfOpen();
 }
 
 // สร้างการ์ดไฟล์ 1 ใบด้วย DOM API ล้วนๆ (textContent เท่านั้น) — ห้ามประกอบ innerHTML จากข้อมูลที่มาจาก
@@ -616,8 +620,10 @@ function buildFileCard(doc) {
     card.className = "file-card";
 
     const nameRow = document.createElement("div");
-    nameRow.className = "file-card-name";
+    nameRow.className = "file-card-name file-card-name-clickable";
     nameRow.textContent = doc.filename;
+    nameRow.title = "คลิกเพื่อดูไฟล์";
+    nameRow.onclick = () => openDocPreview(doc.document_id, doc.filename);
     card.appendChild(nameRow);
 
     const metaParts = [];
@@ -675,6 +681,13 @@ function buildFileCard(doc) {
     const actions = document.createElement("div");
     actions.className = "file-card-actions";
 
+    const previewBtn = document.createElement("button");
+    previewBtn.type = "button";
+    previewBtn.className = "file-card-btn";
+    previewBtn.textContent = "ดูไฟล์";
+    previewBtn.onclick = () => openDocPreview(doc.document_id, doc.filename);
+    actions.appendChild(previewBtn);
+
     const downloadBtn = document.createElement("a");
     downloadBtn.className = "file-card-btn";
     downloadBtn.textContent = "ดาวน์โหลด";
@@ -729,6 +742,194 @@ function handleCloseFromPanel(documentId, filename) {
         },
         { confirmText: "ปิดไฟล์" }
     );
+}
+
+// =====================================================================
+// Preview เอกสาร Excel ในแท็บด้านขวา (read-only — ดู GET /api/excel-editor/{id}/preview ฝั่ง backend)
+// เปิดจากการคลิกไฟล์ในแผงไฟล์ (ชื่อไฟล์ หรือปุ่ม "ดูไฟล์" — ดู buildFileCard ด้านบน)
+// =====================================================================
+const DOC_PREVIEW_PAGE_SIZE = 100;
+
+// null เมื่อแผงปิดอยู่ — มีค่าตอนเปิดแผง เก็บชีตที่เลือกอยู่ + แถวที่สะสมโหลดมาแล้วทั้งหมดของชีตนั้น (โหลดเพิ่ม
+// ทีละหน้า ต่อท้ายสะสมไว้ ไม่ใช่แทนที่ — สลับชีตถึงจะรีเซ็ตกลับไปแถว 1 ใหม่) เรียก mode=current เสมอ (ไม่มีขั้น
+// ยืนยันแล้ว ทุกการแก้ทำทันที — ไม่มี "หลังยืนยัน" ให้สลับดูอีกต่อไป backend ยังรองรับ mode=pending อยู่ ไม่ได้ลบ
+// แค่ frontend ไม่เรียกใช้)
+let docPreviewState = null;
+
+function openDocPreview(documentId, filename) {
+    docPreviewState = {
+        documentId, filename, sheet: null,
+        rows: [], columnWidths: [], merges: [], usedCols: 0, hasMore: false, nextStartRow: 1,
+        sheets: [],
+    };
+    document.getElementById("docPreviewTitle").textContent = filename;
+    document.getElementById("docPreviewDrawer").classList.add("open");
+    document.getElementById("docPreviewDrawer").setAttribute("aria-hidden", "false");
+    document.getElementById("docPreviewBackdrop").hidden = false;
+    fetchDocPreviewPage(true);
+}
+
+function closeDocPreview() {
+    document.getElementById("docPreviewDrawer").classList.remove("open");
+    document.getElementById("docPreviewDrawer").setAttribute("aria-hidden", "true");
+    document.getElementById("docPreviewBackdrop").hidden = true;
+    docPreviewState = null;
+}
+
+// reset=true: ล้างแถวที่สะสมไว้ทิ้งแล้วเริ่มใหม่จากแถว 1 (สลับชีต หรือรีเฟรชเพราะไฟล์อาจเปลี่ยนไปแล้ว — ดู
+// refreshDocPreviewIfOpen) reset=false: ต่อท้ายแถวที่มีอยู่แล้ว (ปุ่ม "โหลดเพิ่ม")
+async function fetchDocPreviewPage(reset) {
+    if (!docPreviewState) return;
+    const state = docPreviewState;
+    if (reset) {
+        state.rows = [];
+        state.nextStartRow = 1;
+    }
+
+    const params = new URLSearchParams({
+        start_row: String(state.nextStartRow),
+        max_rows: String(DOC_PREVIEW_PAGE_SIZE),
+        mode: "current",
+    });
+    if (state.sheet) params.set("sheet", state.sheet);
+
+    let data;
+    try {
+        const res = await fetch(`/api/excel-editor/${state.documentId}/preview?${params}`);
+        data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+    } catch (error) {
+        // docPreviewState !== state เช็คด้านล่างกันกรณีปิด/สลับไฟล์ไปแล้วระหว่างรอ fetch อยู่ — แต่ error เกิดก่อน
+        // เช็คนั้นได้ ต้องเช็ค docPreviewState ยังเป็นแผงที่เปิดอยู่จริง (ไม่ null) ก่อนจะแตะ DOM
+        if (docPreviewState === state) {
+            document.getElementById("docPreviewBody").textContent = "⚠️ โหลด preview ไม่สำเร็จ: " + error;
+        }
+        return;
+    }
+    if (docPreviewState !== state) return; // ปิด/สลับไฟล์ไปแล้วระหว่างรอผล ทิ้งผลนี้ไป ไม่แสดงทับของใหม่
+
+    state.sheet = data.sheet;
+    state.sheets = data.sheets;
+    state.usedCols = data.used_cols;
+    state.columnWidths = data.column_widths;
+    state.merges = data.merges;
+    state.hasMore = data.has_more;
+    state.nextStartRow = data.end_row + 1;
+    state.rows = reset ? data.rows : state.rows.concat(data.rows);
+
+    renderDocPreview();
+}
+
+function switchDocPreviewSheet(sheetName) {
+    if (!docPreviewState || docPreviewState.sheet === sheetName) return;
+    docPreviewState.sheet = sheetName;
+    fetchDocPreviewPage(true);
+}
+
+// รีเฟรช preview ที่เปิดอยู่ (ถ้ามี) — เรียกจากกลไก refresh เดิมของแผงไฟล์ทุกจุด (ดู renderFilesPanel) และตอน
+// กลับมาที่แท็บนี้ (ดู visibilitychange ด้านล่าง) รีเซ็ตกลับไปแถว 1 เสมอ (ไม่ใช่แค่ต่อท้าย) เพราะการแก้โครงสร้าง
+// (เช่นลบ/เพิ่มรายการ) อาจทำให้แถวที่เคยโหลดไว้ก่อนหน้าไม่ตรงกับของจริงอีกต่อไป
+function refreshDocPreviewIfOpen() {
+    if (!docPreviewState) return;
+    fetchDocPreviewPage(true);
+}
+
+document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshDocPreviewIfOpen();
+});
+
+document.getElementById("docPreviewCloseBtn").addEventListener("click", closeDocPreview);
+document.getElementById("docPreviewBackdrop").addEventListener("click", closeDocPreview);
+document.getElementById("docPreviewLoadMoreBtn").addEventListener("click", () => fetchDocPreviewPage(false));
+
+function renderDocPreview() {
+    const state = docPreviewState;
+    if (!state) return;
+
+    const tabsEl = document.getElementById("docPreviewSheetTabs");
+    tabsEl.innerHTML = "";
+    tabsEl.hidden = state.sheets.length <= 1;
+    state.sheets.forEach(s => {
+        const tab = document.createElement("button");
+        tab.type = "button";
+        tab.className = "doc-preview-sheet-tab" + (s.name === state.sheet ? " active" : "");
+        tab.textContent = s.name;
+        tab.onclick = () => switchDocPreviewSheet(s.name);
+        tabsEl.appendChild(tab);
+    });
+
+    document.getElementById("docPreviewBody").innerHTML = buildDocPreviewTableHtml(state);
+    document.getElementById("docPreviewLoadMoreBtn").hidden = !state.hasMore;
+}
+
+// แปลงความกว้างคอลัมน์หน่วยของ Excel (ประมาณ "จำนวนตัวอักษร") เป็น px คร่าวๆ — ไม่ต้องเป๊ะ แค่ให้สัดส่วนใกล้
+// เคียงของจริงพอสมควร ไม่มีความกว้างกำหนดไว้ (null) -> ใช้ค่าเริ่มต้นกลางๆ
+function excelColumnWidthToPx(width) {
+    if (!width) return 80;
+    return Math.max(40, Math.round(width * 7));
+}
+
+// สร้าง HTML ตารางจาก state ที่สะสมไว้ (merges จาก backend บอก colspan/rowspan ให้ตรงๆ) — ข้อความทุกเซลล์ผ่าน
+// html.escape() มาจาก backend แล้วเสมอ (ดู _render_sheet_window ใน main.py) ปลอดภัยที่จะประกอบเป็น innerHTML
+// ตรงนี้ได้ (เหมือนหลักการเดียวกับ typewriterReveal ที่ใช้ marked+DOMPurify กับคำตอบแชท) ห้ามใช้วิธีนี้กับข้อความ
+// จากแหล่งอื่นที่ยังไม่ผ่านการ escape มาก่อน
+function buildDocPreviewTableHtml(state) {
+    const mergedAway = new Set();
+    const mergeAnchorAt = new Map(); // "row,col" -> merge object (เฉพาะเซลล์มุมบนซ้ายของช่วงที่ผสาน)
+    state.merges.forEach(m => {
+        mergeAnchorAt.set(`${m.start_row},${m.start_col}`, m);
+        for (let r = m.start_row; r <= m.end_row; r++) {
+            for (let c = m.start_col; c <= m.end_col; c++) {
+                if (r === m.start_row && c === m.start_col) continue;
+                mergedAway.add(`${r},${c}`);
+            }
+        }
+    });
+
+    let colgroup = "<colgroup>";
+    for (let c = 1; c <= state.usedCols; c++) {
+        colgroup += `<col style="width:${excelColumnWidthToPx(state.columnWidths[c - 1])}px">`;
+    }
+    colgroup += "</colgroup>";
+
+    let bodyHtml = "";
+    state.rows.forEach(rowEntry => {
+        const cellByCol = new Map(rowEntry.cells.map(c => [c.col, c]));
+        let rowHtml = "";
+        for (let col = 1; col <= state.usedCols; col++) {
+            const key = `${rowEntry.row},${col}`;
+            if (mergedAway.has(key)) continue;
+
+            const cell = cellByCol.get(col);
+            const anchor = mergeAnchorAt.get(key);
+            const colspan = anchor ? (anchor.end_col - anchor.start_col + 1) : 1;
+            const rowspan = anchor ? (anchor.end_row - anchor.start_row + 1) : 1;
+
+            const classes = ["doc-preview-cell"];
+            if (cell && cell.bold) classes.push("doc-preview-cell-bold");
+            if (cell && cell.not_computable) classes.push("doc-preview-cell-uncomputable");
+            if (cell && cell.changed) classes.push("doc-preview-cell-changed");
+            if (cell && cell.align) classes.push("doc-preview-align-" + cell.align);
+            if (cell && cell.border) {
+                if (cell.border.top) classes.push("doc-preview-border-top");
+                if (cell.border.bottom) classes.push("doc-preview-border-bottom");
+                if (cell.border.left) classes.push("doc-preview-border-left");
+                if (cell.border.right) classes.push("doc-preview-border-right");
+            }
+
+            const styleAttr = (cell && cell.fill) ? ` style="background-color:${cell.fill}"` : "";
+
+            let title = "";
+            if (cell && cell.title) title = ` title="${cell.title}"`;
+            else if (cell && cell.changed) title = ` title="เดิม: ${cell.old_text || "(ว่าง)"}"`;
+
+            const text = cell ? cell.text : "";
+            rowHtml += `<td colspan="${colspan}" rowspan="${rowspan}" class="${classes.join(" ")}"${styleAttr}${title}>${text}</td>`;
+        }
+        bodyHtml += `<tr>${rowHtml}</tr>`;
+    });
+
+    return `<table class="doc-preview-table">${colgroup}<tbody>${bodyHtml}</tbody></table>`;
 }
 
 // =====================================================================

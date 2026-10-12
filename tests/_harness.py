@@ -10,6 +10,7 @@ import ast
 import io
 import os
 import re
+import html
 import json
 import zipfile
 import difflib
@@ -60,6 +61,10 @@ WANTED_MAIN_FUNCS = {
     "_get_active_chat_document", "execute_open_library_file", "_normalize_filename_for_matching",
     "_match_and_apply_excel_edit", "_parse_json_response",
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
+    "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
+    "_format_cell_display_text", "_cell_style_info", "_evaluate_preview_formula_cells",
+    "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
+    "_resolve_preview_mode_bytes", "_preview_cache_get", "_preview_cache_set",
 }
 
 WANTED_MAIN_CONSTS = {
@@ -80,6 +85,10 @@ WANTED_MAIN_CONSTS = {
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES",
     "_POLITE_PARTICLE_COMPOUND_RE", "_POLITE_PARTICLE_TRAILING_RE",
+    "_THAI_DIGIT_WORDS", "_THAI_PLACE_WORDS",
+    "_BAHTTEXT_FORMULA_RE", "_SIMPLE_CELL_REFERENCE_RE", "_PREVIEW_NOT_COMPUTABLE_TITLE",
+    "_PREVIEW_MAX_COLUMNS", "_PREVIEW_MAX_ROWS_PER_PAGE", "_PREVIEW_DEFAULT_MAX_ROWS",
+    "_PREVIEW_CACHE", "_PREVIEW_CACHE_MAX_ENTRIES",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -142,6 +151,13 @@ class _FakeDb:
         if not versions:
             return None
         v = versions[-1]
+        return {"id": v["id"], "file_bytes": v["file_bytes"], "label_map": v["label_map"]}
+
+    def get_second_latest_document_version(self, document_id):
+        versions = self.versions.get(document_id, [])
+        if len(versions) < 2:
+            return None
+        v = versions[-2]
         return {"id": v["id"], "file_bytes": v["file_bytes"], "label_map": v["label_map"]}
 
     def create_document_version(self, document_id, file_bytes, label_map, change_summary=None):
@@ -276,6 +292,16 @@ def _extract(tree: ast.Module, wanted_funcs: set, wanted_consts: set, ns: dict, 
             if node.targets[0].id in wanted_consts:
                 exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{label}>", "exec"), ns)
                 found_consts.add(node.targets[0].id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            # ค่าคงที่ module-level ที่มี type annotation กำกับ (เช่น "_PREVIEW_CACHE: dict[tuple, dict] = {}")
+            # — ast.Assign ธรรมดาไม่ครอบคลุม ต้องดึง ast.AnnAssign แยกต่างหาก (exec แค่ชื่อ = ค่า ทิ้ง annotation
+            # ไปเลย ไม่จำเป็นต้องมีอยู่ใน namespace ของเทสต์)
+            if node.target.id in wanted_consts:
+                plain_assign = ast.Assign(targets=[node.target], value=node.value)
+                ast.copy_location(plain_assign, node)
+                ast.fix_missing_locations(plain_assign)
+                exec(compile(ast.Module(body=[plain_assign], type_ignores=[]), f"<{label}>", "exec"), ns)
+                found_consts.add(node.target.id)
 
     missing = (wanted_funcs - found_funcs) | (wanted_consts - found_consts)
     if missing:
@@ -331,7 +357,8 @@ def build_namespace() -> dict:
         "run_agentic_tool_loop": fake_agentic_loop,
         "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
-        "io": io, "os": os, "re": re, "json": json, "zipfile": zipfile, "difflib": difflib, "datetime": datetime,
+        "io": io, "os": os, "re": re, "html": html, "json": json, "zipfile": zipfile, "difflib": difflib,
+        "datetime": datetime,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
@@ -341,6 +368,7 @@ def build_namespace() -> dict:
         "get_editable_document_raw": fake_db.get_editable_document_raw,
         "get_editable_document": fake_db.get_editable_document,
         "get_latest_document_version": fake_db.get_latest_document_version,
+        "get_second_latest_document_version": fake_db.get_second_latest_document_version,
         "create_document_version": fake_db.create_document_version,
         "delete_latest_document_version": fake_db.delete_latest_document_version,
         "link_edit_log_to_version": fake_db.link_edit_log_to_version,

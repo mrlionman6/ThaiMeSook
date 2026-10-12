@@ -1484,6 +1484,25 @@ def get_latest_document_version(document_id: int) -> Optional[dict]:
         }
 
 
+def get_second_latest_document_version(document_id: int) -> Optional[dict]:
+    """คืนเวอร์ชัน "รองล่าสุด" (version_no สูงสุดอันดับสอง) ของไฟล์นี้ หรือ None ถ้ามีแค่ 1 เวอร์ชันหรือไม่มีเวอร์ชัน
+    เลย — ใช้เทียบกับเวอร์ชันล่าสุดเพื่อหาว่าเซลล์ไหนเพิ่งเปลี่ยนไปในการแก้ล่าสุด (ดู endpoint preview ใน main.py
+    mode=current — ถ้าไม่มีเวอร์ชันรองลงมาเลย (มีแค่ 1 เวอร์ชันหรือไม่มีเลย) caller เทียบกับ
+    EditableDocument.original_bytes แทน)"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(DocumentVersion)
+            .filter(DocumentVersion.document_id == document_id)
+            .order_by(DocumentVersion.version_no.desc())
+            .limit(2)
+            .all()
+        )
+        if len(rows) < 2:
+            return None
+        row = rows[1]
+        return {"id": row.id, "version_no": row.version_no, "file_bytes": row.file_bytes, "label_map": row.label_map}
+
+
 def create_document_version(
     document_id: int, file_bytes: bytes, label_map: dict, change_summary: Optional[str] = None
 ) -> int:

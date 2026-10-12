@@ -69,6 +69,7 @@ from db import (
     get_editable_document_by_chat,
     list_active_editable_documents_by_chat,
     get_latest_document_version,
+    get_second_latest_document_version,
     create_document_version,
     link_edit_log_to_version,
     delete_latest_document_version,
@@ -115,6 +116,7 @@ from db import (
 import os
 import io
 import re
+import html
 import json
 import base64
 import time
@@ -134,7 +136,7 @@ from openpyxl.workbook.properties import CalcProperties
 from openpyxl.cell.cell import MergedCell
 from pycel import ExcelCompiler
 from typing import Optional
-from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File
+from fastapi import FastAPI, Depends, HTTPException, Request, Form, UploadFile, File, Query
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
@@ -7642,6 +7644,501 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
         media_type=media_type,
         headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
     )
+
+
+# ---------- Document preview (ดูไฟล์ Excel ในแท็บด้านขวา — read-only ล้วน ไม่แก้ไฟล์ใดๆ เลยสักจุด) ----------
+
+_THAI_DIGIT_WORDS = ("ศูนย์", "หนึ่ง", "สอง", "สาม", "สี่", "ห้า", "หก", "เจ็ด", "แปด", "เก้า")
+# ตำแหน่งหลัก (นับจากหลักหน่วย = 0) ภายใน 1 กลุ่ม 6 หลัก ก่อนจะวนซ้ำด้วยคำว่า "ล้าน" สำหรับกลุ่มถัดไป —
+# ภาษาไทยนับหลักเป็นกลุ่มละ 6 หลัก ไม่ใช่กลุ่มละ 3 หลักเหมือนภาษาอังกฤษ (ดู _thai_integer_to_text)
+_THAI_PLACE_WORDS = ("", "สิบ", "ร้อย", "พัน", "หมื่น", "แสน")
+
+
+def _thai_group_to_text(number: int) -> str:
+    """แปลงตัวเลข 1-999999 (1 กลุ่ม 6 หลักของระบบเลขไทย ก่อนจะถึงคำว่า "ล้าน") เป็นคำอ่านภาษาไทย — ใช้เฉพาะใน
+    _thai_integer_to_text ด้านล่าง จัดการกรณีพิเศษ 2 แบบตามหลักภาษาไทย: หลักสิบเป็น 1 อ่านว่า "สิบ" เฉยๆ (ไม่ใช่
+    "หนึ่งสิบ") หลักสิบเป็น 2 อ่านว่า "ยี่สิบ" (ไม่ใช่ "สองสิบ") และหลักหน่วยเป็น 1 เมื่อเลขมีมากกว่า 1 หลัก อ่าน
+    ว่า "เอ็ด" (ไม่ใช่ "หนึ่ง") เช่น 21 -> "ยี่สิบเอ็ด" ไม่ใช่ "สองสิบหนึ่ง\""""
+    digits = str(number)
+    length = len(digits)
+    parts = []
+    for index, ch in enumerate(digits):
+        digit = int(ch)
+        if digit == 0:
+            continue
+        place = length - index - 1  # 0=หน่วย, 1=สิบ, 2=ร้อย, 3=พัน, 4=หมื่น, 5=แสน
+        if place == 0:
+            parts.append("เอ็ด" if (digit == 1 and length > 1) else _THAI_DIGIT_WORDS[digit])
+        elif place == 1:
+            if digit == 1:
+                parts.append("สิบ")
+            elif digit == 2:
+                parts.append("ยี่สิบ")
+            else:
+                parts.append(_THAI_DIGIT_WORDS[digit] + "สิบ")
+        else:
+            parts.append(_THAI_DIGIT_WORDS[digit] + _THAI_PLACE_WORDS[place])
+    return "".join(parts)
+
+
+def _thai_integer_to_text(number: int) -> str:
+    """แปลงจำนวนเต็มไม่ติดลบเป็นคำอ่านภาษาไทยเต็มรูป (รองรับเกิน 999,999 ด้วยการวนคำว่า "ล้าน" ซ้ำทุก 6 หลัก)
+    ใช้โดย _bahttext ด้านล่างเท่านั้น"""
+    if number == 0:
+        return _THAI_DIGIT_WORDS[0]
+
+    groups = []
+    remaining = number
+    while remaining > 0:
+        groups.append(remaining % 1_000_000)
+        remaining //= 1_000_000
+    groups.reverse()  # กลุ่มที่มีค่ามากสุด (ซ้ายสุด) มาก่อน
+
+    text = ""
+    last_index = len(groups) - 1
+    for i, group in enumerate(groups):
+        if group == 0:
+            continue
+        text += _thai_group_to_text(group)
+        if i != last_index:
+            text += "ล้าน"
+    return text
+
+
+def _bahttext(amount: float) -> str:
+    """แปลงจำนวนเงิน (บาท) เป็นคำอ่านภาษาไทยเต็มรูปแบบเหมือนฟังก์ชัน BAHTTEXT ของ Excel เอง (ซึ่ง pycel ไม่
+    รองรับเลย — ดู _try_evaluate_bahttext) ปัดเป็น 2 ตำแหน่งทศนิยมก่อนเสมอ (กันเศษทศนิยมที่ลอยมาจาก
+    floating-point เช่น 62220.499999999996) 0 สตางค์ -> ต่อท้ายด้วย "ถ้วน" ไม่ใช่ "ศูนย์สตางค์" ติดลบ -> นำหน้า
+    ด้วย "ลบ\""""
+    negative = amount < 0
+    rounded = round(abs(amount), 2)
+    baht = int(rounded)
+    satang = int(round((rounded - baht) * 100))
+    if satang >= 100:  # เผื่อปัดเศษแล้วทะลุ 100 สตางค์พอดี (เช่น 0.999999 ปัดเป็น 1.00)
+        baht += 1
+        satang = 0
+
+    text = _thai_integer_to_text(baht) + "บาท"
+    text += "ถ้วน" if satang == 0 else _thai_integer_to_text(satang) + "สตางค์"
+    return ("ลบ" + text) if negative else text
+
+
+# จับ "=BAHTTEXT(...)" (ไม่สนตัวพิมพ์เล็กใหญ่) — รองรับเฉพาะกรณีที่ argument เป็นตัวเลขตรงๆ หรือ cell reference
+# เดียวตรงๆ เท่านั้น (ครอบคลุมรูปแบบที่พบในไฟล์จริงเกือบทั้งหมด เช่น "=BAHTTEXT(G28)") นิพจน์ซับซ้อนกว่านี้ (เช่น
+# "=BAHTTEXT(G28*2)") ไม่รองรับ ถือเป็นคำนวณไม่ได้ (เลี่ยงการเขียนตัว parse สูตร Excel เต็มรูปแบบเอง)
+_BAHTTEXT_FORMULA_RE = re.compile(r"^=\s*BAHTTEXT\s*\(\s*(.+?)\s*\)\s*$", re.IGNORECASE)
+_SIMPLE_CELL_REFERENCE_RE = re.compile(r"^(?:'([^']+)'!|([A-Za-z_][A-Za-z0-9_]*)!)?(\$?[A-Za-z]{1,3}\$?\d+)$")
+
+
+def _try_evaluate_bahttext(formula: str, default_sheet: str, excel: ExcelCompiler) -> Optional[str]:
+    """ถ้า formula เป็น "=BAHTTEXT(...)" คำนวณค่าตัวเลขของ argument เอง (ตัวเลขตรงๆ หรือ cell reference เดียว —
+    ดู _BAHTTEXT_FORMULA_RE/_SIMPLE_CELL_REFERENCE_RE) แล้วแปลงเป็นคำอ่านภาษาไทยด้วย _bahttext (pycel เองไม่
+    รองรับฟังก์ชันนี้ — error UnknownFunction ทุกครั้ง) คืน None ถ้าไม่ใช่ BAHTTEXT หรือ argument ซับซ้อนเกินจะ
+    parse ด้วยโค้ดง่ายๆ แบบนี้ (ปล่อยให้ caller ถือว่าคำนวณไม่ได้แทน ไม่ raise)"""
+    match = _BAHTTEXT_FORMULA_RE.match(formula.strip())
+    if not match:
+        return None
+
+    argument = match.group(1).strip()
+    try:
+        number = float(argument)
+    except ValueError:
+        ref_match = _SIMPLE_CELL_REFERENCE_RE.match(argument)
+        if not ref_match:
+            return None
+        sheet = ref_match.group(1) or ref_match.group(2) or default_sheet
+        cell_ref = ref_match.group(3).replace("$", "")
+        try:
+            number = excel.evaluate(f"'{sheet}'!{cell_ref}")
+        except Exception as e:
+            print(f"[DocumentPreview] bahttext_ref_eval_failed exception_type={type(e).__name__}")
+            return None
+        if not isinstance(number, (int, float)) or isinstance(number, bool):
+            return None
+
+    try:
+        return _bahttext(number)
+    except Exception as e:
+        print(f"[DocumentPreview] bahttext_convert_failed exception_type={type(e).__name__}")
+        return None
+
+
+_PREVIEW_NOT_COMPUTABLE_TITLE = "คำนวณในระบบไม่ได้ เปิดใน Excel เพื่อดูค่า"
+
+
+def _format_cell_display_text(value, number_format: Optional[str]) -> str:
+    """แปลงค่าดิบของเซลล์ให้เป็นข้อความที่ "แสดงผล" ตาม number_format ของเซลล์ — ใช้เฉพาะหน้า preview เท่านั้น
+    (อ่านอย่างเดียว ไม่เกี่ยวกับ label_map/การคำนวณจริงเลย) ไม่ใช่ตัว parse format string แบบเต็มรูปแบบของ Excel
+    (ซับซ้อนมาก มีเงื่อนไขสี/ส่วนบวก-ลบ-ศูนย์ ฯลฯ) รองรับแค่ลักษณะที่พบบ่อยในไฟล์ธุรกิจทั่วไป: จุลภาคคั่นหลักพัน
+    (#,##0 หรือ 0,0), จำนวนตำแหน่งทศนิยมจากจำนวน "0" หลังจุดในรูปแบบ, เปอร์เซ็นต์ (มี "%"), วันที่/เวลา (เช็คด้วย
+    is_date_format เหมือน _format_display_value — แต่ค่าที่นี่เป็น datetime object ดิบจาก openpyxl ตรงๆ ไม่ใช่
+    ISO string แบบใน label_map) ค่าอื่นๆ/parse ไม่ได้ -> str(value) ตรงๆ
+
+    ข้อจำกัดที่รู้อยู่แล้ว: เซลล์สูตรที่ผลลัพธ์เป็นวันที่ (pycel คืนเลขลำดับวันที่ดิบ ไม่ใช่ datetime object) จะ
+    แสดงเป็นตัวเลขธรรมดาแทนวันที่ (ไม่แปลงกลับเป็นปฏิทิน) — พบน้อยในไฟล์ธุรกิจทั่วไป ยอมรับได้สำหรับตอนนี้"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        if isinstance(value, datetime.datetime) and (value.hour, value.minute, value.second) != (0, 0, 0):
+            return f"{value.day}/{value.month}/{value.year} {value.hour:02d}:{value.minute:02d}"
+        return f"{value.day}/{value.month}/{value.year}"
+    if not isinstance(value, (int, float)):
+        return str(value)
+    if not number_format or number_format == "General":
+        return f"{value:g}" if isinstance(value, float) else str(value)
+
+    is_percent = "%" in number_format
+    display_value = value * 100 if is_percent else value
+
+    decimal_places = 0
+    if "." in number_format:
+        after_dot = number_format.split(".", 1)[1]
+        decimal_places = len(re.match(r"0*", after_dot).group())
+
+    has_thousands_sep = "#,#" in number_format or "0,0" in number_format
+    if has_thousands_sep:
+        text = f"{display_value:,.{decimal_places}f}"
+    elif decimal_places:
+        text = f"{display_value:.{decimal_places}f}"
+    elif "0" in number_format:
+        text = f"{display_value:.0f}"
+    else:
+        text = f"{display_value:g}"
+
+    return text + "%" if is_percent else text
+
+
+def _cell_style_info(cell) -> dict:
+    """ดึง style พื้นฐานของเซลล์ที่จำเป็นต่อการแสดงผล preview เท่านั้น (ไม่ครบทุก property ของ openpyxl) — ตัว
+    หนา, สีพื้นหลัง (เฉพาะ fill แบบ solid เท่านั้น ไม่รองรับ gradient/pattern อื่น), การจัดวางแนวนอน, มีเส้นขอบ
+    ด้านไหนบ้าง (แค่ true/false ต่อด้าน ไม่สนสี/ความหนาของเส้น)"""
+    bold = bool(cell.font and cell.font.bold)
+
+    fill_color = None
+    if cell.fill and cell.fill.patternType == "solid" and cell.fill.fgColor:
+        rgb = cell.fill.fgColor.rgb
+        if isinstance(rgb, str) and len(rgb) == 8:  # "AARRGGBB" — ตัด alpha ทิ้ง เหลือ "RRGGBB"
+            fill_color = f"#{rgb[2:]}"
+
+    align = cell.alignment.horizontal if cell.alignment else None
+
+    border = cell.border
+    border_sides = {
+        "top": bool(border and border.top and border.top.style),
+        "bottom": bool(border and border.bottom and border.bottom.style),
+        "left": bool(border and border.left and border.left.style),
+        "right": bool(border and border.right and border.right.style),
+    }
+
+    return {"bold": bold, "fill": fill_color, "align": align, "border": border_sides}
+
+
+_PREVIEW_MAX_COLUMNS = 50  # used range ของชีตที่ render ไม่เกินนี้ (คอลัมน์เกินนี้ถูกตัดทิ้งไปเลย)
+_PREVIEW_MAX_ROWS_PER_PAGE = 200  # ต่อคำขอหนึ่งครั้งห้ามเกินนี้ (ไม่ว่า max_rows จะขอมาเท่าไร)
+_PREVIEW_DEFAULT_MAX_ROWS = 100
+
+
+def _evaluate_preview_formula_cells(
+    file_bytes: bytes, sheet_name: str, formulas: dict[tuple[int, int], str]
+) -> dict[tuple[int, int], object]:
+    """คำนวณค่าจริงของเซลล์สูตรที่ระบุ (formulas: {(row,col): raw_formula_string}) ในชีตนี้ด้วย pycel (ตัวเดียว
+    กับที่ใช้คำนวณ label_map — ดู _recalculate_formula_values) ใช้เฉพาะหน้า preview (อ่านอย่างเดียว ไม่เกี่ยวกับ
+    label_map เลย) BAHTTEXT (pycel ไม่รองรับ) คำนวณเองแยกต่างหากก่อนเสมอ (ดู _try_evaluate_bahttext — คืนเป็น
+    "ข้อความ" สำเร็จรูป ไม่ใช่ตัวเลข) ไม่ถือเป็น error เหมือนสูตรอื่นที่ pycel คำนวณไม่ได้จริงๆ คืน dict
+    (row,col) -> ค่า (None ถ้าคำนวณไม่ได้จริงๆ) จำกัดเวลารวมทั้งหน้าต่างด้วย FORMULA_RECALC_TIMEOUT_SECONDS
+    เหมือนกับการคำนวณ label_map ทุกประการ"""
+    if not formulas:
+        return {}
+
+    result: dict[tuple[int, int], object] = {pos: None for pos in formulas}
+    tmp_path = None
+    pool = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+
+        def _run():
+            excel = ExcelCompiler(tmp_path)
+            values = {}
+            for pos, formula in formulas.items():
+                bahttext_value = _try_evaluate_bahttext(formula, sheet_name, excel)
+                if bahttext_value is not None:
+                    values[pos] = bahttext_value
+                    continue
+                try:
+                    values[pos] = excel.evaluate(_cell_ref(sheet_name, pos[0], pos[1]))
+                except Exception as e:
+                    print(f"[DocumentPreview] cell_eval_failed exception_type={type(e).__name__}")
+                    values[pos] = None
+            return values
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(_run)
+        result.update(future.result(timeout=FORMULA_RECALC_TIMEOUT_SECONDS))
+    except Exception as e:
+        print(f"[DocumentPreview] whole_sheet_eval_failed exception_type={type(e).__name__}")
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False)
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    return result
+
+
+def _list_preview_sheet_summaries(wb) -> list[dict]:
+    """คืนรายชื่อทุกชีตในไฟล์พร้อมขนาด used range ของแต่ละชีต (ไม่ render เนื้อหาเต็ม — แค่สรุปไว้ให้ frontend
+    สร้างแท็บเลือกชีตได้) used_cols ถูกจำกัดไม่เกิน _PREVIEW_MAX_COLUMNS เหมือนตอน render จริง"""
+    return [
+        {
+            "name": ws.title,
+            "used_rows": ws.max_row or 0,
+            "used_cols": min(ws.max_column or 0, _PREVIEW_MAX_COLUMNS),
+        }
+        for ws in wb.worksheets
+    ]
+
+
+def _render_sheet_window(file_bytes: bytes, sheet_name: str, start_row: int, max_rows: int) -> dict:
+    """render หน้าต่างแถวหนึ่งของชีตหนึ่งในไฟล์นี้ให้พร้อมแสดงผลตรงๆ (ค่าที่คำนวณ+จัดรูปแบบแล้ว ไม่ใช่สูตรดิบ —
+    ดู _format_cell_display_text/_evaluate_preview_formula_cells) พร้อม merges/ความกว้างคอลัมน์/style พื้นฐาน
+    อ่านอย่างเดียวล้วนๆ ไม่เขียนกลับไฟล์เลย ข้อความทุกเซลล์ escape เป็น HTML-safe แล้ว (กันเนื้อหาในไฟล์มี
+    "<script>" หรือแท็ก HTML อื่นปนมา) คืน dict เสมอ sheet_name ต้องมีอยู่จริงในไฟล์นี้เสมอ (caller — endpoint
+    preview ด้านล่าง — เช็คมาก่อนแล้ว ไม่งั้น KeyError จาก openpyxl เอง) start_row/max_rows ไม่ถูก clamp ในนี้
+    (caller clamp มาก่อนแล้วเสมอ)"""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False)
+    sheets = _list_preview_sheet_summaries(wb)
+    ws = wb[sheet_name]
+
+    used_rows = ws.max_row or 0
+    used_cols = min(ws.max_column or 0, _PREVIEW_MAX_COLUMNS)
+    end_row = min(start_row + max_rows - 1, used_rows)
+    has_more = end_row < used_rows
+
+    merges = [
+        {"start_row": rng.min_row, "end_row": rng.max_row, "start_col": rng.min_col, "end_col": rng.max_col}
+        for rng in ws.merged_cells.ranges
+        if rng.min_row <= end_row and rng.max_row >= start_row and rng.min_col <= used_cols
+    ]
+
+    column_widths = []
+    for col in range(1, used_cols + 1):
+        letter = openpyxl.utils.get_column_letter(col)
+        dimension = ws.column_dimensions.get(letter)
+        column_widths.append(dimension.width if dimension and dimension.width else None)
+
+    raw_cells: dict[tuple[int, int], object] = {}
+    formulas: dict[tuple[int, int], str] = {}
+    for row in range(max(start_row, 1), end_row + 1):
+        for col in range(1, used_cols + 1):
+            cell = ws.cell(row=row, column=col)
+            if isinstance(cell, MergedCell):
+                continue  # ไม่ใช่เซลล์บนซ้ายของช่วงที่ผสาน — merges ด้านบนบอก frontend ให้ colspan/rowspan เอง
+            value = cell.value
+            if value is None:
+                continue
+            if isinstance(value, str) and value.startswith("="):
+                formulas[(row, col)] = value
+            else:
+                raw_cells[(row, col)] = value
+
+    computed_formula_values = _evaluate_preview_formula_cells(file_bytes, sheet_name, formulas)
+
+    rows = []
+    for row in range(max(start_row, 1), end_row + 1):
+        row_cells = []
+        for col in range(1, used_cols + 1):
+            pos = (row, col)
+            is_formula = pos in formulas
+            if not is_formula and pos not in raw_cells:
+                continue  # เซลล์ว่าง (หรือถูกผสานไปแล้ว) — ไม่ต้องส่งอะไรมาเลย ฝั่ง frontend แสดงว่างเปล่า
+
+            cell = ws.cell(row=row, column=col)
+            if is_formula:
+                computed_value = computed_formula_values.get(pos)
+                if computed_value is None:
+                    not_computable = True
+                    text = "—"
+                elif isinstance(computed_value, str):
+                    not_computable = False
+                    text = computed_value  # ผลจาก BAHTTEXT เป็นข้อความสำเร็จรูปอยู่แล้ว ไม่ต้องจัด number_format ซ้ำ
+                else:
+                    not_computable = False
+                    text = _format_cell_display_text(computed_value, cell.number_format)
+            else:
+                not_computable = False
+                text = _format_cell_display_text(raw_cells[pos], cell.number_format)
+
+            style = _cell_style_info(cell)
+            row_cells.append({
+                "col": col,
+                "text": html.escape(str(text)),
+                "not_computable": not_computable,
+                "title": _PREVIEW_NOT_COMPUTABLE_TITLE if not_computable else None,
+                **style,
+            })
+        rows.append({"row": row, "cells": row_cells})
+
+    return {
+        "sheets": sheets,
+        "sheet": sheet_name,
+        "start_row": start_row,
+        "end_row": end_row,
+        "used_rows": used_rows,
+        "used_cols": used_cols,
+        "has_more": has_more,
+        "column_widths": column_widths,
+        "merges": merges,
+        "rows": rows,
+    }
+
+
+def _merge_preview_highlight(displayed_window: dict, baseline_window: Optional[dict]) -> dict:
+    """เติม "changed"/"old_text" ให้แต่ละเซลล์ใน displayed_window โดยเทียบกับ baseline_window (หน้าต่างเดียวกัน
+    เป๊ะ — ชีต/ช่วงแถวเดียวกัน) ถ้า baseline_window เป็น None (เช่น ยังไม่เคยมีเวอร์ชันก่อนหน้าเลย หรือคิวว่างไม่
+    มีอะไรจะเปลี่ยน) ถือว่าไม่มีอะไรเปลี่ยนเลย (ไม่เติม key เหล่านี้ให้เซลล์ไหนทั้งนั้น) เซลล์ที่มีค่าอยู่ใน
+    baseline แต่หายไปจาก displayed (กลายเป็นว่างเปล่า เช่น ถูกลบรายการในตาราง) ก็ถือว่า "เปลี่ยน" ด้วย — เพิ่ม
+    cell entry ใหม่ (text ว่างเปล่า) ให้แถวนั้นเพื่อให้ไฮไลต์ได้ แก้ displayed_window ตรงๆ (ไม่ copy) แล้วคืน
+    ตัวเดิม"""
+    if baseline_window is None:
+        return displayed_window
+
+    baseline_by_pos = {
+        (row_entry["row"], cell["col"]): cell["text"]
+        for row_entry in baseline_window["rows"]
+        for cell in row_entry["cells"]
+    }
+
+    displayed_positions = set()
+    rows_by_number = {row_entry["row"]: row_entry for row_entry in displayed_window["rows"]}
+
+    for row_entry in displayed_window["rows"]:
+        for cell in row_entry["cells"]:
+            pos = (row_entry["row"], cell["col"])
+            displayed_positions.add(pos)
+            old_text = baseline_by_pos.get(pos, "")
+            if old_text != cell["text"]:
+                cell["changed"] = True
+                cell["old_text"] = old_text
+
+    for (row, col), old_text in baseline_by_pos.items():
+        if (row, col) in displayed_positions or old_text == "":
+            continue
+        row_entry = rows_by_number.get(row)
+        if row_entry is None:
+            continue  # แถวนี้อยู่นอกช่วงที่ render (ไม่ควรเกิดถ้าหน้าต่างเดียวกันเป๊ะ แต่กันไว้)
+        row_entry["cells"].append({
+            "col": col, "text": "", "not_computable": False, "title": None,
+            "bold": False, "fill": None, "align": None,
+            "border": {"top": False, "bottom": False, "left": False, "right": False},
+            "changed": True, "old_text": old_text,
+        })
+        row_entry["cells"].sort(key=lambda c: c["col"])
+
+    return displayed_window
+
+
+def _resolve_preview_mode_bytes(
+    doc: dict, mode: str, base_bytes: bytes, label_map: dict, pending_queue: list[dict]
+) -> tuple[bytes, Optional[bytes]]:
+    """ตัดสินใจว่า preview endpoint ควรแสดง bytes ไหน (displayed) และเทียบกับ bytes ไหนเพื่อหาไฮไลต์ (baseline
+    — None แปลว่าไม่มีอะไรให้ไฮไลต์เลย) ตาม mode ที่ขอมา — แยกออกมาจาก endpoint เองเพื่อให้ทดสอบได้โดยไม่ต้อง
+    พึ่ง FastAPI/Request จริง (ดู endpoint preview_excel_editor_document)
+
+    mode="pending" + คิวไม่ว่าง: แสดงสถานะเสมือนถ้าคิวถูกนำไปใช้ครบ (ดู _replay_pending_queue) เทียบกับสำเนา
+    ทำงานปัจจุบัน (ไฮไลต์สิ่งที่ "จะ" เปลี่ยน)
+    mode="pending" + คิวว่าง: เหมือน mode="current" เป๊ะ (ไม่มีคิว ไม่มีอะไรจะเปลี่ยน)
+    mode="current": แสดงสำเนาทำงานปัจจุบัน เทียบกับเวอร์ชันก่อนหน้าเวอร์ชันล่าสุด (ไฮไลต์สิ่งที่เพิ่ง "เปลี่ยนไป
+    แล้ว" ในการแก้ล่าสุด) ไม่มีเวอร์ชันก่อนหน้าเลย (ไฟล์ยังไม่เคยแก้ หรือแก้แค่ครั้งเดียว) -> ไม่ไฮไลต์อะไร"""
+    if mode == "pending" and pending_queue:
+        displayed_bytes, _ = _replay_pending_queue(base_bytes, label_map, pending_queue)
+        return displayed_bytes, base_bytes
+
+    if mode == "current":
+        latest_version = get_latest_document_version(doc["id"])
+        if latest_version is None:
+            return base_bytes, None
+        previous_version = get_second_latest_document_version(doc["id"])
+        baseline_bytes = previous_version["file_bytes"] if previous_version else doc["original_bytes"]
+        return base_bytes, baseline_bytes
+
+    return base_bytes, None  # mode="pending" แต่คิวว่าง
+
+
+_PREVIEW_CACHE: dict[tuple, dict] = {}
+_PREVIEW_CACHE_MAX_ENTRIES = 128  # กันหน่วยความจำบวมถ้ามีคนเปิด preview ไฟล์/ชีต/หน้าต่างแตกต่างกันเยอะมาก
+
+
+def _preview_cache_get(key: tuple) -> Optional[dict]:
+    return _PREVIEW_CACHE.get(key)
+
+
+def _preview_cache_set(key: tuple, value: dict) -> None:
+    _PREVIEW_CACHE[key] = value
+    while len(_PREVIEW_CACHE) > _PREVIEW_CACHE_MAX_ENTRIES:
+        del _PREVIEW_CACHE[next(iter(_PREVIEW_CACHE))]  # ตัดรายการเก่าสุด (insertion order) ทิ้งก่อนเสมอ
+
+
+@app.get("/api/excel-editor/{document_id}/preview")
+def preview_excel_editor_document(
+    document_id: int,
+    sheet: Optional[str] = Query(None),
+    start_row: int = Query(1, ge=1),
+    max_rows: int = Query(_PREVIEW_DEFAULT_MAX_ROWS, ge=1, le=_PREVIEW_MAX_ROWS_PER_PAGE),
+    mode: str = Query("current"),
+    user_id: int = Depends(require_user),
+):
+    """อ่านอย่างเดียวล้วนๆ (ไม่แก้ไฟล์ใดๆ เลย) — คืนค่าที่คำนวณ+จัดรูปแบบแล้วพร้อมแสดงผลของหน้าต่างแถวหนึ่งในชีต
+    หนึ่งของไฟล์นี้ (ดู _render_sheet_window) ให้แผงไฟล์ด้านขวาแสดง preview แทนการต้องดาวน์โหลดไฟล์มาเปิดเอง —
+    ดู docstring ของ _resolve_preview_mode_bytes สำหรับความหมายของ mode="current"/"pending"
+
+    ตรวจ ownership ด้วย get_editable_document() เหมือน endpoint download ทุกประการ ไม่พบ/ไม่ใช่เจ้าของ -> 404
+    cache ผลตาม (document_id, mode, เวอร์ชัน/คิวปัจจุบัน, sheet, start_row, max_rows) กันคำนวณซ้ำ (pycel
+    compile ทั้งไฟล์ไม่ถูกเลย) ตอนเปิด/ปิด/เลื่อนดู preview ซ้ำๆ โดยไม่มีอะไรเปลี่ยนจริง"""
+    if mode not in ("current", "pending"):
+        raise HTTPException(status_code=400, detail="mode ต้องเป็น current หรือ pending เท่านั้น")
+
+    doc = get_editable_document(document_id, user_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+
+    base_bytes, label_map = get_working_copy(doc)
+    pending_queue = get_chat_pending_actions(doc["chat_id"]) if doc.get("chat_id") else []
+    displayed_bytes, baseline_bytes = _resolve_preview_mode_bytes(doc, mode, base_bytes, label_map, pending_queue)
+
+    try:
+        available_sheets = openpyxl.load_workbook(io.BytesIO(displayed_bytes), read_only=True).sheetnames
+    except Exception:
+        raise HTTPException(status_code=400, detail="เปิดไฟล์นี้ไม่ได้")
+    if sheet is not None and sheet not in available_sheets:
+        raise HTTPException(status_code=400, detail=f"ไม่พบชีต '{sheet}' ในไฟล์นี้")
+    resolved_sheet = sheet or available_sheets[0]
+
+    version_marker = _get_document_version_marker(doc)
+    pending_fingerprint = tuple(item["id"] for item in pending_queue)
+    cache_key = (document_id, mode, version_marker, pending_fingerprint, resolved_sheet, start_row, max_rows)
+
+    cached = _preview_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    displayed_window = _render_sheet_window(displayed_bytes, resolved_sheet, start_row, max_rows)
+    baseline_window = (
+        _render_sheet_window(baseline_bytes, resolved_sheet, start_row, max_rows)
+        if baseline_bytes is not None else None
+    )
+    result = _merge_preview_highlight(displayed_window, baseline_window)
+    result["mode"] = mode
+    result["pending_count"] = len(pending_queue)
+
+    _preview_cache_set(cache_key, result)
+    return result
 
 
 # ---------- File Library (คลังไฟล์ Excel ของแอดมิน — แยกจาก Excel Editor/EditableDocument โดยสิ้นเชิง
