@@ -2090,30 +2090,6 @@ button {
     border-color: var(--color-sky);
 }
 
-.doc-preview-mode-toggle {
-    display: flex;
-    gap: 6px;
-    padding: 10px 16px;
-    border-bottom: 1px solid #eee;
-    flex-shrink: 0;
-}
-
-.doc-preview-mode-btn {
-    font-size: 12px;
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid #ddd;
-    background: #fff;
-    color: #333;
-    cursor: pointer;
-}
-
-.doc-preview-mode-btn.active {
-    background: var(--color-primary);
-    color: #fff;
-    border-color: var(--color-primary);
-}
-
 .doc-preview-body {
     flex: 1;
     overflow: auto;

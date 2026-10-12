@@ -750,15 +750,17 @@ function handleCloseFromPanel(documentId, filename) {
 // =====================================================================
 const DOC_PREVIEW_PAGE_SIZE = 100;
 
-// null เมื่อแผงปิดอยู่ — มีค่าตอนเปิดแผง เก็บ sheet/mode ที่เลือกอยู่ + แถวที่สะสมโหลดมาแล้วทั้งหมดของหน้านั้น
-// (โหลดเพิ่มทีละหน้า ต่อท้ายสะสมไว้ ไม่ใช่แทนที่ — สลับชีต/โหมดถึงจะรีเซ็ตกลับไปแถว 1 ใหม่)
+// null เมื่อแผงปิดอยู่ — มีค่าตอนเปิดแผง เก็บชีตที่เลือกอยู่ + แถวที่สะสมโหลดมาแล้วทั้งหมดของชีตนั้น (โหลดเพิ่ม
+// ทีละหน้า ต่อท้ายสะสมไว้ ไม่ใช่แทนที่ — สลับชีตถึงจะรีเซ็ตกลับไปแถว 1 ใหม่) เรียก mode=current เสมอ (ไม่มีขั้น
+// ยืนยันแล้ว ทุกการแก้ทำทันที — ไม่มี "หลังยืนยัน" ให้สลับดูอีกต่อไป backend ยังรองรับ mode=pending อยู่ ไม่ได้ลบ
+// แค่ frontend ไม่เรียกใช้)
 let docPreviewState = null;
 
 function openDocPreview(documentId, filename) {
     docPreviewState = {
-        documentId, filename, sheet: null, mode: "current",
+        documentId, filename, sheet: null,
         rows: [], columnWidths: [], merges: [], usedCols: 0, hasMore: false, nextStartRow: 1,
-        pendingCount: 0, sheets: [],
+        sheets: [],
     };
     document.getElementById("docPreviewTitle").textContent = filename;
     document.getElementById("docPreviewDrawer").classList.add("open");
@@ -774,8 +776,8 @@ function closeDocPreview() {
     docPreviewState = null;
 }
 
-// reset=true: ล้างแถวที่สะสมไว้ทิ้งแล้วเริ่มใหม่จากแถว 1 (สลับชีต/โหมด หรือรีเฟรชเพราะไฟล์อาจเปลี่ยนไปแล้ว —
-// ดู refreshDocPreviewIfOpen) reset=false: ต่อท้ายแถวที่มีอยู่แล้ว (ปุ่ม "โหลดเพิ่ม")
+// reset=true: ล้างแถวที่สะสมไว้ทิ้งแล้วเริ่มใหม่จากแถว 1 (สลับชีต หรือรีเฟรชเพราะไฟล์อาจเปลี่ยนไปแล้ว — ดู
+// refreshDocPreviewIfOpen) reset=false: ต่อท้ายแถวที่มีอยู่แล้ว (ปุ่ม "โหลดเพิ่ม")
 async function fetchDocPreviewPage(reset) {
     if (!docPreviewState) return;
     const state = docPreviewState;
@@ -787,7 +789,7 @@ async function fetchDocPreviewPage(reset) {
     const params = new URLSearchParams({
         start_row: String(state.nextStartRow),
         max_rows: String(DOC_PREVIEW_PAGE_SIZE),
-        mode: state.mode,
+        mode: "current",
     });
     if (state.sheet) params.set("sheet", state.sheet);
 
@@ -813,7 +815,6 @@ async function fetchDocPreviewPage(reset) {
     state.merges = data.merges;
     state.hasMore = data.has_more;
     state.nextStartRow = data.end_row + 1;
-    state.pendingCount = data.pending_count;
     state.rows = reset ? data.rows : state.rows.concat(data.rows);
 
     renderDocPreview();
@@ -822,12 +823,6 @@ async function fetchDocPreviewPage(reset) {
 function switchDocPreviewSheet(sheetName) {
     if (!docPreviewState || docPreviewState.sheet === sheetName) return;
     docPreviewState.sheet = sheetName;
-    fetchDocPreviewPage(true);
-}
-
-function switchDocPreviewMode(mode) {
-    if (!docPreviewState || docPreviewState.mode === mode) return;
-    docPreviewState.mode = mode;
     fetchDocPreviewPage(true);
 }
 
@@ -845,8 +840,6 @@ document.addEventListener("visibilitychange", () => {
 
 document.getElementById("docPreviewCloseBtn").addEventListener("click", closeDocPreview);
 document.getElementById("docPreviewBackdrop").addEventListener("click", closeDocPreview);
-document.getElementById("docPreviewModeCurrentBtn").addEventListener("click", () => switchDocPreviewMode("current"));
-document.getElementById("docPreviewModePendingBtn").addEventListener("click", () => switchDocPreviewMode("pending"));
 document.getElementById("docPreviewLoadMoreBtn").addEventListener("click", () => fetchDocPreviewPage(false));
 
 function renderDocPreview() {
@@ -864,15 +857,6 @@ function renderDocPreview() {
         tab.onclick = () => switchDocPreviewSheet(s.name);
         tabsEl.appendChild(tab);
     });
-
-    const toggleEl = document.getElementById("docPreviewModeToggle");
-    toggleEl.hidden = state.pendingCount <= 0;
-    if (state.pendingCount > 0) {
-        document.getElementById("docPreviewModeCurrentBtn").classList.toggle("active", state.mode === "current");
-        const pendingBtn = document.getElementById("docPreviewModePendingBtn");
-        pendingBtn.textContent = `หลังยืนยัน (${state.pendingCount} รายการ)`;
-        pendingBtn.classList.toggle("active", state.mode === "pending");
-    }
 
     document.getElementById("docPreviewBody").innerHTML = buildDocPreviewTableHtml(state);
     document.getElementById("docPreviewLoadMoreBtn").hidden = !state.hasMore;
