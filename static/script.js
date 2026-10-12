@@ -1526,6 +1526,16 @@ async function loadChatHistory() {
                 li.appendChild(fileCountBadge);
             }
 
+            const downloadBtn = document.createElement("button");
+            downloadBtn.className = "side-chat-download";
+            downloadBtn.textContent = "⬇";
+            downloadBtn.title = "ดาวน์โหลดบทสนทนานี้ (.txt)";
+            downloadBtn.onclick = (e) => {
+                e.stopPropagation();
+                window.open(`/api/chat/${chat.id}/export.txt`, "_blank");
+            };
+            li.appendChild(downloadBtn);
+
             const deleteBtn = document.createElement("button");
             deleteBtn.className = "side-chat-delete";
             deleteBtn.textContent = "✕";
