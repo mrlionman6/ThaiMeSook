@@ -1011,18 +1011,28 @@ def test_build_final_answer_with_citations_no_source_heading_without_any_citatio
 
 def test_run_agentic_tool_loop_continues_after_pause_turn_then_ends_on_second_call(ns):
     """stop_reason="pause_turn" (server tool เช่น web_search ยังทำงานไม่เสร็จ) ต้องไม่ break ทันที ต้องเรียก API
-    ต่อในรอบถัดไปจนกว่าจะได้ stop_reason อื่น (ในเทสต์นี้คือ end_turn ในรอบที่สอง)"""
+    ต่อในรอบถัดไปจนกว่าจะได้ stop_reason อื่น (ในเทสต์นี้คือ end_turn ในรอบที่สอง) และข้อความ/citation ของรอบ
+    pause_turn (ส่วนแรกของคำตอบ) ต้องไม่หายไป — ต้องถูกสะสมไว้แล้วต่อกับรอบสุดท้ายตอนประกอบคำตอบ (เหตุการณ์จริงที่
+    แก้: เดิมใช้แค่ response.content ของรอบสุดท้ายรอบเดียว ทำให้ข้อความ/citation ของรอบ pause_turn ก่อนหน้าหายไป)"""
     real_loop = ns["_real_run_agentic_tool_loop"]
     fake_client = ns["_fake_client"]
     fake_client.response_queue = [
-        _FakeAgenticResponse([_FakeAgenticTextBlock("กำลังค้นหาข้อมูลเพิ่มเติม...")], stop_reason="pause_turn"),
-        _FakeAgenticResponse([_FakeAgenticTextBlock("พบรุ่นที่แนะนำแล้วครับ")], stop_reason="end_turn"),
+        _FakeAgenticResponse(
+            [_FakeAgenticTextBlock("ส่วนแรก ", citations=[_FakeCitation("https://a.com", "แหล่ง A")])],
+            stop_reason="pause_turn",
+        ),
+        _FakeAgenticResponse(
+            [_FakeAgenticTextBlock("ส่วนหลัง", citations=[_FakeCitation("https://b.com", "แหล่ง B")])],
+            stop_reason="end_turn",
+        ),
     ]
     answer, receipts, structural = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำกล้องหน่อย"}],
         user_id=None, chat_id=None, tools_override=[],
     )
-    assert answer == "พบรุ่นที่แนะนำแล้วครับ"
+    assert answer.startswith("ส่วนแรก ส่วนหลัง")
+    assert "แหล่ง A — https://a.com" in answer
+    assert "แหล่ง B — https://b.com" in answer
     assert fake_client.call_count == 2
     assert receipts == []
     assert structural is False

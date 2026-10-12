@@ -2766,6 +2766,14 @@ def run_agentic_tool_loop(
         AVAILABLE_TOOLS + LIBRARY_TOOLS + CHAT_DOCUMENT_TOOLS if (user_id and chat_id) else AVAILABLE_TOOLS
     )
 
+    # เก็บ content blocks ของ response ที่ stop_reason == "pause_turn" สะสมไว้ (ดูจุดที่ใช้ด้านล่าง สุดท้าย
+    # ต่อกับ content ของ response ล่าสุดก่อนส่งเข้า _build_final_answer_with_citations) — เหตุการณ์จริงที่แก้:
+    # pause_turn อาจเกิดหลายครั้งติดกัน (web_search ใช้เวลานานมาก) แต่ละรอบมีข้อความ/citation ส่วนหนึ่งของคำตอบ
+    # เดียวกันอยู่ใน response ของรอบนั้นๆ เอง เดิมใช้แค่ response.content ของรอบสุดท้ายรอบเดียวตอนประกอบคำตอบ ทำให้
+    # ข้อความ/citation ของรอบก่อนๆ หายไปหมด ล้างทิ้งถ้ามีรอบเรียก custom tool จริงเกิดขึ้นคั่นกลาง (ส่วนที่สะสมไว้
+    # ก่อนหน้าไม่ใช่ส่วนหนึ่งของคำตอบสุดท้ายรอบนี้อีกต่อไปแล้ว)
+    paused_content_blocks: list = []
+
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -2780,9 +2788,11 @@ def run_agentic_tool_loop(
 
         if response.stop_reason == "pause_turn":
             # server tool (เช่น web_search ที่ใช้เวลาค้นนาน) ยังทำงานไม่เสร็จในเทิร์นนี้ — ไม่ใช่ tool_use ที่
-            # เราต้อง execute เอง และไม่ใช่ end_turn จริง ส่ง messages เดิม (รวม assistant content ล่าสุดที่เพิ่ง
-            # ต่อไปด้านบน) กลับเข้า loop เพื่อเรียกต่อในรอบถัดไปโดยไม่แก้ไขอะไรเพิ่ม (นับรวมเป็น 1 รอบใน
+            # เราต้อง execute เอง และไม่ใช่ end_turn จริง เก็บข้อความ/citation ของรอบนี้ไว้ก่อน (ดู
+            # paused_content_blocks ด้านบน) แล้วส่ง messages เดิม (รวม assistant content ล่าสุดที่เพิ่งต่อไป
+            # ด้านบน) กลับเข้า loop เพื่อเรียกต่อในรอบถัดไปโดยไม่แก้ไขอะไรเพิ่ม (นับรวมเป็น 1 รอบใน
             # MAX_TOOL_ITERATIONS เหมือนเดิม กันวนไม่รู้จบถ้า pause_turn ไม่เคยจบสักที)
+            paused_content_blocks.extend(response.content)
             continue
 
         if response.stop_reason != "tool_use":
@@ -2946,6 +2956,9 @@ def run_agentic_tool_loop(
 
         if not tool_results:
             break  # ไม่มี custom tool ให้ execute (เช่นมีแค่ web_search ที่ resolve ไปแล้วที่ server) กันวน loop เปล่า
+        # มีรอบเรียก custom tool จริงเกิดขึ้นคั่นกลาง — ข้อความ/citation ที่สะสมไว้จาก pause_turn ก่อนหน้า (ถ้ามี)
+        # ไม่ใช่ส่วนหนึ่งของคำตอบสุดท้ายรอบนี้อีกต่อไปแล้ว (ดู docstring ของ paused_content_blocks ด้านบน)
+        paused_content_blocks.clear()
         messages.append({"role": "user", "content": tool_results})
     else:
         # for...else: ส่วนนี้ทำงานเฉพาะตอนวนครบ MAX_TOOL_ITERATIONS โดยไม่เคย break เลยสักครั้ง — แปลว่า
@@ -2960,7 +2973,7 @@ def run_agentic_tool_loop(
         # Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด (ดู docstring ด้านบน)
         return "\n\n".join(applied_messages), action_receipts, structural_tool_called
 
-    final_text = _build_final_answer_with_citations(response.content)
+    final_text = _build_final_answer_with_citations(paused_content_blocks + response.content)
     if not final_text:
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
