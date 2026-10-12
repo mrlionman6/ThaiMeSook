@@ -573,6 +573,62 @@ def test_apply_structural_commands_reports_failure_without_stopping_remaining_co
     assert len(ns["_fake_db"].versions.get(1, [])) == 1  # เฉพาะคำสั่งที่สำเร็จเท่านั้นที่สร้างเวอร์ชัน
 
 
+# ---------- routing ระดับ ask_question(): direct parse ต้องถูกลองก่อน _is_structural_edit_command เสมอ ----------
+# (review PR #31 — เดิม direct parse ถูกเรียกเฉพาะเมื่อ _is_structural_edit_command(query) เป็น True เท่านั้น
+# "เปลี่ยน Box 4x4 เป็น 7x7"/"เปลี่ยนจำนวน Box 4x4 เป็น 30" ไม่มีคำที่ฟังก์ชันนั้นรู้จักเลย เลยไม่เคยไปถึง
+# _parse_direct_structural_commands — ตกไป classifier/agent ทั้งที่ parse ได้ชัดเจนด้วยโค้ดเฉยๆ)
+
+def test_resolve_direct_structural_dispatch_for_description_change_bypasses_is_structural_edit_command(ns, box_doc):
+    """"เปลี่ยน Box 4x4 เป็น 7x7" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ยืนยันด้วย assert ข้อแรก)
+    แต่ _resolve_direct_structural_dispatch ต้องยังจับได้และ apply จริง ไม่ต้องรอผ่าน gate นั้นก่อน"""
+    query = "เปลี่ยน Box 4x4 เป็น 7x7"
+    assert ns["_is_structural_edit_command"](query) is False
+
+    result = ns["_resolve_direct_structural_dispatch"](query, [box_doc], 1, 1)
+    assert result is not None
+    assert result["document_id"] == 1
+    assert "✓" in result["answer"]
+
+    filled = _current(ns)["tables"][0]["rows"]
+    assert filled[0]["values"]["description"] == "Box 7x7"
+
+
+@pytest.mark.parametrize("query,field,expected_value", [
+    ("เปลี่ยนจำนวน Box 4x4 เป็น 30", "qty", 30),
+    ("แก้หน่วยของ Box 6x6 เป็น กล่อง", "unit", "กล่อง"),
+])
+def test_resolve_direct_structural_dispatch_for_field_updates_bypasses_is_structural_edit_command(
+    ns, box_doc, query, field, expected_value
+):
+    assert ns["_is_structural_edit_command"](query) is False
+
+    result = ns["_resolve_direct_structural_dispatch"](query, [box_doc], 1, 1)
+    assert result is not None
+
+    filled = _current(ns)["tables"][0]["rows"]
+    target_index = 0 if "4x4" in query else 1
+    assert filled[target_index]["values"][field] == expected_value
+
+
+def test_resolve_direct_structural_dispatch_returns_none_for_non_table_label_edit(ns, doc1):
+    """"เปลี่ยนชื่อลูกค้าเป็น บริษัท ทดสอบ จำกัด" ไม่ใช่รายการในตาราง ("ชื่อลูกค้า" ไม่ใช่รายละเอียดสินค้าแถวไหน
+    เลย) — ต้องคืน None ปล่อยให้ ask_question() ไปทาง classifier (intent="edit") ตามเดิม ไม่ใช่เดา apply ผิดที่"""
+    result = ns["_resolve_direct_structural_dispatch"]("เปลี่ยนชื่อลูกค้าเป็น บริษัท ทดสอบ จำกัด", [doc1], 1, 1)
+    assert result is None
+    assert ns["_fake_db"].versions.get(1, []) == []
+
+
+def test_resolve_direct_structural_dispatch_returns_none_for_document_reading_question(ns, doc1):
+    """"มีรายการอะไรบ้าง" ไม่มีกริยาแก้ไฟล์เลย (ไม่มี "เปลี่ยน"/"แก้"/"ลบ") — parse ไม่ได้ตามธรรมชาติอยู่แล้ว คืน
+    None เสมอ ไม่ต้องพึ่ง gate อะไรเพิ่ม (ใน ask_question() จริง คำถามแบบนี้ถูกดักไปตอบด้วย
+    read_document_values ตั้งแต่ก่อนถึงจุดนี้อยู่แล้วเช่นกัน — ดู reading_question/document_content_question)"""
+    assert ns["_resolve_direct_structural_dispatch"]("มีรายการอะไรบ้าง", [doc1], 1, 1) is None
+
+
+def test_resolve_direct_structural_dispatch_returns_none_when_no_target_document(ns):
+    assert ns["_resolve_direct_structural_dispatch"]("เปลี่ยน VAT เป็น 10%", [], 1, 1) is None
+
+
 # ---------- routing: โครงสร้างต้องไปทาง agent ไม่ใช่ _match_and_apply_excel_edit ----------
 
 @pytest.mark.parametrize("query", [

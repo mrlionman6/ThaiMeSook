@@ -55,6 +55,7 @@ WANTED_MAIN_FUNCS = {
     "_find_single_rate_label",
     "_match_structural_clause", "_resolve_table_target", "_normalize_structural_target_text",
     "_combine_description_replacement", "_parse_structural_number", "_parse_direct_structural_commands",
+    "_resolve_direct_structural_dispatch",
     "_has_explicit_finalize_word", "_classify_pending_queue_command",
     "_normalize_pending_queue_command_text", "_mentions_pending_queue_intent",
     "_get_document_version_marker",

@@ -3847,30 +3847,31 @@ async def ask_question(
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
 
+        # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
+        # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
+        # _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น 7x7"/"เปลี่ยนจำนวน
+        # Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/"อัตรา"/"รายการที่ N"/
+        # "ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง ทั้งที่ parse ได้ชัดเจนด้วย
+        # โค้ดเฉยๆ
+        direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+        if direct_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+            answer = direct_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         # ด่านกันด้วยโค้ดก่อนเรียก classifier เลย (ไม่พึ่ง LLM อย่างเดียว) — เหตุการณ์จริงที่แก้: "เปลี่ยน VAT
         # เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียวเปิดอยู่ ถูก
         # _classify_excel_editor_intent ตีความเป็น "edit" แล้วไปเข้า _match_and_apply_excel_edit ซึ่งเขียนค่า
         # ทับเซลล์สูตรตรงๆ (สูตร VAT กลายเป็นค่าคงที่) โดยไม่มี preview/ยืนยันเลย ดู _is_structural_edit_command
+        # (ถึงจุดนี้ได้แปลว่า direct dispatch ด้านบนคืน None แล้ว — ไม่มีเอกสารเป้าหมายชัดเจน หรือ parse ไม่ได้
+        # เลย ต้องพึ่ง agent/LLM แทน)
         structural_route = bool(active_docs) and _is_structural_edit_command(query)
         if structural_route:
             focus_doc = get_chat_document_focus(chat_id, user_id)
             direct_target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
-
-            # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด — ดู _match_structural_clause)
-            # parse ด้วยโค้ดแล้วเรียก apply_* ตรงๆ เลย (แก้ไฟล์ทันที) ไม่ต้องผ่าน agent/LLM เลยสักครั้ง —
-            # เหตุการณ์จริงที่แก้: คำสั่งแบบนี้ไม่กำกวมเลย แต่บางครั้ง Claude ไม่เรียก tool เลย (ตอบ fallback
-            # คงที่แทน) ทั้งที่โค้ดรู้คำตอบได้เองอยู่แล้ว ดู _parse_direct_structural_commands
-            if direct_target_doc is not None:
-                direct_base_bytes, direct_label_map = get_working_copy(direct_target_doc)
-                direct_commands = _parse_direct_structural_commands(query, direct_base_bytes, direct_label_map)
-                if direct_commands is not None:
-                    print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_target_doc['id']}")
-                    answer = _apply_structural_commands(direct_target_doc["id"], user_id, direct_commands)
-                    add_chat_message(chat_id, "user", query)
-                    add_chat_message(chat_id, "assistant", answer)
-                    touch_chat_session(chat_id)
-                    return {"answer": answer, "sources": [], "chat_id": chat_id}
-
             log_doc_id = direct_target_doc["id"] if direct_target_doc else None
             print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
 
@@ -7196,6 +7197,36 @@ def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: 
     lines.append("")
     lines.append(_UNDO_HINT_LINE)
     return "\n".join(lines)
+
+
+def _resolve_direct_structural_dispatch(
+    query: str, active_docs: list[dict], chat_id: int, user_id: int
+) -> Optional[dict]:
+    """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งแก้โครงสร้างที่ชัดเจนได้ไหม (ไม่ต้องพึ่ง _is_structural_edit_command
+    เลยสักนิด) แล้ว apply ทันทีถ้าใช่ — แยกออกมาจาก ask_question() เป็นฟังก์ชันเดี่ยวๆ เพื่อให้ทดสอบ "ระดับ
+    routing" ได้โดยไม่ต้องพึ่ง FastAPI/Request จริง (ดู review PR #31 — เดิม direct parse ถูกเรียกเฉพาะเมื่อ
+    _is_structural_edit_command(query) เป็น True เท่านั้น ทำให้คำสั่งที่ parse ได้ชัดเจนมากอย่าง "เปลี่ยน Box
+    4x4 เป็น 7x7"/"เปลี่ยนจำนวน Box 4x4 เป็น 30" ไม่เคยถูกลองเลยสักครั้ง เพราะไม่มีคำที่
+    _is_structural_edit_command รู้จัก — ต้องลอง parse ก่อนเช็ค gate นั้นเสมอ)
+
+    เป้าหมาย: เอกสารที่โฟกัสอยู่ในแชทนี้ หรือเปิดอยู่ไฟล์เดียวพอดี (ไม่มีทั้งสองอย่าง — เช่น เปิดหลายไฟล์พร้อมกัน
+    ไม่มีโฟกัส — ถือว่ากำกวมเกินจะเดา ไม่ลอง parse เลย คืน None ทันที)
+
+    คืน {"document_id":, "answer":} ถ้า parse ได้และ apply จริงไปแล้ว (เรียก _apply_structural_commands จริง —
+    ไฟล์ถูกแก้แล้ว) หรือ None ถ้าไม่มีเอกสารเป้าหมายชัดเจน หรือ parse ไม่ได้เลย (ให้ ask_question() ปล่อยตกไป
+    ทำงานปกติ — เช็ค _is_structural_edit_command/classifier/agent ต่อเหมือนเดิมทุกประการ)"""
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    direct_target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    if direct_target_doc is None:
+        return None
+
+    base_bytes, label_map = get_working_copy(direct_target_doc)
+    commands = _parse_direct_structural_commands(query, base_bytes, label_map)
+    if commands is None:
+        return None
+
+    answer = _apply_structural_commands(direct_target_doc["id"], user_id, commands)
+    return {"document_id": direct_target_doc["id"], "answer": answer}
 
 
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:
