@@ -66,6 +66,7 @@ WANTED_MAIN_FUNCS = {
     "_match_and_apply_excel_edit", "_parse_json_response",
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
     "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
+    "_advisor_target_doc", "_advisor_document_context",
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text",

@@ -3572,16 +3572,23 @@ def _classify_question_route(query: str) -> str:
 _ADVISOR_REPLACEMENT_OFFER_LINE = "ถ้าต้องการ พิมพ์เช่น 'แทนรายการที่ 5 ด้วยรุ่นที่ 1' หรือ 'เพิ่มรุ่นที่ 2'"
 
 
+def _advisor_target_doc(active_docs: list[dict], chat_id: Optional[int], user_id: Optional[int]) -> Optional[dict]:
+    """หาเอกสารเป้าหมายของเส้นทาง advisor (โฟกัสอยู่ หรือไฟล์เดียวที่เปิดอยู่พอดี) — ใช้ร่วมกันทั้ง
+    _advisor_offer_line (เสนอแทนรายการ) และ _advisor_document_context (ส่งตารางรายการเป็น context) คืน None ถ้า
+    ไม่มีเอกสารเปิดอยู่/ไม่ได้ล็อกอิน/กำกวม (หลายไฟล์ไม่มีโฟกัส)"""
+    if not active_docs or not chat_id or not user_id:
+        return None
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    return focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+
+
 def _advisor_offer_line(active_docs: list[dict], chat_id: Optional[int], user_id: Optional[int], query: str) -> str:
     """คืนบรรทัดเสนอ "แทนรายการที่ N ด้วยรุ่นที่เลือก" ท้ายคำตอบ advisor ถ้ามีใบเสนอราคาเปิดอยู่ตอนนี้ และคำถามนี้
     เอ่ยถึงรายการ/label ที่มีอยู่จริงในตารางของไฟล์นั้นตรงๆ (ดู _query_mentions_table_item_or_label) — การแทน/
     เพิ่มรายการจริงจากคำตอบ advisor ยังไม่ได้ต่อสายจริงใน PR นี้ (ตั้งใจเลื่อนไป PR ถัดไป) นี่แค่ข้อความเสนอให้
     ผู้ใช้รู้ว่าพิมพ์คำสั่งแบบไหนได้ คืนว่างเปล่าถ้าไม่มีเอกสารเปิดอยู่/ไม่ได้ล็อกอิน/คำถามไม่เกี่ยวกับรายการใน
     ตารางของไฟล์ที่เปิดอยู่เลย"""
-    if not active_docs or not chat_id or not user_id:
-        return ""
-    focus_doc = get_chat_document_focus(chat_id, user_id)
-    target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    target_doc = _advisor_target_doc(active_docs, chat_id, user_id)
     if target_doc is None:
         return ""
     if _query_mentions_table_item_or_label(query, target_doc):
@@ -3589,12 +3596,32 @@ def _advisor_offer_line(active_docs: list[dict], chat_id: Optional[int], user_id
     return ""
 
 
-def _advisor_system_prompt() -> str:
+def _advisor_document_context(active_docs: list[dict], chat_id: Optional[int], user_id: Optional[int]) -> str:
+    """คืนข้อความตารางรายการ/ค่าในเอกสาร (ใบเสนอราคา ฯลฯ) ที่เปิดอยู่ในแชทนี้ตอนนี้ (ถ้ามี) — ใช้
+    read_document_values ตรงๆ (ข้อมูลจริงจากไฟล์ จัดรูปแล้วด้วย _format_document_values_text เหมือนเส้นทางอื่นๆ
+    ที่ใช้ข้อมูลไฟล์ ไม่ให้ AI เดา) ส่งเป็น context ให้ advisor เข้าใจว่ากำลังช่วยโครงการ/งานแบบไหนอยู่ ไม่ว่าจะเป็น
+    สินค้าประเภทใดก็ตาม (ไม่ hardcode ตามประเภทสินค้าเลย — ดู docstring ของ _advisor_system_prompt) คืนว่างเปล่า
+    ถ้าไม่มีเอกสารเป้าหมายชัดเจน หรือไฟล์นั้นไม่มีตารางรายการเลย"""
+    target_doc = _advisor_target_doc(active_docs, chat_id, user_id)
+    if target_doc is None:
+        return ""
+    data = read_document_values(target_doc)
+    if not data.get("tables"):
+        return ""
+    return _format_document_values_text(data)
+
+
+def _advisor_system_prompt(document_context: str = "") -> str:
     """system prompt สำหรับ advisor_answer — ไม่มีข้อความบังคับ "ตอบจากข้อมูลอ้างอิงเท่านั้น"/บริบทฐานความรู้
     กฎหมายใดๆ เลย (ต่างจาก _prepare_rag_context โดยตั้งใจ) ห้ามพูดถึงฐานความรู้/เอกสารอ้างอิงกับผู้ใช้เด็ดขาดไม่
-    ว่ากรณีใด — วันที่ปัจจุบัน (เวลาไทย) ใส่ไว้ให้ AI ใช้ระบุว่าราคาที่ค้นเจอเป็นราคาโดยประมาณ ณ วันที่เท่าไร"""
+    ว่ากรณีใด — วันที่ปัจจุบัน (เวลาไทย) ใส่ไว้ให้ AI ใช้ระบุว่าราคาที่ค้นเจอเป็นราคาโดยประมาณ ณ วันที่เท่าไร
+
+    document_context (ดู _advisor_document_context): ถ้ามี (มีใบเสนอราคา/เอกสารเปิดอยู่และมีตารางรายการ) ต่อท้าย
+    ด้วยตารางรายการจริง + กติกาเปรียบเทียบ/ผลกระทบ/หน่วยขาย 3 ข้อด้านล่าง — ทั้งหมดเป็นกติกาทั่วไปที่ใช้ได้กับ
+    สินค้าทุกประเภท ไม่ hardcode เกณฑ์ตายตัวตามสินค้าใดสินค้าหนึ่งเลย (ให้ AI เลือกเกณฑ์ที่เหมาะสมเองตามสินค้าที่
+    ถูกถามถึงจริงในแต่ละครั้ง)"""
     today = datetime.datetime.now(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d")
-    return (
+    prompt = (
         "คุณเป็นผู้ช่วยให้คำแนะนำทั่วไปสำหรับผู้ประกอบการ/นักลงทุนในประเทศไทย ตอบคำถามทั่วไปที่ไม่ใช่คำถามเชิง"
         "กฎหมาย/ภาษี/การลงทุน (เช่น แนะนำ/เปรียบเทียบสินค้า อุปกรณ์ รุ่น ราคา ผู้ให้บริการ หรือคำถามธุรกิจทั่วไป"
         "อื่นๆ)\n"
@@ -3617,6 +3644,24 @@ def _advisor_system_prompt() -> str:
         "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใช้ \"ค่ะ\" เด็ดขาด\n"
         "- ห้ามใส่ข้อความ disclaimer ทางกฎหมายท้ายคำตอบ (ไม่เกี่ยวกับคำถามประเภทนี้)"
     )
+    if document_context:
+        prompt += (
+            "\n\n- ตารางรายการในใบเสนอราคา/เอกสารที่เปิดอยู่ในแชทนี้ตอนนี้ (ข้อมูลจริงจากไฟล์ ใช้ทำความเข้าใจว่า"
+            "กำลังช่วยเรื่องโครงการ/งานแบบไหนอยู่ ไม่ใช่ข้อมูลอ้างอิงที่ต้องยึดตอบตามเป๊ะเหมือนฐานความรู้กฎหมาย):\n"
+            + document_context + "\n\n"
+            "- เลือกเกณฑ์เปรียบเทียบ 3-5 ข้อที่เหมาะสมกับประเภทสินค้าที่ถูกถามถึงในครั้งนี้เอง (เกณฑ์ไม่ตายตัว "
+            "สินค้าแต่ละประเภทมีสิ่งที่ควรเทียบต่างกัน เช่น กล้องวงจรปิดอาจดูความละเอียด/มุมมอง/การมองเห็นในที่มืด, "
+            "ฮาร์ดดิสก์อาจดูความจุ/รอบการเขียนอ่านต่อวันที่รองรับ/อายุการรับประกัน, สายสัญญาณอาจดูความยาวสูงสุดที่"
+            "ส่งสัญญาณได้/เกรดสาย/มาตรฐานที่รองรับ — เลือกเกณฑ์ที่ตรงกับสินค้าที่ถูกถามจริงๆ เอง) แล้วเปรียบเทียบ"
+            "ตัวเลือกที่แนะนำตามเกณฑ์เหล่านั้นให้ชัดเจน\n"
+            "- ถ้าตัวเลือกที่แนะนำกระทบรายการอื่นในใบเสนอราคาเดียวกัน (เช่น ความเข้ากันได้/ความจุ/จำนวนพอร์ต/ขนาด"
+            "ที่ต้องเปลี่ยนตามไปด้วย) ให้แจ้งเป็นหัวข้อ 'ผลกระทบต่อรายการอื่น' แยกต่างหากท้ายคำตอบเสมอ แจ้งให้ผู้ใช้"
+            "ทราบเท่านั้น ห้ามบอกว่าแก้ไฟล์ให้แล้วหรือกำลังจะแก้ไฟล์ให้เด็ดขาด (คำตอบนี้ยังไม่มีการแก้ไฟล์ใดๆ "
+            "เกิดขึ้นจริง)\n"
+            "- ทุกรุ่นที่แนะนำต้องระบุหน่วยขาย (เช่น ชิ้น/กล่อง 10 ชิ้น/ม้วน 305 เมตร) เทียบกับหน่วยของรายการเดิม"
+            "ในตารางด้านบน ถ้าหน่วยขายของรุ่นที่แนะนำไม่ตรงกับหน่วยเดิม ให้บอกผู้ใช้ตรงๆ ด้วย"
+        )
+    return prompt
 
 
 def advisor_answer(
@@ -3624,21 +3669,24 @@ def advisor_answer(
     active_docs: Optional[list] = None,
 ) -> tuple[str, list]:
     """คำตอบสำหรับเส้นทาง advisor (คำถามทั่วไป/แนะนำสินค้า ไม่ใช่กฎหมาย/เนื้อหาไฟล์เอกสารที่เปิดอยู่) — ไม่มี
-    context จากฐานความรู้กฎหมายเลย (ต่างจาก rag_answer) ใช้ system prompt แยกต่างหาก (ดู _advisor_system_prompt)
-    ส่งประวัติสนทนาล่าสุด (เหมือน rag_answer — สูงสุด MAX_HISTORY_MESSAGES ข้อความ) ให้ AI เข้าใจบริบทคำถามที่
-    เคยถามไปก่อนหน้า (เช่น ผู้ใช้เพิ่งตอบคำถามที่เคยถูกถามกลับ) เปิดใช้ web_search ทั่วไป (ไม่จำกัดโดเมน ต่างจาก
-    AVAILABLE_TOOLS — ดู ADVISOR_TOOLS) ไม่มีเครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้ (ฟีเจอร์ "แทนรายการด้วย
-    รุ่นที่เลือก" ยังไม่ต่อสายจริง — แค่เสนอข้อความท้ายคำตอบถ้าเข้าเงื่อนไข ดู _advisor_offer_line)
+    context จากฐานความรู้กฎหมายเลย (ต่างจาก rag_answer) ใช้ system prompt แยกต่างหาก (ดู _advisor_system_prompt —
+    ต่อท้ายด้วยตารางรายการของเอกสารที่เปิดอยู่ถ้ามี ดู _advisor_document_context) ส่งประวัติสนทนาล่าสุด (เหมือน
+    rag_answer — สูงสุด MAX_HISTORY_MESSAGES ข้อความ) ให้ AI เข้าใจบริบทคำถามที่เคยถามไปก่อนหน้า (เช่น ผู้ใช้เพิ่ง
+    ตอบคำถามที่เคยถูกถามกลับ) เปิดใช้ web_search ทั่วไป (ไม่จำกัดโดเมน ต่างจาก AVAILABLE_TOOLS — ดู ADVISOR_TOOLS)
+    ไม่มีเครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้ (ฟีเจอร์ "แทนรายการด้วยรุ่นที่เลือก" ยังไม่ต่อสายจริง — แค่
+    เสนอข้อความท้ายคำตอบถ้าเข้าเงื่อนไข ดู _advisor_offer_line)
 
     คืน (ข้อความคำตอบ, []) เสมอ (sources ว่างเสมอ — ไม่มี RAG chunk ให้แสดง เป็นเส้นทางที่ไม่ผ่านฐานความรู้เลย)"""
     history = history or []
     active_docs = active_docs or []
+    document_context = _advisor_document_context(active_docs, chat_id, user_id)
     recent_history = history[-MAX_HISTORY_MESSAGES:] if history else []
     messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
     messages.append({"role": "user", "content": query})
 
     raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
-        _advisor_system_prompt(), messages, user_id=user_id, chat_id=chat_id, tools_override=ADVISOR_TOOLS,
+        _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
+        tools_override=ADVISOR_TOOLS,
     )
     answer = _normalize_polite_particles(raw_answer)
     answer += _advisor_offer_line(active_docs, chat_id, user_id, query)

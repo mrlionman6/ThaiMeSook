@@ -96,6 +96,42 @@ def box_doc(ns):
     return ns["_fake_db"].documents[1]
 
 
+def _build_quote_workbook_with_items(items):
+    """ทั่วไปกว่า _build_box_quote_workbook — รับรายการ (desc, qty, unit, price) เองได้ ใช้ทดสอบว่า advisor
+    ส่งตารางรายการเป็น context ได้กับสินค้า "ทุกประเภท" ไม่ใช่เฉพาะกรณี Box/ไส้ไก่ (ดู feat/advisor-route:
+    เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขายต้องเป็นกติกาทั่วไป ไม่ hardcode ตามสินค้า)"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+    ws["A15"] = "ลำดับ"
+    ws["B15"] = "รายการ"
+    ws["D15"] = "จำนวน"
+    ws["E15"] = "หน่วย"
+    ws["F15"] = "ราคา/หน่วย"
+    ws["G15"] = "จำนวนเงิน"
+
+    cache_values = {}
+    for i, (desc, qty, unit, price) in enumerate(items):
+        row = 16 + i
+        ws.cell(row=row, column=1, value=i + 1)
+        ws.cell(row=row, column=2, value=desc)
+        ws.cell(row=row, column=4, value=qty)
+        ws.cell(row=row, column=5, value=unit)
+        ws.cell(row=row, column=6, value=price)
+        ws.cell(row=row, column=7, value=f"=D{row}*F{row}")
+        cache_values[f"G{row}"] = qty * price
+
+    last_item_row = 16 + len(items) - 1
+    total = sum(qty * price for _, qty, _, price in items)
+    ws["A26"] = "รวมเงิน"
+    ws["G26"] = f"=SUM(G16:G{last_item_row})"
+    cache_values["G26"] = total
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return inject_formula_cache(buf.getvalue(), cache_values)
+
+
 def _current(ns, document_id=1):
     """อ่านค่าปัจจุบันของเอกสาร (สำเนาทำงานล่าสุด) — ใช้ตรวจผลหลัง apply ทันที"""
     doc = ns["get_editable_document_raw"](document_id)
@@ -923,6 +959,74 @@ def test_advisor_answer_does_not_offer_replacement_when_question_unrelated_to_op
         "แนะนำ Rack case server 12U", history=[], user_id=1, chat_id=1, active_docs=[box_doc],
     )
     assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] not in answer
+
+
+# ---------- feat/advisor-route: ส่งตารางรายการเป็น context + เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขาย ----------
+# ต้องเป็นกติกาทั่วไปที่ใช้ได้กับสินค้า "ทุกประเภท" ไม่ hardcode ตามสินค้าใดสินค้าหนึ่ง — ทดสอบด้วย 3 ประเภทสินค้า
+# ที่ต่างกันมาก (กล้องวงจรปิด/ฮาร์ดดิสก์/สายสัญญาณ) ยืนยันว่า system prompt มีตารางรายการจริง + คำสั่งเรื่องเกณฑ์
+# เปรียบเทียบและผลกระทบต่อรายการอื่นเหมือนกันทุกประเภท (ไม่ใช่ข้อความเฉพาะกิจของสินค้าใดสินค้าหนึ่ง)
+
+_CAMERA_ITEMS = [("กล้องวงจรปิด 4MP รุ่น A", 8, "ตัว", 1200), ("Switch PoE 8 พอร์ต", 1, "เครื่อง", 2500)]
+_HDD_ITEMS = [("ฮาร์ดดิสก์ 4TB สำหรับ NVR", 2, "ลูก", 2800), ("NVR 8 ช่อง", 1, "เครื่อง", 4500)]
+_CABLE_ITEMS = [("สาย UTP Cat6 กล่อง 305 ม.", 3, "กล่อง", 1800), ("หัวต่อ RJ45", 100, "ชิ้น", 3)]
+
+
+@pytest.fixture
+def camera_doc(ns):
+    raw = _build_quote_workbook_with_items(_CAMERA_ITEMS)
+    label_map = ns["_extract_excel_labels"](raw)
+    ns["_fake_db"].add_document(1, "quote.xlsx", raw, label_map, chat_id=1, user_id=1)
+    return ns["_fake_db"].documents[1]
+
+
+@pytest.fixture
+def hdd_doc(ns):
+    raw = _build_quote_workbook_with_items(_HDD_ITEMS)
+    label_map = ns["_extract_excel_labels"](raw)
+    ns["_fake_db"].add_document(1, "quote.xlsx", raw, label_map, chat_id=1, user_id=1)
+    return ns["_fake_db"].documents[1]
+
+
+@pytest.fixture
+def cable_doc(ns):
+    raw = _build_quote_workbook_with_items(_CABLE_ITEMS)
+    label_map = ns["_extract_excel_labels"](raw)
+    ns["_fake_db"].add_document(1, "quote.xlsx", raw, label_map, chat_id=1, user_id=1)
+    return ns["_fake_db"].documents[1]
+
+
+@pytest.mark.parametrize("doc_fixture_name, query, item_text", [
+    ("camera_doc", "มีกล้องวงจรปิด 4MP รุ่นอื่นที่คุ้มกว่านี้ไหม", "กล้องวงจรปิด 4MP รุ่น A"),
+    ("hdd_doc", "ฮาร์ดดิสก์สำหรับ NVR รุ่นนี้มีตัวเลือกอื่นไหม", "ฮาร์ดดิสก์ 4TB สำหรับ NVR"),
+    ("cable_doc", "สาย UTP แบบนี้มีเกรดอื่นให้เลือกไหม", "สาย UTP Cat6 กล่อง 305 ม."),
+])
+def test_advisor_system_prompt_includes_quotation_table_for_any_product_category(
+    ns, request, doc_fixture_name, query, item_text,
+):
+    """ไม่ว่าจะเป็นสินค้าประเภทไหน (กล้อง/HDD/สาย) advisor_answer ต้องส่งตารางรายการจริงของใบเสนอราคาที่เปิดอยู่
+    เป็น context เสมอ (ดู _advisor_document_context) และ system prompt ต้องมีกติกาทั่วไป 3 ข้อ: เกณฑ์เปรียบเทียบ
+    3-5 ข้อ, หัวข้อ "ผลกระทบต่อรายการอื่น", และหน่วยขายของรุ่นที่แนะนำ — ข้อความเดียวกันทุกประเภทสินค้า ไม่ใช่
+    ข้อความเฉพาะกิจของสินค้าใดสินค้าหนึ่ง"""
+    doc = request.getfixturevalue(doc_fixture_name)
+    ns["_fake_agentic_loop"].set_response("แนะนำรุ่น A, B, C ครับ", [], False)
+    ns["advisor_answer"](query, history=[], user_id=1, chat_id=1, active_docs=[doc])
+
+    system_prompt = ns["_fake_agentic_loop"].last_call_args["system_prompt"]
+    assert item_text in system_prompt
+    assert "เกณฑ์เปรียบเทียบ 3-5 ข้อ" in system_prompt
+    assert "ผลกระทบต่อรายการอื่น" in system_prompt
+    assert "หน่วยขาย" in system_prompt
+    # ห้ามบอกว่าแก้ไฟล์ไปแล้ว/กำลังจะแก้ — แจ้งผลกระทบเท่านั้น
+    assert "ยังไม่มีการแก้ไฟล์ใดๆ เกิดขึ้นจริง" in system_prompt
+
+
+def test_advisor_system_prompt_has_no_document_context_section_without_open_document(ns):
+    ns["_fake_agentic_loop"].set_response("แนะนำรุ่น A, B, C ครับ", [], False)
+    ns["advisor_answer"]("แนะนำ Rack case server 12U", history=[], user_id=1, chat_id=1, active_docs=[])
+
+    system_prompt = ns["_fake_agentic_loop"].last_call_args["system_prompt"]
+    assert "เกณฑ์เปรียบเทียบ 3-5 ข้อ" not in system_prompt
+    assert "ผลกระทบต่อรายการอื่น" not in system_prompt
 
 
 # ---------- feat/advisor-route: export บทสนทนาเป็นไฟล์ .txt ----------
