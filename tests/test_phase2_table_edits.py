@@ -14,6 +14,7 @@ from _harness import (
     build_namespace, build_fixture_workbook, inject_formula_cache,
     FIXTURE_TOTAL, FIXTURE_VAT, FIXTURE_GRAND_TOTAL,
     _FakeCitation, _FakeAgenticTextBlock, _FakeAgenticResponse,
+    _FakeAgenticOtherBlock, _FakeAgenticToolUseBlock,
 )
 
 
@@ -144,14 +145,15 @@ def _current(ns, document_id=1):
 def test_apply_change_rate_to_10_percent(ns, doc1):
     result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
     assert result["matched"] is True
-    assert "เปลี่ยนอัตราของ" in result["message"]
-    assert "10%" in result["message"]
+    assert "✓ เปลี่ยน 'ภาษีมูลค่าเพิ่ม'" in result["message"]
+    assert "จาก 7% เป็น 10%" in result["message"]
     assert "พิมพ์ 'ย้อนการแก้'" in result["message"]
 
     expected_vat = round(FIXTURE_TOTAL * 0.10, 2)
     expected_total = FIXTURE_TOTAL + expected_vat
-    assert str(expected_vat) in result["message"]
-    assert str(expected_total) in result["message"]
+    # ตัวเลขเงินมีคอมมาคั่นหลักพันเสมอ (ดู _format_money_value) เช่น "8,822" ไม่ใช่ "8822.0"
+    assert ns["_format_money_value"](expected_vat) in result["message"]
+    assert ns["_format_money_value"](expected_total) in result["message"]
 
     data = _current(ns)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
@@ -164,21 +166,44 @@ def test_apply_change_rate_to_10_percent(ns, doc1):
 
 
 def test_apply_change_rate_message_and_values_show_current_label_not_stale_name(ns, doc1):
-    """เหตุการณ์จริงที่แก้: เปลี่ยน VAT จาก 7% เป็น 25% สำเร็จ แต่ข้อความผลลัพธ์/read_document_values ยังโชว์ชื่อ
-    เดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่ตลอดไป (label_map key แช่แข็งไว้ตั้งแต่ extract ครั้งแรก ไม่เคยอัปเดตตาม
-    ข้อความจริงในเซลล์ป้าย) ตอนนี้ต้องโชว์ "ภาษีมูลค่าเพิ่ม 25%" ทั้งในข้อความผลลัพธ์และ read_document_values"""
+    """เหตุการณ์จริงที่แก้ (3 รอบ): (1) read_document_values/ยอดล่าสุด เคยโชว์ชื่อเดิม "ภาษีมูลค่าเพิ่ม 7%" ค้างอยู่
+    ตลอดไปหลังเปลี่ยนเป็น 25% แล้ว (2) ข้อความผลลัพธ์เคยเขียน "เปลี่ยนอัตราของ 'ภาษีมูลค่าเพิ่ม 25%' เป็น 25%"
+    (บอกว่าเปลี่ยนจาก 25% ทั้งที่จริงเปลี่ยนจาก 7%) ตอนนี้ต้องเขียน "เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%"
+    ชัดเจน (3) label ที่ถูกแก้ตรงๆ (VAT) ไม่ต้องโผล่ซ้ำใต้หัวข้อ "ยอดล่าสุด:" อีก เพราะมีบรรทัด "เปลี่ยนจาก...เป็น..."
+    ของมันเองอยู่แล้วในข้อความหลัก (ดู _document_totals_lines exclude_labels) — read_document_values เอง (ไม่ผ่าน
+    exclude_labels) ยังโชว์ "ภาษีมูลค่าเพิ่ม 25%" (ชื่อปัจจุบันจริง) ตามปกติ"""
     result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 25)
     assert result["matched"] is True
-    assert "'ภาษีมูลค่าเพิ่ม 25%'" in result["message"]
+    assert "✓ เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%" in result["message"]
     assert "ภาษีมูลค่าเพิ่ม 7%" not in result["message"]
     assert "ยอดล่าสุด" in result["message"]
-    assert "ภาษีมูลค่าเพิ่ม 25%:" in result["message"]
+    # VAT เองไม่ซ้ำใต้ "ยอดล่าสุด:" อีก (ถูกกันด้วย exclude_labels เพราะมีบรรทัดหลักของมันเองอยู่แล้ว)
+    assert "ภาษีมูลค่าเพิ่ม 25%:" not in result["message"]
+    # แต่ "รวมเงิน" (ไม่ได้ถูกกล่าวถึงที่ไหนเลย ไม่ใช่ผลข้างเคียงด้วย) ยังโผล่ใต้ "ยอดล่าสุด:" ตามปกติ
+    assert "รวมเงิน:" in result["message"]
 
     data = _current(ns)
     label_values = {l["label"]: l["value"] for l in data["labels"]}
     assert "ภาษีมูลค่าเพิ่ม 7%" not in label_values
     expected_vat = round(FIXTURE_TOTAL * 0.25, 2)
     assert label_values["ภาษีมูลค่าเพิ่ม 25%"] == expected_vat
+
+
+@pytest.mark.parametrize("value, expected", [
+    (2.0, "2"), (2, "2"), (54436, "54,436"), (54436.0, "54,436"),
+    (3810.5, "3,810.50"), (58246.52, "58,246.52"), (0, "0"), (None, "None"), ("ชิ้น", "ชิ้น"),
+])
+def test_format_money_value(ns, value, expected):
+    assert ns["_format_money_value"](value) == expected
+
+
+def test_format_side_effect_lines_has_space_before_verb(ns):
+    """เหตุการณ์จริงที่แก้: เดิมติดกัน "ภาษีมูลค่าเพิ่ม 7%เปลี่ยนจาก..." (ไม่มีช่องว่างระหว่างชื่อ label กับ verb)
+    อ่านยาก ตอนนี้ต้องมีช่องว่างคั่นเสมอ และตัวเลขต้องมีคอมมาคั่นหลักพัน"""
+    side_effects = [{"label": "รวมราคาทั้งสิ้น", "old_value": 8581.4, "new_value": 10025}]
+    text = ns["_format_side_effect_lines"](side_effects, "เปลี่ยน")
+    assert "รวมราคาทั้งสิ้น เปลี่ยนจาก 8,581.40 เป็น 10,025" in text
+    assert "ทั้งสิ้นเปลี่ยนจาก" not in text  # ไม่ติดกันแบบเดิม
 
 
 def test_apply_change_rate_noop_when_already_at_target_rate(ns, doc1):
@@ -217,8 +242,8 @@ def test_apply_change_rate_position_based_lookup_matches_real_file_scale(ns):
 
     result = ns["apply_change_rate"](2, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
     assert result["matched"] is True
-    assert "5815" in result["message"]
-    assert "63965" in result["message"]
+    assert "5,815" in result["message"]  # คอมมาคั่นหลักพัน (ดู _format_money_value)
+    assert "63,965" in result["message"]
 
 
 # ---------- update_table_item (แก้ทันที) ----------
@@ -985,10 +1010,11 @@ def test_build_final_answer_with_citations_joins_text_blocks_without_breaking_se
     assert body == "กล้องรุ่น A ราคาประมาณ 1,500 บาท ตามที่ประกาศไว้ และยังมีอีกร้านที่เสนอราคา 1,450 บาท"
     assert "\n\n" not in body
 
-    # citation ตัดซ้ำตาม url (https://a.com เจอ 2 ครั้งแต่นับครั้งเดียว) ไม่เกิน 5 แหล่ง
+    # citation ตัดซ้ำตาม url (https://a.com เจอ 2 ครั้งแต่นับครั้งเดียว) ไม่เกิน 5 แหล่ง รูปแบบ "N. <title> —
+    # [ลิงก์](<url>)" (markdown link ไม่ใช่ URL ดิบ — ดู _build_final_answer_with_citations)
     assert text.count("แหล่งที่มา:") == 1
-    assert "1. ร้าน A — https://a.com" in text
-    assert "2. ร้าน B — https://b.com" in text
+    assert "1. ร้าน A — [ลิงก์](https://a.com)" in text
+    assert "2. ร้าน B — [ลิงก์](https://b.com)" in text
     assert text.count("ร้าน A —") == 1
 
 
@@ -998,7 +1024,7 @@ def test_build_final_answer_with_citations_caps_at_five_sources(ns):
         for i in range(8)
     ]
     text = ns["_build_final_answer_with_citations"](blocks)
-    assert text.count(" — https://site") == 5
+    assert text.count("[ลิงก์](https://site") == 5
     assert "https://site5.com" not in text  # index 0-4 เท่านั้น (5 แหล่งแรก)
 
 
@@ -1031,11 +1057,233 @@ def test_run_agentic_tool_loop_continues_after_pause_turn_then_ends_on_second_ca
         user_id=None, chat_id=None, tools_override=[],
     )
     assert answer.startswith("ส่วนแรก ส่วนหลัง")
-    assert "แหล่ง A — https://a.com" in answer
-    assert "แหล่ง B — https://b.com" in answer
+    assert "แหล่ง A — [ลิงก์](https://a.com)" in answer
+    assert "แหล่ง B — [ลิงก์](https://b.com)" in answer
     assert fake_client.call_count == 2
     assert receipts == []
     assert structural is False
+
+
+def test_build_final_answer_with_citations_drops_text_written_before_search(ns):
+    """ข้อความที่ Claude เขียนไว้ "ก่อน" เรียก web_search (เช่น "ขอค้นเพิ่มเติม...") ต้องไม่หลุดเข้าคำตอบสุดท้าย —
+    ใช้เฉพาะ text block ที่อยู่ "หลัง" server_tool_use/web_search_tool_result block สุดท้ายเท่านั้น"""
+    blocks = [
+        _FakeAgenticTextBlock("ขอค้นเพิ่มเติมเพื่อหาราคาไทยที่ชัดเจน:"),
+        _FakeAgenticOtherBlock("server_tool_use"),
+        _FakeAgenticOtherBlock("web_search_tool_result", content=[{"url": "https://a.com", "title": "A"}]),
+        _FakeAgenticTextBlock("คำตอบ"),
+    ]
+    text = ns["_build_final_answer_with_citations"](blocks)
+    assert text == "คำตอบ"
+    assert "ขอค้นเพิ่มเติม" not in text
+
+
+def test_run_agentic_tool_loop_present_recommendations_filters_unverified_source_urls(ns):
+    """Claude เรียก present_recommendations 3 รุ่น (url 2 อันอยู่ในผลค้นจริง, 1 อันไม่อยู่เลย — แต่งขึ้นเอง) ->
+    ต้องเหลือแค่ 2 รุ่นที่ยืนยันได้ เลข 1-2 มี [ลิงก์] รุ่นที่ 3 (แต่ง url) ต้องไม่โผล่มาในคำตอบเลย และบันทึกแค่
+    รายการที่เหลือ (2 รุ่น) ไว้ที่ chat_last_recommendations"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    tool_input = {
+        "criteria": ["ความจุ", "ความเร็ว", "ราคา"],
+        "items": [
+            {
+                "name": "รุ่น A", "key_specs": "สเปก A", "price_thb": 1000, "price_note": None, "unit": "ชิ้น",
+                "source_url": "https://a.com", "compatible": True, "compatibility_note": None,
+            },
+            {
+                "name": "รุ่น B", "key_specs": "สเปก B", "price_thb": 2000, "price_note": None, "unit": "ชิ้น",
+                "source_url": "https://b.com", "compatible": False, "compatibility_note": "แรงดันไฟไม่ตรงกัน",
+            },
+            {
+                "name": "รุ่น C (แต่งขึ้นเอง)", "key_specs": "สเปก C", "price_thb": 3000, "price_note": None,
+                "unit": "ชิ้น", "source_url": "https://ไม่มีจริง.com", "compatible": True,
+                "compatibility_note": None,
+            },
+        ],
+        "impacts": ["ต้องเปลี่ยนสายไฟให้รองรับด้วย"],
+        "summary": "แนะนำรุ่น A และ B ครับ"
+    }
+    search_result_block = _FakeAgenticOtherBlock("web_search_tool_result", content=[
+        {"url": "https://a.com", "title": "เว็บ A"}, {"url": "https://b.com", "title": "เว็บ B"},
+    ])
+    tool_use_block = _FakeAgenticToolUseBlock("tool_1", "present_recommendations", tool_input)
+    fake_client.response_queue = [
+        _FakeAgenticResponse([search_result_block, tool_use_block], stop_reason="tool_use"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("จบ")], stop_reason="end_turn"),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำกล้องหน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    assert "1. รุ่น A" in answer
+    assert "2. รุ่น B" in answer
+    assert "[ลิงก์](https://a.com)" in answer
+    assert "[ลิงก์](https://b.com)" in answer
+    assert "รุ่น C" not in answer
+    assert "⚠ แรงดันไฟไม่ตรงกัน" in answer
+    assert "ผลกระทบต่อรายการอื่น:" in answer
+    assert "ต้องเปลี่ยนสายไฟให้รองรับด้วย" in answer
+
+    saved = ns["_fake_db"].last_recommendations.get(1)
+    assert saved is not None
+    assert len(saved) == 2
+    assert saved[0]["name"] == "รุ่น A"
+
+
+def test_render_recommendations_answer_returns_fixed_message_when_no_items_survive_filtering(ns):
+    answer = ns["_render_recommendations_answer"]({"criteria": [], "items": [], "impacts": [], "summary": ""}, False)
+    assert answer == ns["_NO_VERIFIED_RECOMMENDATIONS_MESSAGE"]
+
+
+def test_render_recommendations_answer_appends_offer_line_only_when_document_open(ns):
+    result = {
+        "criteria": ["ก"], "items": [{
+            "name": "รุ่น A", "key_specs": "สเปก", "price_thb": 100, "price_note": None, "unit": "ชิ้น",
+            "source_url": "https://a.com", "compatible": True, "compatibility_note": None,
+        }],
+        "impacts": [], "summary": "",
+    }
+    with_doc = ns["_render_recommendations_answer"](result, True)
+    without_doc = ns["_render_recommendations_answer"](result, False)
+    assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] in with_doc
+    assert ns["_ADVISOR_REPLACEMENT_OFFER_LINE"] not in without_doc
+
+
+# ---------- feat/recommend-to-document: เชื่อมรายการแนะนำสินค้าเข้าใบเสนอราคา ----------
+# box_doc (ดู _BOX_ITEMS ด้านบน) มี 8 รายการ: รายการที่ 5 = "Item E" (1 เครื่อง ราคา 5000)
+
+_SAMPLE_RECOMMENDATIONS = [
+    {
+        "name": "Rack case 9U รุ่นประหยัด", "key_specs": "เหล็กหนา 1.2mm", "price_thb": 4405.0,
+        "price_note": None, "unit": "ตู้", "source_url": "https://shop-a.com/product", "compatible": True,
+        "compatibility_note": None,
+    },
+    {
+        "name": "Rack case 9U รุ่นพรีเมียม", "key_specs": "เหล็กหนา 1.5mm กันสนิม", "price_thb": None,
+        "price_note": "≈ $423 ราคาต่างประเทศ", "unit": "ตู้", "source_url": "https://shop-b.com/product",
+        "compatible": True, "compatibility_note": None,
+    },
+]
+
+
+def test_recommendation_replace_command_changes_description_and_price_keeps_qty(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1", [box_doc], 1, 1)
+    assert result is not None
+    answer = result["answer"]
+    assert "✓ แทนรายการที่ 5 (Item E) ด้วย Rack case 9U รุ่นประหยัด" in answer
+    assert "ราคา/หน่วย 5,000 → 4,405" in answer
+    assert "(ราคาอ้างอิงจาก shop-a.com)" in answer
+    assert "พิมพ์ 'ย้อนการแก้'" in answer
+
+    row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert row["description"] == "Rack case 9U รุ่นประหยัด"
+    assert row["unit_price"] == 4405.0
+    assert row["qty"] == 1  # จำนวนคงเดิม
+
+    undo_result = ns["undo_last_edit"](1, 1)
+    assert undo_result["matched"] is True
+    restored_row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert restored_row["description"] == "Item E"
+    assert restored_row["unit_price"] == 5000
+
+
+def test_recommendation_replace_command_with_explicit_price(ns, box_doc):
+    """ผู้ใช้ระบุราคาเอง ("ราคา X") ถือว่าราคาเปลี่ยนจริงเสมอ (แม้บังเอิญตรงกับราคาเดิมเป๊ะ) ต้องมี "→" และ
+    วงเล็บ "(ราคาที่กำหนดเอง)" ไม่ใช่ "(ราคาอ้างอิงจาก ...)" เพราะไม่ได้มาจากเว็บ"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1 ราคา 5000", [box_doc], 1, 1)
+    row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert row["unit_price"] == 5000
+    assert "ราคา/หน่วย 5,000 → 5,000 (ราคาที่กำหนดเอง)" in result["answer"]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
+
+
+def test_recommendation_replace_command_with_original_price_shows_no_change_wording(ns, box_doc):
+    """เหตุการณ์จริงที่แก้: "ราคาเดิม" เคยโชว์ "ราคา/หน่วย 5,000 → 5,000 (ราคาอ้างอิงจาก ...)" ซึ่งชวนเข้าใจผิดว่า
+    ราคาเปลี่ยนไปแล้วทั้งที่ไม่ได้อ้างอิงเว็บอะไรเลย ตอนนี้ต้องโชว์ "ราคาเดิม 5,000 บาท" เฉยๆ ไม่มี "→"/วงเล็บเลย"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1 ราคาเดิม", [box_doc], 1, 1)
+    row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert row["description"] == "Rack case 9U รุ่นประหยัด"
+    assert row["unit_price"] == 5000  # ราคาเดิมไม่เปลี่ยน
+    assert "ราคาเดิม 5,000 บาท" in result["answer"]
+    assert "→" not in result["answer"].splitlines()[0]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
+    assert "ยังไม่ได้เปลี่ยนราคา" not in result["answer"]  # ผู้ใช้ตั้งใจเลือกไม่เปลี่ยนเอง ไม่ใช่ไม่มีราคาให้ใช้
+
+
+def test_recommendation_replace_command_with_markup_percent(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"](
+        "แทนรายการที่ 5 ด้วยรุ่นที่ 1 บวกกำไร 20%", [box_doc], 1, 1,
+    )
+    row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert row["unit_price"] == 5286.00
+    assert "ราคา/หน่วย 5,000 → 5,286 (ราคาอ้างอิงจาก shop-a.com)" in result["answer"]
+
+
+def test_recommendation_replace_command_with_null_price_only_changes_name_and_notifies(ns, box_doc):
+    """รุ่นที่ 2 (รุ่นพรีเมียม) price_thb เป็น null และผู้ใช้ไม่ได้ระบุราคาต่อท้ายคำสั่งเลย -> แก้แค่ชื่อ ราคาเดิม
+    คงอยู่ พร้อมข้อความแจ้งให้พิมพ์ราคาเอง — receipt ต้องโชว์ "ราคาเดิม X บาท" เฉยๆ ไม่มี "→"/วงเล็บที่มาเลย"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 2", [box_doc], 1, 1)
+    row = _current(ns)["tables"][0]["rows"][4]["values"]
+    assert row["description"] == "Rack case 9U รุ่นพรีเมียม"
+    assert row["unit_price"] == 5000  # ราคาเดิมยังไม่เปลี่ยน
+    assert "ราคาเดิม 5,000 บาท" in result["answer"]
+    assert "→" not in result["answer"].splitlines()[0]
+    assert "ราคาอ้างอิงจาก" not in result["answer"]
+    assert "ยังไม่ได้เปลี่ยนราคา" in result["answer"]
+    assert "≈ $423 ราคาต่างประเทศ" in result["answer"]
+
+
+def test_recommendation_add_command_with_quantity(ns, doc1):
+    """doc1 (build_fixture_workbook) มีความจุ 10 แถว เต็ม 8 รายการ เหลือว่าง 2 แถว (ดู test_apply_add_table_item_
+    until_full) — box_doc เต็มพอดี 8/8 ไม่มีที่ว่างให้เพิ่มเลย จึงใช้ doc1 แทนสำหรับเทสต์ "เพิ่มสำเร็จ" นี้"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("เพิ่มรุ่นที่ 2 จำนวน 2", [doc1], 1, 1)
+    assert result is not None
+    # qty parse มาเป็น float (2.0) เสมอ — ข้อความต้องโชว์ "จำนวน=2" ไม่ใช่ "จำนวน=2.0" (ดู _format_money_value)
+    assert "จำนวน=2" in result["answer"]
+    assert "จำนวน=2.0" not in result["answer"]
+    data = _current(ns)
+    filled = data["tables"][0]["rows"]
+    assert len(filled) == 9
+    new_row = filled[-1]["values"]
+    assert new_row["description"] == "Rack case 9U รุ่นพรีเมียม"
+    assert new_row["qty"] == 2
+
+
+def test_recommendation_add_command_reports_full_table(ns, doc1):
+    """เติมที่ว่างทั้ง 2 แถวที่เหลือของ doc1 จนเต็ม (10/10) แล้วลองเพิ่มอีกต้องถูกปฏิเสธพร้อมแจ้งตรงๆ"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_resolve_recommendation_command_dispatch"]("เพิ่มรุ่นที่ 1", [doc1], 1, 1)
+    ns["_resolve_recommendation_command_dispatch"]("เพิ่มรุ่นที่ 1", [doc1], 1, 1)
+    result = ns["_resolve_recommendation_command_dispatch"]("เพิ่มรุ่นที่ 1", [doc1], 1, 1)
+    assert result is not None
+    assert "เต็มแล้ว" in result["answer"]
+
+
+def test_recommendation_command_without_any_recommendations_yet(ns, box_doc):
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1", [box_doc], 1, 1)
+    assert result is not None
+    assert "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ" in result["answer"]
+
+
+def test_recommendation_command_with_out_of_range_model_index(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 9", [box_doc], 1, 1)
+    assert result is not None
+    assert "มีรุ่นแนะนำแค่ 2 รุ่น" in result["answer"]
+
+
+def test_recommendation_command_dispatch_returns_none_for_unrelated_query(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    assert ns["_resolve_recommendation_command_dispatch"]("แนะนำ Rack case server 12U", [box_doc], 1, 1) is None
 
 
 # ---------- feat/advisor-route: ส่งตารางรายการเป็น context + เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขาย ----------
@@ -1082,8 +1330,10 @@ def test_advisor_system_prompt_includes_quotation_table_for_any_product_category
 ):
     """ไม่ว่าจะเป็นสินค้าประเภทไหน (กล้อง/HDD/สาย) advisor_answer ต้องส่งตารางรายการจริงของใบเสนอราคาที่เปิดอยู่
     เป็น context เสมอ (ดู _advisor_document_context) และ system prompt ต้องมีกติกาทั่วไป 3 ข้อ: เกณฑ์เปรียบเทียบ
-    3-5 ข้อ, หัวข้อ "ผลกระทบต่อรายการอื่น", และหน่วยขายของรุ่นที่แนะนำ — ข้อความเดียวกันทุกประเภทสินค้า ไม่ใช่
-    ข้อความเฉพาะกิจของสินค้าใดสินค้าหนึ่ง"""
+    3-5 ข้อ, กติกาเรื่อง impacts (ผลกระทบต่อรายการอื่น/อุปกรณ์จำเป็นที่ขาดไป), และหน่วยขายของรุ่นที่แนะนำ —
+    ข้อความเดียวกันทุกประเภทสินค้า ไม่ใช่ข้อความเฉพาะกิจของสินค้าใดสินค้าหนึ่ง (หัวข้อ "ผลกระทบต่อรายการอื่น:" ที่
+    ผู้ใช้เห็นจริงๆ ตอนนี้มาจากโค้ด _render_recommendations_answer ไม่ใช่ system prompt อีกต่อไป — AI กรอกแค่
+    ข้อมูลดิบผ่าน present_recommendations)"""
     doc = request.getfixturevalue(doc_fixture_name)
     ns["_fake_agentic_loop"].set_response("แนะนำรุ่น A, B, C ครับ", [], False)
     ns["advisor_answer"](query, history=[], user_id=1, chat_id=1, active_docs=[doc])
@@ -1091,7 +1341,8 @@ def test_advisor_system_prompt_includes_quotation_table_for_any_product_category
     system_prompt = ns["_fake_agentic_loop"].last_call_args["system_prompt"]
     assert item_text in system_prompt
     assert "เกณฑ์เปรียบเทียบ 3-5 ข้อ" in system_prompt
-    assert "ผลกระทบต่อรายการอื่น" in system_prompt
+    assert "impacts" in system_prompt
+    assert "NVR/DVR" in system_prompt
     assert "หน่วยขาย" in system_prompt
     # ห้ามบอกว่าแก้ไฟล์ไปแล้ว/กำลังจะแก้ — แจ้งผลกระทบเท่านั้น
     assert "ยังไม่มีการแก้ไฟล์ใดๆ เกิดขึ้นจริง" in system_prompt
@@ -1147,3 +1398,22 @@ def test_build_chat_export_text_handles_missing_or_unparsable_timestamp(ns):
     messages = [{"role": "user", "content": "ข้อความไม่มีเวลา", "created_at": None}]
     text = ns["_build_chat_export_text"]("แชททดสอบ", messages)
     assert "[-] ผู้ใช้: ข้อความไม่มีเวลา" in text
+
+
+def test_strip_markdown_for_export_removes_bold_and_rewrites_links(ns):
+    assert ns["_strip_markdown_for_export"]("**ตัวหนา**") == "ตัวหนา"
+    assert ns["_strip_markdown_for_export"]("__ตัวหนา__") == "ตัวหนา"
+    assert ns["_strip_markdown_for_export"]("[ลิงก์](https://x.com)") == "ลิงก์ (https://x.com)"
+    assert ns["_strip_markdown_for_export"]("# หัวข้อใหญ่") == "หัวข้อใหญ่"
+
+
+def test_build_chat_export_text_strips_markdown_from_message_content(ns):
+    messages = [{
+        "role": "assistant",
+        "content": "แนะนำ **รุ่น A** — [ลิงก์](https://x.com)",
+        "created_at": "2026-10-12T12:00:00",
+    }]
+    text = ns["_build_chat_export_text"]("แชททดสอบ", messages)
+    assert "แนะนำ รุ่น A — ลิงก์ (https://x.com)" in text
+    assert "**" not in text
+    assert "[ลิงก์]" not in text

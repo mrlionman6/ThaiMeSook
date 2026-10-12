@@ -101,6 +101,8 @@ from db import (
     upsert_customer,
     set_chat_last_listing,
     get_chat_last_listing,
+    set_chat_last_recommendations,
+    get_chat_last_recommendations,
     clear_chat_document_focus,
     close_editable_document,
     log_document_edit,
@@ -193,6 +195,14 @@ client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "1234")
+
+# เส้นทาง advisor (แนะนำสินค้า/ราคา ฯลฯ) ใช้โมเดลนี้แทน Haiku (ดู advisor_answer) — ต้องการเหตุผล/ภาษาไทยที่
+# แม่นยำกว่าในคำตอบยาวๆ ที่ผสมผลค้นเว็บหลายแหล่ง (เหตุการณ์จริงที่แก้: Haiku เขียนภาษาไทยเพี้ยนในคำตอบยาว เช่น
+# "ขออบรรจุรายการ"/"หนึ่งพัฒนาการคำเทคนิก") ตั้งค่าผ่าน env ได้ (ไม่ hardcode ตายตัว เผื่อ API key นี้ยังเข้าถึง
+# รุ่นนี้ไม่ได้ หรือ Anthropic ออกรุ่นใหม่กว่านี้ภายหลัง) ค่าเริ่มต้นเป็น Claude API ID ของ Sonnet รุ่นล่าสุด ณ
+# ตอนเขียน (claude-sonnet-5-5 — ดู platform.claude.com/docs/en/about-claude/models/all-models) เส้นทางอื่น
+# ทั้งหมด (legal RAG/classifier ต่างๆ) ยังใช้ Haiku เหมือนเดิมทุกจุด ไม่เปลี่ยน
+ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-5-5")
 
 def require_login(request: Request):
     if not request.session.get("logged_in"):
@@ -512,10 +522,96 @@ GENERAL_WEB_SEARCH_TOOL = {
     "max_uses": 3,
 }
 
-# เส้นทาง advisor ไม่ให้เครื่องมือแก้ไฟล์ (change_rate/update_table_item/ฯลฯ) หรือเครื่องมือคลังเอกสารเลย —
-# ฟีเจอร์ "แทนรายการที่ N ด้วยรุ่นที่เลือก" ยังไม่ได้ต่อสายจริงใน PR นี้ (แค่ข้อความเสนอท้ายคำตอบ ดู
-# _advisor_offer_line) ตั้งใจไม่ให้ AI เรียก tool แก้ไฟล์เองได้เลยในเส้นทางนี้ กันพลาดแก้ไฟล์โดยไม่ได้ตั้งใจ
-ADVISOR_TOOLS = [GENERAL_WEB_SEARCH_TOOL]
+# เครื่องมือเดียวที่ advisor_answer ใช้ส่งคำแนะนำสินค้าแบบมีโครงสร้าง (ดู execute_present_recommendations/
+# _render_recommendations_answer) — บังคับให้ AI ส่งข้อมูลเป็น JSON โครงสร้างแน่นอนเสมอ แล้วให้โค้ดเป็นคนจัดรูป
+# คำตอบสุดท้ายเอง ไม่ปล่อยให้ Claude เขียนรายการแนะนำเป็นข้อความอิสระ (เหตุการณ์จริงที่แก้: บางคำตอบมีเลขรายการ
+# บางคำตอบไม่มี จัดรูปไม่สม่ำเสมอ) และตรวจ source_url กับผลค้นจริงได้ (กัน Claude แต่งรุ่น/URL ขึ้นเอง)
+PRESENT_RECOMMENDATIONS_TOOL = {
+    "name": "present_recommendations",
+    "description": (
+        "ส่งคำแนะนำสินค้า/รุ่นที่เปรียบเทียบแล้วแบบมีโครงสร้างเสมอ ต้องเรียกเครื่องมือนี้ทุกครั้งที่จะแนะนำสินค้า/"
+        "รุ่นให้ผู้ใช้ หลังค้นเว็บ (web_search) หาข้อมูลจริงเสร็จแล้วเท่านั้น ห้ามเขียนรายการแนะนำเป็นข้อความเอง"
+        "ในคำตอบเด็ดขาดไม่ว่ากรณีใด ให้โค้ดจัดรูปคำตอบสุดท้ายให้เองทั้งหมด"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "criteria": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 3,
+                "maxItems": 5,
+                "description": (
+                    "เกณฑ์เปรียบเทียบ 3-5 ข้อที่เหมาะกับสินค้าประเภทนี้โดยเฉพาะ (คิดเองตามสินค้าที่ถูกถามถึงจริง "
+                    "ในครั้งนี้ ไม่ใช่เกณฑ์ตายตัว — สินค้าต่างประเภทมีสิ่งที่ควรเทียบต่างกัน)"
+                ),
+            },
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 5,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "ชื่อรุ่น/ยี่ห้อที่แนะนำ"},
+                        "key_specs": {"type": "string", "description": "สเปกสำคัญสั้นๆ ตามเกณฑ์ที่เลือก"},
+                        "price_thb": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "ราคาเป็นบาท ตัวเลขล้วน ถ้าเป็นช่วงราคา/ราคาต่างประเทศ/ไม่มีราคาที่ชัดเจน "
+                                "ให้ใส่ null แล้วอธิบายใน price_note แทน ห้ามแต่งตัวเลขขึ้นเองเด็ดขาด"
+                            ),
+                        },
+                        "price_note": {
+                            "type": ["string", "null"],
+                            "description": (
+                                "คำอธิบายราคาเพิ่มเติม ใช้เมื่อ price_thb เป็น null เท่านั้น "
+                                "(เช่น '≈ $423 ราคาต่างประเทศ')"
+                            ),
+                        },
+                        "unit": {
+                            "type": ["string", "null"],
+                            "description": "หน่วยขาย เช่น ชิ้น/กล่อง 10 ชิ้น/ม้วน 305 เมตร",
+                        },
+                        "source_url": {
+                            "type": "string",
+                            "description": "URL ของแหล่งข้อมูลที่ใช้ยืนยันรุ่น/ราคานี้ ต้องมาจากผลค้น web_search ของเทิร์นนี้จริงๆ เท่านั้น",
+                        },
+                        "compatible": {
+                            "type": "boolean",
+                            "description": "เข้ากันได้กับระบบที่มีอยู่ในใบเสนอราคาที่เปิดอยู่ไหม (ใส่ true ถ้าไม่มีใบเสนอราคาเปิดอยู่)",
+                        },
+                        "compatibility_note": {
+                            "type": ["string", "null"],
+                            "description": "เหตุผลสั้นๆ ถ้า compatible เป็น false (ไม่งั้นใส่ null)",
+                        },
+                    },
+                    "required": [
+                        "name", "key_specs", "price_thb", "price_note", "unit",
+                        "source_url", "compatible", "compatibility_note",
+                    ],
+                },
+            },
+            "impacts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "ผลกระทบต่อรายการอื่นในใบเสนอราคาเดียวกัน (ความเข้ากันได้/ความจุ/จำนวนพอร์ต/ขนาดที่ต้อง"
+                    "เปลี่ยนตามไปด้วย) หรืออุปกรณ์จำเป็นที่ขาดไปจากระบบ (เช่น มีกล้อง+ฮาร์ดดิสก์แต่ไม่มี NVR/DVR "
+                    "ให้เสียบ) ห้ามโยงอุปกรณ์ที่ไม่เกี่ยวข้องกันผิดหลักเทคนิค (เช่น ฮาร์ดดิสก์อยู่ใน NVR/DVR ไม่ใช่ "
+                    "ในตู้ rack โดยตรง) ว่างเปล่าถ้าไม่มีผลกระทบใดๆ"
+                ),
+            },
+            "summary": {"type": "string", "description": "สรุปสั้นๆ ปิดท้ายคำตอบ"},
+        },
+        "required": ["criteria", "items", "impacts", "summary"],
+    },
+}
+
+# เส้นทาง advisor ไม่ให้เครื่องมือแก้ไฟล์ (change_rate/update_table_item/ฯลฯ) หรือเครื่องมือคลังเอกสารเลย — การ
+# เชื่อมคำแนะนำเข้าเอกสารทำผ่านคำสั่ง direct parse ด้วยโค้ดแทน (ดู _resolve_recommendation_command_dispatch) ไม่
+# ให้ AI เรียก tool แก้ไฟล์เองได้เลยในเส้นทางนี้ กันพลาดแก้ไฟล์โดยไม่ได้ตั้งใจ
+ADVISOR_TOOLS = [GENERAL_WEB_SEARCH_TOOL, PRESENT_RECOMMENDATIONS_TOOL]
 
 # แยกจาก AVAILABLE_TOOLS โดยตั้งใจ — สอง tool นี้เข้าถึงข้อมูลส่วนตัวของ user (สร้าง EditableDocument
 # ผูกกับ user_id/chat_id) จึงต้องส่งให้ Claude เห็นเฉพาะตอนมี user_id ที่ล็อกอินอยู่จริงเท่านั้น
@@ -2671,23 +2767,40 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
 
 _MAX_ANSWER_CITATIONS = 5
 
+# block ชนิดที่บ่งบอกว่ามีการค้นเว็บเกิดขึ้นจริงในเทิร์นนี้ (server_tool_use = Claude ขอค้น,
+# web_search_tool_result = ผลค้นที่ Anthropic ส่งกลับมาอัตโนมัติ) — ใช้โดย _build_final_answer_with_citations
+# ตัดข้อความที่ Claude เขียน "ก่อน" เรียกค้นทิ้ง (ดู docstring ด้านล่าง)
+_SEARCH_TOOL_BLOCK_TYPES = ("server_tool_use", "web_search_tool_result")
+
 
 def _build_final_answer_with_citations(content_blocks: list) -> str:
-    """ประกอบคำตอบสุดท้ายจาก text block ทั้งหมดของ response (ดู run_agentic_tool_loop) — ต่อกันด้วย "" ตรงๆ
-    (ไม่ใช่ "\\n\\n") แล้ว strip เพราะ web_search ทำให้ Claude แบ่งคำตอบเป็นหลาย text block ตรงจุดอ้างอิงแหล่งที่มา
+    """ประกอบคำตอบสุดท้ายจาก text block ของ response (ดู run_agentic_tool_loop) — ต่อกันด้วย "" ตรงๆ (ไม่ใช่
+    "\\n\\n") แล้ว strip เพราะ web_search ทำให้ Claude แบ่งคำตอบเป็นหลาย text block ตรงจุดอ้างอิงแหล่งที่มา
     (citation) ซึ่งมักอยู่กลางประโยค — ต่อด้วย "\\n\\n" แบบเดิมทำให้ประโยคเดียวกันแตกเป็นสองย่อหน้าโดยไม่ตั้งใจ
     (เหตุการณ์จริงที่แก้ — กระทบเส้นทาง advisor ที่ค้นเว็บบ่อยที่สุด แต่ใช้ร่วมกับเส้นทางกฎหมายเดิมด้วย)
 
-    เก็บ citations จากทุก text block (block.citations — Anthropic แนบมาเองตอนอ้างอิงผลค้นจาก web_search แต่ละ
-    ชิ้น มี url/title) ตัดซ้ำตาม url (เก็บรายการแรกที่เจอ คงลำดับเดิม) ไม่เกิน _MAX_ANSWER_CITATIONS แหล่ง ต่อท้าย
-    คำตอบเป็นหัวข้อ "แหล่งที่มา:" ก็ต่อเมื่อมีอย่างน้อย 1 รายการเท่านั้น — คำตอบที่ไม่ได้ใช้ web_search เลย (ไม่มี
-    citation ติดมาด้วยสักอัน) ไม่ต่อท้ายอะไรเพิ่มเลย"""
-    text_parts = [block.text for block in content_blocks if block.type == "text"]
+    ใช้เฉพาะ text block ที่อยู่ "หลัง" server_tool_use/web_search_tool_result block สุดท้ายใน content_blocks
+    เท่านั้น (ดู _SEARCH_TOOL_BLOCK_TYPES — รวม block ที่สะสมมาจาก pause_turn ก่อนหน้าด้วย ถ้า caller ส่งมารวมกัน
+    แล้ว) ไม่มีการค้นเว็บเลยในเทิร์นนี้ (ไม่เจอ block ชนิดนี้สักอัน) ใช้ทุก text block เหมือนเดิมทั้งหมด —
+    เหตุการณ์จริงที่แก้: ข้อความที่ Claude เขียนไว้ "ก่อน" เรียก web_search (เช่น "ขอค้นเพิ่มเติมเพื่อหาราคาไทยที่
+    ชัดเจน:") หลุดเข้าไปปนกับคำตอบสุดท้ายจริง ทั้งที่เป็นแค่ความคิด/แผนก่อนเรียกเครื่องมือ ไม่ใช่ส่วนหนึ่งของคำตอบ
+
+    เก็บ citations จากทุก text block ที่นับ (block.citations — Anthropic แนบมาเองตอนอ้างอิงผลค้นจาก web_search
+    แต่ละชิ้น มี url/title) ตัดซ้ำตาม url (เก็บรายการแรกที่เจอ คงลำดับเดิม) ไม่เกิน _MAX_ANSWER_CITATIONS แหล่ง
+    ต่อท้ายคำตอบเป็นหัวข้อ "แหล่งที่มา:" ก็ต่อเมื่อมีอย่างน้อย 1 รายการเท่านั้น — คำตอบที่ไม่ได้ใช้ web_search เลย
+    (ไม่มี citation ติดมาด้วยสักอัน) ไม่ต่อท้ายอะไรเพิ่มเลย"""
+    last_search_index = None
+    for i, block in enumerate(content_blocks):
+        if block.type in _SEARCH_TOOL_BLOCK_TYPES:
+            last_search_index = i
+    relevant_blocks = content_blocks[last_search_index + 1:] if last_search_index is not None else content_blocks
+
+    text_parts = [block.text for block in relevant_blocks if block.type == "text"]
     final_text = "".join(text_parts).strip()
 
     seen_urls = set()
     citations: list[tuple[str, str]] = []
-    for block in content_blocks:
+    for block in relevant_blocks:
         if block.type != "text":
             continue
         for citation in (getattr(block, "citations", None) or []):
@@ -2704,15 +2817,17 @@ def _build_final_answer_with_citations(content_blocks: list) -> str:
     if not citations:
         return final_text
 
-    source_lines = [f"{i}. {title} — {url}" for i, (title, url) in enumerate(citations, start=1)]
+    source_lines = [f"{i}. {title} — [ลิงก์]({url})" for i, (title, url) in enumerate(citations, start=1)]
     return final_text + "\n\nแหล่งที่มา:\n" + "\n".join(source_lines)
 
 
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
-    tools_override: Optional[list] = None,
+    tools_override: Optional[list] = None, model: Optional[str] = None,
 ) -> tuple[str, list[str], bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
+    - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL — ต้องการเหตุผล/
+      ภาษาไทยที่แม่นยำกว่าในคำตอบยาวๆ ที่ผสมผลค้นเว็บหลายแหล่ง) เส้นทางอื่นทั้งหมดไม่ระบุมา ใช้ Haiku เหมือนเดิม
     - tools_override: ถ้าระบุมา ใช้ชุดนี้แทนการประกอบ AVAILABLE_TOOLS+LIBRARY_TOOLS+CHAT_DOCUMENT_TOOLS ตามปกติ
       ทั้งหมด (ใช้โดย advisor_answer — ดู ADVISOR_TOOLS — ให้เครื่องมือเฉพาะ web_search ทั่วไปเท่านั้น ไม่มี
       เครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้) dispatcher ของแต่ละ tool ด้านล่างยังคงเช็คชื่อ tool ตามปกติ
@@ -2774,9 +2889,15 @@ def run_agentic_tool_loop(
     # ก่อนหน้าไม่ใช่ส่วนหนึ่งของคำตอบสุดท้ายรอบนี้อีกต่อไปแล้ว)
     paused_content_blocks: list = []
 
+    # url ทุกตัวที่มาจากผลค้น web_search จริงของเทิร์นนี้ (citations ของ text block + รายการผลลัพธ์ใน
+    # web_search_tool_result block) สะสมตลอดทั้งฟังก์ชัน (ไม่ล้างแม้มีรอบ tool_results คั่นกลาง — ยังเป็นผลค้นจริง
+    # ของบทสนทนาเทิร์นนี้อยู่) ใช้ตรวจ source_url ที่ Claude อ้างใน present_recommendations ว่ามาจากผลค้นจริงหรือ
+    # แต่งขึ้นเอง (ดู execute_present_recommendations)
+    verified_source_urls: set = set()
+
     for _ in range(MAX_TOOL_ITERATIONS):
         response = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=model or "claude-haiku-4-5-20251001",
             max_tokens=2500,  # เดิม 1500 — เพิ่มเพราะคำตอบสาย investment advisor มักมี breakdown + อ้างอิงกฎหมายยาวขึ้น
             system=system_prompt,
             tools=tools_for_this_call,
@@ -2785,6 +2906,20 @@ def run_agentic_tool_loop(
 
         # แปลงเป็น dict ชัดเจนก่อนส่งกลับเข้า messages กัน serialize พลาด (ปลอดภัยกว่าพึ่ง SDK แปลงให้เอง)
         messages.append({"role": "assistant", "content": [block.model_dump() for block in response.content]})
+
+        for block in response.content:
+            if block.type == "text":
+                for citation in (getattr(block, "citations", None) or []):
+                    url = getattr(citation, "url", None)
+                    if url:
+                        verified_source_urls.add(url)
+            elif block.type == "web_search_tool_result":
+                result_content = getattr(block, "content", None)
+                if isinstance(result_content, list):
+                    for result in result_content:
+                        url = result.get("url") if isinstance(result, dict) else getattr(result, "url", None)
+                        if url:
+                            verified_source_urls.add(url)
 
         if response.stop_reason == "pause_turn":
             # server tool (เช่น web_search ที่ใช้เวลาค้นนาน) ยังทำงานไม่เสร็จในเทิร์นนี้ — ไม่ใช่ tool_use ที่
@@ -2948,6 +3083,23 @@ def run_agentic_tool_loop(
                 structural_tool_called = True
                 result = _safe_execute_tool("add_table_item", execute_add_table_item, block.input, user_id, chat_id)
                 _track_applied_result("add_table_item", result)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
+            elif block.type == "tool_use" and block.name == "present_recommendations":
+                result = _safe_execute_tool(
+                    "present_recommendations", execute_present_recommendations,
+                    block.input, chat_id, verified_source_urls,
+                )
+                if "error" in result:
+                    applied_messages.append(result["error"])
+                else:
+                    has_open_document = bool(
+                        user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
+                    )
+                    applied_messages.append(_render_recommendations_answer(result, has_open_document))
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -3339,7 +3491,13 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
         "สำหรับคำถามธุรกิจทั่วไปนอกเหนือจากนี้ ตอบด้วยความรู้ทั่วไปตามปกติ ไม่ต้องบอกว่า \"นอกเหนือความเชี่ยวชาญ\"\n"
         "- เจาะลึกเป็นพิเศษด้าน: พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว, BOI, การจดทะเบียนธุรกิจ, ภาษีนิติบุคคล, "
         "Work Permit/วีซ่านักลงทุน, การถือครองที่ดิน/อสังหาริมทรัพย์โดยชาวต่างชาติ\n"
-        "- ถ้าข้อมูลอ้างอิงที่ให้มาตรงกับคำถาม ให้ใช้ข้อมูลนั้นเป็นหลัก อ้างอิงชื่อกฎหมาย/มาตราให้ชัดเจนเมื่อทำได้\n"
+        "- ถ้าข้อมูลอ้างอิงที่ให้มาตรงกับคำถาม ให้ใช้ข้อมูลนั้นเป็นหลัก อ้างอิงชื่อกฎหมาย/มาตราให้ชัดเจนเมื่อทำได้ "
+        "(เช่น \"ตาม พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว มาตรา...\") ห้ามอ้างคำว่า \"ข้อมูลอ้างอิง\"/\"ข้อมูลที่ให้มา\" "
+        "ลอยๆ โดยไม่ระบุชื่อกฎหมาย/แหล่งที่มาจริงเด็ดขาด — ผู้ใช้ไม่รู้ว่า \"ข้อมูลอ้างอิง\" ของระบบคืออะไร "
+        "ชื่อกฎหมาย/มาตราต่างหากที่มีความหมายกับผู้ใช้\n"
+        "- ถ้าข้อมูลอ้างอิงที่ให้มาเป็นแค่ \"ตัวอย่างบางส่วน\" ของรายการที่มีทั้งหมด (เช่น รายชื่อธุรกิจในบัญชี "
+        "พ.ร.บ.ต่างด้าว) ไม่ใช่รายการครบถ้วนทั้งหมด ห้ามเขียนราวกับว่าเป็นรายการทั้งหมด ให้ใช้คำว่า \"ตัวอย่างเช่น\"/"
+        "\"ได้แก่ (ตัวอย่าง)\" กำกับไว้เสมอ และบอกผู้ใช้ว่ายังมีรายการอื่นอีกถ้าข้อมูลที่ให้มาไม่ครบ\n"
         # เดิม 2 บรรทัด (ลบทั้งคู่ — ต้นเหตุคำตอบกฎหมายผิด/แต่งข้อมูลจากผลทดสอบจริง 12 ข้อ: AI เติมรายละเอียด
         # ที่ KB ไม่ครอบคลุมเองทั้งหมดโดยไม่บอก แต่งชื่อหน่วยงานที่ไม่มีจริง และตอบขัดกันเองระหว่างคำถาม):
         # "- ถ้าข้อมูลอ้างอิงไม่ครอบคลุมหรือไม่มีรายละเอียดพอ ให้ใช้ความรู้ทั่วไปของคุณตอบเสริมให้ครบถ้วนที่สุด "
@@ -3356,7 +3514,8 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
         # เดิม: "ใช้คำลงท้ายประโยคว่า \"ครับ\" เท่านั้นเสมอ ห้ามใช้ \"ค่ะ\" หรือเขียน \"ครับ/ค่ะ\" คู่กันเด็ดขาด"
         # แก้เป็นข้อนี้แทน — เคยเจอ Claude ใส่ "ครับ" ท้ายทุกย่อหน้า/เป็นบรรทัดเดี่ยวทั้งที่ยังไม่จบคำตอบ
         "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใส่ \"ครับ\" ท้ายทุกย่อหน้าหรือเป็น "
-        "บรรทัดเดี่ยวๆ ห้ามใช้ \"ค่ะ\" เด็ดขาด ห้ามขึ้นต้นคำตอบด้วย \"จากข้อมูลอ้างอิงที่ให้มา\"\n"
+        "บรรทัดเดี่ยวๆ ห้ามใช้ \"ค่ะ\" เด็ดขาด ห้ามขึ้นต้นคำตอบด้วย \"จากข้อมูลอ้างอิงที่ให้มา\"/\"ตามข้อมูลอ้างอิง\" "
+        "หรือวลีทำนองเดียวกันเด็ดขาด — ขึ้นต้นด้วยคำตอบจริงหรือชื่อกฎหมาย/มาตราที่เกี่ยวข้องแทน\n"
         "- ถ้าผู้ใช้พิมพ์คำถามเป็นภาษาอังกฤษ ให้ตอบเป็นภาษาอังกฤษ เพราะนักลงทุนต่างชาติจำนวนมากอ่านภาษาไทยไม่ออก\n"
         "- ห้ามใส่ข้อความ disclaimer หรือคำเตือนทางกฎหมายท้ายคำตอบเอง เพราะมีข้อความนี้แสดงอยู่ใต้กล่องแชทบนหน้าเว็บอยู่แล้ว\n"
         "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ ให้ใช้บริบทนั้นประกอบการตอบด้วย\n"
@@ -3627,7 +3786,7 @@ def _classify_question_route(query: str) -> str:
     return _classify_legal_or_advisor_route(query)
 
 
-_ADVISOR_REPLACEMENT_OFFER_LINE = "ถ้าต้องการ พิมพ์เช่น 'แทนรายการที่ 5 ด้วยรุ่นที่ 1' หรือ 'เพิ่มรุ่นที่ 2'"
+_ADVISOR_REPLACEMENT_OFFER_LINE = "สั่งต่อได้ เช่น 'แทนรายการที่ 5 ด้วยรุ่นที่ 1' หรือ 'เพิ่มรุ่นที่ 2 จำนวน 2'"
 
 
 def _advisor_target_doc(active_docs: list[dict], chat_id: Optional[int], user_id: Optional[int]) -> Optional[dict]:
@@ -3695,8 +3854,11 @@ def _advisor_system_prompt(document_context: str = "") -> str:
         "(เช่น ขนาด/การใช้งานที่สันนิษฐานไว้) ให้ชัดเจนในคำตอบแทน\n"
         "- ถ้าแบรนด์ที่ผู้ใช้ระบุมาไม่ได้ผลิตสินค้าประเภทนั้นจริงๆ ให้บอกตรงๆ และแนะนำแบรนด์อื่นที่ผลิตสินค้า"
         "ประเภทนั้นจริงแทน ห้ามแต่งรุ่นปลอมขึ้นมาเด็ดขาด\n"
-        "- คำแนะนำสินค้า/รุ่น ให้จัดเป็นรายการลำดับเลข (1. 2. 3. ...) ไม่เกิน 5 รายการ แต่ละรายการระบุ: ชื่อรุ่น, "
-        "สเปกสำคัญ, ราคาโดยประมาณ, แหล่งที่มา\n"
+        "- เมื่อไรก็ตามที่จะแนะนำสินค้า/รุ่นให้ผู้ใช้ ต้องเรียกเครื่องมือ present_recommendations เสมอ \"หลัง\" "
+        "ค้นเว็บ (web_search) หาข้อมูลจริงเสร็จแล้วเท่านั้น ห้ามเขียนรายการแนะนำเป็นข้อความเองในคำตอบเด็ดขาดไม่ว่า"
+        "กรณีใด (ห้ามเขียนชื่อรุ่น/ราคา/ลิงก์เองแม้แต่บรรทัดเดียว) ให้โค้ดจัดรูปคำตอบสุดท้ายให้เองทั้งหมด — ถ้าเป็น"
+        "คำถามทั่วไปที่ไม่ใช่การแนะนำสินค้า (เช่น ถามข้อมูลทั่วไป/คำนวณ/อธิบาย) ตอบเป็นข้อความตามปกติได้เลย ไม่ต้อง"
+        "เรียกเครื่องมือนี้\n"
         "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ (เช่น ผู้ใช้เพิ่งตอบคำถามที่คุณถามไปก่อนหน้า) "
         "ให้ใช้บริบทนั้นประกอบการตอบด้วยเสมอ ห้ามถามคำถามเดิมซ้ำอีก\n"
         "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใช้ \"ค่ะ\" เด็ดขาด\n"
@@ -3707,19 +3869,113 @@ def _advisor_system_prompt(document_context: str = "") -> str:
             "\n\n- ตารางรายการในใบเสนอราคา/เอกสารที่เปิดอยู่ในแชทนี้ตอนนี้ (ข้อมูลจริงจากไฟล์ ใช้ทำความเข้าใจว่า"
             "กำลังช่วยเรื่องโครงการ/งานแบบไหนอยู่ ไม่ใช่ข้อมูลอ้างอิงที่ต้องยึดตอบตามเป๊ะเหมือนฐานความรู้กฎหมาย):\n"
             + document_context + "\n\n"
-            "- เลือกเกณฑ์เปรียบเทียบ 3-5 ข้อที่เหมาะสมกับประเภทสินค้าที่ถูกถามถึงในครั้งนี้เอง (เกณฑ์ไม่ตายตัว "
-            "สินค้าแต่ละประเภทมีสิ่งที่ควรเทียบต่างกัน เช่น กล้องวงจรปิดอาจดูความละเอียด/มุมมอง/การมองเห็นในที่มืด, "
-            "ฮาร์ดดิสก์อาจดูความจุ/รอบการเขียนอ่านต่อวันที่รองรับ/อายุการรับประกัน, สายสัญญาณอาจดูความยาวสูงสุดที่"
-            "ส่งสัญญาณได้/เกรดสาย/มาตรฐานที่รองรับ — เลือกเกณฑ์ที่ตรงกับสินค้าที่ถูกถามจริงๆ เอง) แล้วเปรียบเทียบ"
-            "ตัวเลือกที่แนะนำตามเกณฑ์เหล่านั้นให้ชัดเจน\n"
-            "- ถ้าตัวเลือกที่แนะนำกระทบรายการอื่นในใบเสนอราคาเดียวกัน (เช่น ความเข้ากันได้/ความจุ/จำนวนพอร์ต/ขนาด"
-            "ที่ต้องเปลี่ยนตามไปด้วย) ให้แจ้งเป็นหัวข้อ 'ผลกระทบต่อรายการอื่น' แยกต่างหากท้ายคำตอบเสมอ แจ้งให้ผู้ใช้"
-            "ทราบเท่านั้น ห้ามบอกว่าแก้ไฟล์ให้แล้วหรือกำลังจะแก้ไฟล์ให้เด็ดขาด (คำตอบนี้ยังไม่มีการแก้ไฟล์ใดๆ "
-            "เกิดขึ้นจริง)\n"
-            "- ทุกรุ่นที่แนะนำต้องระบุหน่วยขาย (เช่น ชิ้น/กล่อง 10 ชิ้น/ม้วน 305 เมตร) เทียบกับหน่วยของรายการเดิม"
-            "ในตารางด้านบน ถ้าหน่วยขายของรุ่นที่แนะนำไม่ตรงกับหน่วยเดิม ให้บอกผู้ใช้ตรงๆ ด้วย"
+            "- criteria ของ present_recommendations: เลือกเกณฑ์เปรียบเทียบ 3-5 ข้อที่เหมาะสมกับประเภทสินค้าที่"
+            "ถูกถามถึงในครั้งนี้เอง (เกณฑ์ไม่ตายตัว สินค้าแต่ละประเภทมีสิ่งที่ควรเทียบต่างกัน เช่น กล้องวงจรปิดอาจดู"
+            "ความละเอียด/มุมมอง/การมองเห็นในที่มืด, ฮาร์ดดิสก์อาจดูความจุ/รอบการเขียนอ่านต่อวันที่รองรับ/อายุการ"
+            "รับประกัน, สายสัญญาณอาจดูความยาวสูงสุดที่ส่งสัญญาณได้/เกรดสาย/มาตรฐานที่รองรับ — เลือกเกณฑ์ที่ตรงกับ"
+            "สินค้าที่ถูกถามจริงๆ เอง)\n"
+            "- items[].compatible/compatibility_note: ตรวจแต่ละตัวเลือกว่าเข้ากันได้กับระบบที่มีอยู่ในตารางด้านบน"
+            "ไหม (เช่น แรงดันไฟ/อินเทอร์เฟซ/ขนาดที่ใส่ลงช่องเดิมได้จริง) ไม่เข้ากัน -> compatible=false พร้อมเหตุผล"
+            "สั้นๆ ใน compatibility_note\n"
+            "- impacts ของ present_recommendations: ต้องถูกหลักเทคนิคเสมอ ห้ามโยงอุปกรณ์ที่ไม่เกี่ยวข้องกันผิดๆ "
+            "(เช่น ฮาร์ดดิสก์ติดตั้งอยู่ \"ใน\" เครื่อง NVR/DVR ไม่ใช่เสียบตรงกับตู้ rack โดยตรง) ตรวจด้วยว่าระบบใน"
+            "ตารางด้านบนขาดอุปกรณ์จำเป็นที่ต้องมีคู่กันไหม (เช่น มีกล้อง + ฮาร์ดดิสก์ แต่ไม่มี NVR/DVR ให้เสียบ) "
+            "ถ้าของเดิมที่มีอยู่คำนวณแล้วไม่พอ (เช่น ความจุฮาร์ดดิสก์ไม่พอเก็บภาพตามจำนวนวันที่ต้องการ) ให้ระบุตรงๆ "
+            "ว่า \"ของเดิม X ไม่พอ ต้องการประมาณ Y\" เป็นข้อความหนึ่งใน impacts เสมอ — แจ้งให้ทราบเท่านั้น ห้ามบอก"
+            "ว่าแก้ไฟล์ให้แล้วหรือกำลังจะแก้ไฟล์ให้เด็ดขาด (คำตอบนี้ยังไม่มีการแก้ไฟล์ใดๆ เกิดขึ้นจริง)\n"
+            "- items[].unit: ทุกรุ่นที่แนะนำต้องระบุหน่วยขาย (เช่น ชิ้น/กล่อง 10 ชิ้น/ม้วน 305 เมตร) เทียบกับหน่วย"
+            "ของรายการเดิมในตารางด้านบน ถ้าหน่วยขายของรุ่นที่แนะนำไม่ตรงกับหน่วยเดิม ให้ระบุไว้ใน key_specs ด้วยว่า"
+            "หน่วยไม่ตรงกัน"
         )
     return prompt
+
+
+_NO_VERIFIED_RECOMMENDATIONS_MESSAGE = "ยังหาข้อมูลรุ่นที่ยืนยันได้ไม่เจอครับ ลองระบุให้แคบลง"
+
+
+def _extract_domain_from_url(url: Optional[str]) -> Optional[str]:
+    """คืนโดเมน (ไม่มี "www." นำหน้า) จาก url — ใช้แสดง "(ราคาอ้างอิงจาก <โดเมน>)" ในใบเสร็จแทนที่จะแปะ URL เต็ม
+    ยาวๆ คืน None ถ้า url ว่างเปล่า/parse ไม่ได้"""
+    if not url:
+        return None
+    try:
+        netloc = urllib.parse.urlparse(url).netloc
+    except ValueError:
+        return None
+    if not netloc:
+        return None
+    return netloc[4:] if netloc.startswith("www.") else netloc
+
+
+def execute_present_recommendations(tool_input: dict, chat_id: Optional[int], verified_urls: set) -> dict:
+    """เครื่องมือเดียวที่ advisor_answer ใช้ส่งคำแนะนำสินค้าแบบมีโครงสร้างเสมอ (ดู PRESENT_RECOMMENDATIONS_TOOL) —
+    ตรวจ source_url ของแต่ละรุ่นกับ url ที่มาจากผล web_search จริงของเทิร์นนี้ (verified_urls — เก็บไว้แล้วใน
+    run_agentic_tool_loop) ก่อนเสมอ ตัดรุ่นที่ยืนยันแหล่งที่มาไม่ได้ทิ้ง (กัน Claude แต่งรุ่น/URL ขึ้นเอง) บันทึก
+    รายการที่เหลือ (หลังตัด) ไว้ที่ chat_last_recommendations เพื่อให้คำสั่งเชื่อมเข้าเอกสารใช้ต่อได้ (ดู
+    _resolve_recommendation_command_dispatch) คืน dict ให้ _render_recommendations_answer จัดรูปคำตอบสุดท้าย"""
+    criteria = [c for c in (tool_input.get("criteria") or []) if isinstance(c, str) and c.strip()][:5]
+    raw_items = tool_input.get("items") or []
+    verified_items = [item for item in raw_items if item.get("source_url") in verified_urls][:5]
+    impacts = [i for i in (tool_input.get("impacts") or []) if isinstance(i, str) and i.strip()]
+    summary = (tool_input.get("summary") or "").strip()
+
+    if chat_id:
+        set_chat_last_recommendations(chat_id, verified_items)
+
+    return {"criteria": criteria, "items": verified_items, "impacts": impacts, "summary": summary}
+
+
+def _render_recommendation_item_line(index: int, item: dict) -> str:
+    """ประกอบบรรทัดเดียวของรายการแนะนำที่ index นี้ — รูปแบบตายตัว
+    "<index>. <name> — <key_specs> — ราคา <price_thb> บาท/<unit> — [ลิงก์](<source_url>)" (หรือใช้ price_note
+    แทนส่วนราคาถ้า price_thb เป็น null) ต่อท้ายด้วย "⚠ <compatibility_note>" ถ้า compatible เป็น false"""
+    price_thb = item.get("price_thb")
+    unit = item.get("unit")
+    if price_thb is not None:
+        price_part = f"ราคา {price_thb:,.0f} บาท" + (f"/{unit}" if unit else "")
+    else:
+        price_part = item.get("price_note") or "ไม่พบราคาที่ชัดเจน"
+    line = f"{index}. {item.get('name')} — {item.get('key_specs')} — {price_part} — [ลิงก์]({item.get('source_url')})"
+    if item.get("compatible") is False:
+        line += f" ⚠ {item.get('compatibility_note') or 'อาจไม่เข้ากันกับระบบเดิม'}"
+    return line
+
+
+def _render_recommendations_answer(result: dict, has_open_document: bool) -> str:
+    """จัดรูปคำตอบสุดท้ายของ present_recommendations ด้วยโค้ดล้วนๆ (ไม่ใช่ Claude เขียนเอง — ดู docstring ของ
+    PRESENT_RECOMMENDATIONS_TOOL) ไม่มีรุ่นไหนยืนยันแหล่งที่มาได้เลย (ถูกตัดทิ้งหมดใน execute_present_
+    recommendations) คืน _NO_VERIFIED_RECOMMENDATIONS_MESSAGE แทน has_open_document: ต่อท้ายด้วย
+    _ADVISOR_REPLACEMENT_OFFER_LINE เสมอถ้ามีใบเสนอราคาเปิดอยู่ (ไม่สนว่าคำถามเอ่ยถึงรายการเดิมหรือไม่ — ต่างจาก
+    _advisor_offer_line เดิมที่ใช้กับคำตอบข้อความธรรมดา เพราะตอนนี้มีรายการแนะนำเป็นเลข 1-5 ให้อ้างถึงแล้วจริงๆ)"""
+    items = result.get("items") or []
+    if not items:
+        return _NO_VERIFIED_RECOMMENDATIONS_MESSAGE
+
+    lines = []
+    criteria = result.get("criteria") or []
+    if criteria:
+        lines.append("เกณฑ์เปรียบเทียบ: " + ", ".join(criteria))
+        lines.append("")
+
+    for i, item in enumerate(items, start=1):
+        lines.append(_render_recommendation_item_line(i, item))
+
+    impacts = result.get("impacts") or []
+    if impacts:
+        lines.append("")
+        lines.append("ผลกระทบต่อรายการอื่น:")
+        lines.extend(f"- {impact}" for impact in impacts)
+
+    summary = result.get("summary")
+    if summary:
+        lines.append("")
+        lines.append(summary)
+
+    if has_open_document:
+        lines.append("")
+        lines.append(_ADVISOR_REPLACEMENT_OFFER_LINE)
+
+    return "\n".join(lines)
 
 
 def advisor_answer(
@@ -3731,8 +3987,9 @@ def advisor_answer(
     ต่อท้ายด้วยตารางรายการของเอกสารที่เปิดอยู่ถ้ามี ดู _advisor_document_context) ส่งประวัติสนทนาล่าสุด (เหมือน
     rag_answer — สูงสุด MAX_HISTORY_MESSAGES ข้อความ) ให้ AI เข้าใจบริบทคำถามที่เคยถามไปก่อนหน้า (เช่น ผู้ใช้เพิ่ง
     ตอบคำถามที่เคยถูกถามกลับ) เปิดใช้ web_search ทั่วไป (ไม่จำกัดโดเมน ต่างจาก AVAILABLE_TOOLS — ดู ADVISOR_TOOLS)
-    ไม่มีเครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้ (ฟีเจอร์ "แทนรายการด้วยรุ่นที่เลือก" ยังไม่ต่อสายจริง — แค่
-    เสนอข้อความท้ายคำตอบถ้าเข้าเงื่อนไข ดู _advisor_offer_line)
+    + present_recommendations (ดู execute_present_recommendations) ไม่มีเครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทาง
+    นี้ (การเชื่อมคำแนะนำเข้าเอกสารทำผ่าน direct parse ด้วยโค้ดแทน — ดู _resolve_recommendation_command_dispatch)
+    ใช้โมเดล ADVISOR_MODEL (ไม่ใช่ Haiku เหมือนเส้นทางอื่น — ต้องการเหตุผล/ภาษาไทยที่แม่นยำกว่าในคำตอบยาวๆ)
 
     คืน (ข้อความคำตอบ, []) เสมอ (sources ว่างเสมอ — ไม่มี RAG chunk ให้แสดง เป็นเส้นทางที่ไม่ผ่านฐานความรู้เลย)"""
     history = history or []
@@ -3744,10 +4001,15 @@ def advisor_answer(
 
     raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
-        tools_override=ADVISOR_TOOLS,
+        tools_override=ADVISOR_TOOLS, model=ADVISOR_MODEL,
     )
     answer = _normalize_polite_particles(raw_answer)
-    answer += _advisor_offer_line(active_docs, chat_id, user_id, query)
+    # offer_line อาจถูกต่อท้ายไปแล้วจาก _render_recommendations_answer (ตอน Claude เรียก present_recommendations
+    # สำเร็จ) ไม่ต่อซ้ำอีกรอบถ้าเจอข้อความเดิมอยู่แล้ว (เช็คจากเนื้อหาคงที่ ไม่ใช่ flag แยก — ง่ายกว่าและปลอดภัย
+    # เท่ากัน เพราะ _ADVISOR_REPLACEMENT_OFFER_LINE เป็นข้อความตายตัวที่ไม่มีทางโผล่มาจากที่อื่น)
+    offer_line = _advisor_offer_line(active_docs, chat_id, user_id, query)
+    if offer_line and _ADVISOR_REPLACEMENT_OFFER_LINE not in answer:
+        answer += offer_line
     return answer, []
 
 
@@ -4173,6 +4435,19 @@ async def ask_question(
 
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
+
+        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
+        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K") ลอง parse ด้วยโค้ดก่อนเช็คคำสั่งแก้โครงสร้าง
+        # ทั่วไปเสมอ (ไม่ชนกันอยู่แล้ว — คำขึ้นต้น "แทน"/"เพิ่มรุ่นที่" ไม่ตรงรูปแบบ "เปลี่ยน/แก้ X เป็น Y" เลย แต่
+        # จัดลำดับให้ชัดเจนไว้ก่อน)
+        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
+        if recommendation_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+            answer = recommendation_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
 
         # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
         # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
@@ -4706,6 +4981,22 @@ def _format_chat_export_timestamp(created_at: Optional[str]) -> str:
     return parsed.astimezone(ZoneInfo("Asia/Bangkok")).strftime("%Y-%m-%d %H:%M")
 
 
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MARKDOWN_HEADING_RE = re.compile(r"^#{1,6}\s*", re.MULTILINE)
+
+
+def _strip_markdown_for_export(text: str) -> str:
+    """ตัดเครื่องหมาย markdown ที่พบบ่อยในคำตอบของระบบออกก่อน export เป็น .txt — **ตัวหนา**/__ตัวหนา__ ->
+    ตัวหนา, "[ข้อความ](url)" -> "ข้อความ (url)", "# หัวข้อ" -> "หัวข้อ" ให้อ่านใน Notepad สะอาด ไม่มีสัญลักษณ์
+    markdown ดิบปนอยู่ — ใช้เฉพาะตอน export เท่านั้น ไม่กระทบข้อความที่แสดงในหน้าเว็บ (ยังเป็น markdown เรนเดอร์
+    ตามปกติ)"""
+    text = _MARKDOWN_LINK_RE.sub(r"\1 (\2)", text)
+    text = _MARKDOWN_BOLD_RE.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _MARKDOWN_HEADING_RE.sub("", text)
+    return text
+
+
 def _build_chat_export_text(chat_title: str, messages: list[dict]) -> str:
     """ประกอบเนื้อหาไฟล์ export (.txt) ของแชทหนึ่งแชท — header (ชื่อแชท + เวลา export เป็นเวลาไทย) ตามด้วยทุก
     ข้อความเรียงตามเวลาจริง (get_chat_messages คืนเรียงตาม created_at อยู่แล้ว) รูปแบบ
@@ -4716,7 +5007,7 @@ def _build_chat_export_text(chat_title: str, messages: list[dict]) -> str:
     for m in messages:
         role_label = _CHAT_EXPORT_ROLE_LABELS.get(m["role"], m["role"])
         timestamp = _format_chat_export_timestamp(m.get("created_at"))
-        lines.append(f"[{timestamp}] {role_label}: {m['content']}")
+        lines.append(f"[{timestamp}] {role_label}: {_strip_markdown_for_export(m['content'])}")
         lines.append("")
     return "\n".join(lines).rstrip("\n") + "\n"
 
@@ -7066,9 +7357,35 @@ def _format_rate_number(value) -> str:
     return f"{value:g}"
 
 
+def _format_money_value(value) -> str:
+    """จัดรูปตัวเลข (เงิน/จำนวน) ให้อ่านง่ายในข้อความผลลัพธ์ของคำสั่งแก้เอกสารทุกจุด — มีคอมมาคั่นหลักพันเสมอ และ
+    มีทศนิยมเท่าที่จำเป็นเท่านั้น (จำนวนเต็มไม่มี ".0" ต่อท้าย เช่น 2.0 -> "2", 54436 -> "54,436", 3810.5 ->
+    "3,810.50") ค่าที่ไม่ใช่ตัวเลข (เช่น None/ข้อความ/bool) คืนเป็น str(value) ตรงๆ ไม่แตะ — เหตุการณ์จริงที่แก้:
+    ตัวเลขเงินไม่มีคอมมาคั่นหลักพัน (อ่านยาก) และจำนวนที่เป็นจำนวนเต็มแสดงเป็น "2.0" แทน "2" (ค่า qty ที่ parse มา
+    จากข้อความผู้ใช้เป็น float เสมอ — ดู _resolve_recommendation_add_command)"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return str(value)
+    if float(value).is_integer():
+        return f"{int(value):,}"
+    return f"{value:,.2f}"
+
+
 def _rewrite_percent_text(text: str, new_rate) -> str:
     """แทนที่ตัวเลข % ทุกตัวในข้อความ (เช่น label 'ภาษีมูลค่าเพิ่ม 7%') ด้วยอัตราใหม่ เช่น 'ภาษีมูลค่าเพิ่ม 10%'"""
     return _PERCENT_IN_TEXT_RE.sub(f"{_format_rate_number(new_rate)}%", text)
+
+
+def _split_rate_label_base_and_percent(label: str) -> tuple[str, Optional[str]]:
+    """แยกชื่อ label ฐาน (ไม่มีเลข % ต่อท้าย) ออกจากตัวเลขเปอร์เซ็นต์ที่แฝงอยู่ในชื่อ (เช่น "ภาษีมูลค่าเพิ่ม 7%"
+    -> ("ภาษีมูลค่าเพิ่ม", "7")) ใช้สร้างข้อความ "เปลี่ยน 'X' จาก N% เป็น M%" แทนที่จะโชว์ชื่อ label เต็มที่มีเลข %
+    เก่าติดมาด้วย (ปนกับอัตราใหม่ในข้อความเดียวกันจนอ่านสับสน — เหตุการณ์จริงที่แก้: "เปลี่ยนอัตราของ
+    'ภาษีมูลค่าเพิ่ม 25%' เป็น 25%" ซึ่งจริงๆ เปลี่ยนจาก 7% ไม่ใช่ 25% คงที่แบบนั้น) คืน (label เดิมทั้งหมด, None)
+    ถ้าไม่มี "N%" ในชื่อเลย"""
+    m = _PERCENT_IN_TEXT_RE.search(label)
+    if m is None:
+        return label, None
+    base = (label[: m.start()] + label[m.end() :]).strip()
+    return base, m.group(1)
 
 
 def _rewrite_rate_formula(formula: str, new_rate) -> Optional[str]:
@@ -7185,10 +7502,14 @@ def _label_side_effects(
 
 def _format_side_effect_lines(side_effects: list[dict], verb: str) -> str:
     """ต่อท้ายข้อความ preview/ยืนยันด้วยรายการ label ที่เปลี่ยน (จาก _label_side_effects — ตัดไม่เกิน 3 รายการ
-    มาให้แล้ว) verb: 'จะเปลี่ยน'/'เปลี่ยน'"""
+    มาให้แล้ว) verb: 'จะเปลี่ยน'/'เปลี่ยน' — เว้นวรรคระหว่างชื่อ label กับ verb เสมอ (เดิมติดกัน เช่น
+    "ภาษีมูลค่าเพิ่ม 7%เปลี่ยนจาก..." อ่านยาก) ตัวเลขจัดรูปด้วย _format_money_value (คอมมาคั่นหลักพัน)"""
     if not side_effects:
         return ""
-    lines = [f"{e['label']}{verb}จาก {e['old_value']} เป็น {e['new_value']}" for e in side_effects]
+    lines = [
+        f"{e['label']} {verb}จาก {_format_money_value(e['old_value'])} เป็น {_format_money_value(e['new_value'])}"
+        for e in side_effects
+    ]
     return "\n\n" + " / ".join(lines)
 
 
@@ -7554,59 +7875,70 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
 
     exclude_position = (action["sheet"], action["row"], action["col"]) if action_type == "change_rate" else None
     side_effects = _label_side_effects(label_map, new_label_map, new_bytes, exclude_position=exclude_position)
+    # label ที่แสดงไปแล้วเป็นบรรทัด "X เปลี่ยนจาก A เป็น B" (ไม่ว่าจะเป็น label ที่ถูกแก้ตรงๆ หรือผลข้างเคียง) —
+    # กัน _document_totals_lines ด้านล่างแสดงค่าเดียวกันซ้ำอีกรอบใต้หัวข้อ "ยอดล่าสุด:"
+    already_shown_labels = {e["label"] for e in side_effects}
 
     if action_type == "change_rate":
         old_by_position = {_label_position(info): info["current_value"] for info in label_map.values()}
         old_value = old_by_position.get(exclude_position)
         new_info = _find_label_by_position(new_label_map, exclude_position)
         new_value = new_info["current_value"] if new_info is not None else old_value
-        # ใช้ข้อความปัจจุบันจริงในเซลล์ป้าย (เช่น "ภาษีมูลค่าเพิ่ม 25%") แทน action.get("label") ที่แช่แข็งเป็นชื่อ
-        # เดิมตอนก่อนแก้เสมอ (ดู _current_label_display_name) — เหตุการณ์จริงที่แก้: เปลี่ยน VAT 7% -> 25%
-        # สำเร็จ แต่ข้อความผลลัพธ์ยังโชว์ "'ภาษีมูลค่าเพิ่ม 7%'" ค้างอยู่
-        display_label = (
-            _current_label_display_name(new_bytes, action.get("label"), new_info)
-            if new_info is not None else action.get("label")
-        )
         edit_log_id = log_document_edit(document_id, action.get("label"), old_value, new_value, was_formula=True)
         link_edit_log_to_version(edit_log_id, version_result["version_id"])
+        # ชื่อฐาน + อัตราเดิม มาจาก action.get("label") (key แช่แข็งตอนก่อนแก้ — ยังคงเป็นข้อความจริงของอัตราเดิม
+        # เสมอ ไม่ใช่ _current_label_display_name ซึ่งอ่านอัตราใหม่หลังแก้ไปแล้ว) กันข้อความปนกันระหว่างอัตราเดิม
+        # กับอัตราใหม่ (เหตุการณ์จริงที่แก้: "เปลี่ยนอัตราของ 'ภาษีมูลค่าเพิ่ม 25%' เป็น 25%" — จริงๆ เปลี่ยนจาก 7%)
+        base_label, old_rate_text = _split_rate_label_base_and_percent(action.get("label") or "")
+        new_rate_text = _format_rate_number(action.get("new_rate"))
+        rate_change_text = f"จาก {old_rate_text}% เป็น {new_rate_text}%" if old_rate_text is not None else f"เป็น {new_rate_text}%"
         message = (
-            f"เปลี่ยนอัตราของ '{display_label}' เป็น {_format_rate_number(action.get('new_rate'))}% แล้ว "
-            f"— ค่าเปลี่ยนจาก {old_value} เป็น {new_value}"
+            f"✓ เปลี่ยน '{base_label}' {rate_change_text} — ค่าเปลี่ยนจาก "
+            f"{_format_money_value(old_value)} เป็น {_format_money_value(new_value)}"
         )
+        if new_info is not None:
+            already_shown_labels.add(_current_label_display_name(new_bytes, action.get("label"), new_info))
     elif action_type == "update_table_item":
         desc = (action.get("identity") or {}).get("description")
         changed_fields = [
-            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} เปลี่ยนเป็น {v}" for k, v in (action.get("fields") or {}).items()
+            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} เปลี่ยนเป็น {_format_money_value(v)}"
+            for k, v in (action.get("fields") or {}).items()
         ]
-        message = f"แก้รายการ '{desc}' แล้ว: " + " / ".join(changed_fields)
+        message = f"✓ แก้รายการ '{desc}' แล้ว: " + " / ".join(changed_fields)
     elif action_type == "delete_table_item":
         desc = (action.get("identity") or {}).get("description")
-        message = f"ลบรายการ '{desc}' แล้ว"
+        message = f"✓ ลบรายการ '{desc}' แล้ว"
     elif action_type == "add_table_item":
         field_summary = ", ".join(
-            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={v}" for k, v in (action.get("fields") or {}).items()
+            f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={_format_money_value(v)}"
+            for k, v in (action.get("fields") or {}).items()
         )
-        message = f"เพิ่มรายการใหม่ ({field_summary}) แล้ว"
+        message = f"✓ เพิ่มรายการใหม่ ({field_summary}) แล้ว"
     else:
-        message = "ทำรายการนี้เรียบร้อยแล้ว"
+        message = "✓ ทำรายการนี้เรียบร้อยแล้ว"
 
     message += _format_side_effect_lines(side_effects, "เปลี่ยน")
 
-    message_lines = [message] + _document_totals_lines(document_id) + ["", _UNDO_HINT_LINE]
+    message_lines = [message] + _document_totals_lines(document_id, exclude_labels=already_shown_labels) + ["", _UNDO_HINT_LINE]
     return {"matched": True, "message": "\n".join(message_lines)}
 
 
-def _document_totals_lines(document_id: int) -> list[str]:
+def _document_totals_lines(document_id: int, exclude_labels: Optional[set] = None) -> list[str]:
     """คืนบรรทัด "ยอดล่าสุด:" + label ที่มีคำว่า "รวม"/"ภาษี" ในชื่อ (เช่น รวมเงิน/ภาษีมูลค่าเพิ่ม/รวมราคาทั้งสิ้น)
     ของสถานะปัจจุบันจริงของเอกสารนี้หลังแก้เสร็จ — list ว่างถ้าไม่มี label แบบนั้นเลยหรือหาเอกสารไม่เจอ (ไม่
-    error) ใช้ต่อท้ายข้อความผลลัพธ์ของการแก้โครงสร้างทุกจุด (ดู _apply_structural_commands)"""
+    error) ใช้ต่อท้ายข้อความผลลัพธ์ของการแก้โครงสร้างทุกจุด (ดู _apply_structural_commands)
+
+    exclude_labels: ชื่อ label (ชื่อปัจจุบันจริง ตรงกับที่ read_document_values คืน) ที่ไม่ต้องแสดงซ้ำในนี้ —
+    ใช้โดย _apply_single_queue_item กันข้อมูลซ้ำกับบรรทัด "X เปลี่ยนจาก A เป็น B" ที่แสดงไปแล้วก่อนหน้า (เช่น
+    label ที่ถูกแก้ตรงๆ หรือ label ที่โดนผลข้างเคียงจาก _label_side_effects) ไม่ต้องโผล่ซ้ำใต้หัวข้อนี้อีก"""
     doc = get_editable_document_raw(document_id)
     if doc is None:
         return []
     data = read_document_values(doc)
+    exclude_labels = exclude_labels or set()
     totals = [
-        f"- {l['label']}: {l['value']}" for l in data["labels"]
-        if "รวม" in l["label"] or "ภาษี" in l["label"]
+        f"- {l['label']}: {_format_money_value(l['value'])}" for l in data["labels"]
+        if ("รวม" in l["label"] or "ภาษี" in l["label"]) and l["label"] not in exclude_labels
     ]
     if not totals:
         return []
@@ -7633,14 +7965,222 @@ def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: 
             result = apply_update_table_item(document_id, user_id, command["item_no"], command["fields"])
         else:
             result = {"matched": False, "message": "คำสั่งนี้ไม่รองรับ"}
-        mark = "✓" if result.get("matched") else "✗"
         first_line = (result.get("message") or "").splitlines()[0] if result.get("message") else ""
-        lines.append(f"{mark} {first_line}")
+        # first_line อาจมี "✓ "/"✗ " นำหน้ามาแล้วจาก _apply_single_queue_item เอง (ทุกข้อความสำเร็จตอนนี้มี "✓ "
+        # นำหน้าเสมอ) ไม่เติมซ้ำอีกชั้นถ้ามีอยู่แล้ว กันกลายเป็น "✓ ✓ ..."
+        if first_line.startswith(("✓ ", "✗ ")):
+            lines.append(first_line)
+        else:
+            mark = "✓" if result.get("matched") else "✗"
+            lines.append(f"{mark} {first_line}")
 
     lines.extend(_document_totals_lines(document_id))
     lines.append("")
     lines.append(_UNDO_HINT_LINE)
     return "\n".join(lines)
+
+
+# ---------- เชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบเสนอราคา ----------
+# "แทนรายการที่ N ด้วยรุ่นที่ K" / "แทน <ชื่อรายการในตาราง> ด้วยรุ่นที่ K" (+ ตัวเลือกราคาต่อท้าย)
+_RECOMMENDATION_REPLACE_RE = re.compile(r"^แทน\s*(.+?)\s*ด้วยรุ่นที่\s*(\d+)\s*(.*)$")
+# "เพิ่มรุ่นที่ K" [จำนวน Q] [ราคา X | บวกกำไร P%] — ลำดับ "จำนวน"/ราคา สลับกันได้ ดู _resolve_recommendation_add_command
+_RECOMMENDATION_ADD_RE = re.compile(r"^เพิ่มรุ่นที่\s*(\d+)\s*(.*)$")
+_RECOMMENDATION_QTY_CLAUSE_RE = re.compile(r"จำนวน\s*(\d+(?:\.\d+)?)")
+
+# ตัวเลือกราคาต่อท้ายคำสั่งเชื่อมคำแนะนำเข้าเอกสาร (ดู _parse_recommendation_price_clause)
+_PRICE_CLAUSE_EXPLICIT_RE = re.compile(r"^ราคา\s*(\d+(?:\.\d+)?)$")
+_PRICE_CLAUSE_ORIGINAL_RE = re.compile(r"^ราคาเดิม$")
+_PRICE_CLAUSE_MARKUP_RE = re.compile(r"^บวกกำไร\s*(\d+(?:\.\d+)?)\s*%$")
+
+
+def _parse_recommendation_price_clause(text: str) -> tuple[Optional[str], Optional[float]]:
+    """parse ตัวเลือกราคาท้ายคำสั่งเชื่อมคำแนะนำเข้าเอกสาร ("ราคา X"/"ราคาเดิม"/"บวกกำไร P%") คืน (mode, value):
+    mode "none" (ไม่มีตัวเลือกราคาต่อท้ายเลย — value เป็น None เสมอ), "explicit" (value=X บาท), "original"
+    (value=None — ไม่แก้ราคา), "markup" (value=P เปอร์เซ็นต์) — คืน (None, None) ถ้ามีข้อความต่อท้ายแต่ parse
+    ไม่ได้เลยสักรูปแบบ (กำกวมเกินจะเดา ปล่อยให้ agent/LLM ตัดสินใจทั้งข้อความแทน)"""
+    stripped = text.strip()
+    if not stripped:
+        return "none", None
+    m = _PRICE_CLAUSE_EXPLICIT_RE.match(stripped)
+    if m:
+        return "explicit", float(m.group(1))
+    if _PRICE_CLAUSE_ORIGINAL_RE.match(stripped):
+        return "original", None
+    m = _PRICE_CLAUSE_MARKUP_RE.match(stripped)
+    if m:
+        return "markup", float(m.group(1))
+    return None, None
+
+
+def _resolve_recommendation_replace_command(
+    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
+) -> Optional[dict]:
+    """parse + apply คำสั่ง "แทนรายการที่ N ด้วยรุ่นที่ K" (หรือ "แทน <ชื่อรายการในตาราง> ด้วยรุ่นที่ K") ทันทีด้วย
+    โค้ดล้วนๆ ไม่ผ่าน LLM เลย (รูปแบบเดียวกับ _parse_direct_structural_commands) คืน {"matched": bool, "message":
+    str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่น/ตกไปที่ agent ต่อ)
+
+    receipt: ราคาเปลี่ยนจริง (ระบุ "ราคา X"/"บวกกำไร P%"/ไม่ระบุแต่รุ่นมี price_thb) -> "✓ แทนรายการที่ N
+    (<เดิม>) ด้วย <ชื่อรุ่น> — ราคา/หน่วย <เดิม> → <ใหม่> (ราคาที่กำหนดเอง)" (ระบุราคาเอง) หรือ "...(ราคาอ้างอิงจาก
+    <โดเมน>)" (ใช้ price_thb ของรุ่น/บวกกำไร) ไม่เปลี่ยนราคาเลย ("ราคาเดิม"/ไม่ระบุราคาและรุ่นไม่มี price_thb) ->
+    "...ด้วย <ชื่อรุ่น> — ราคาเดิม <ราคา> บาท" (ไม่มี "→"/วงเล็บที่มาเลย กันเข้าใจผิดว่าราคาเปลี่ยนไปแล้วทั้งที่
+    ไม่ได้อ้างอิงเว็บอะไรเลย) ต่อท้ายด้วยยอดล่าสุด + คำแนะนำ "ย้อนการแก้" เหมือน apply_update_table_item ปกติ (ใช้
+    apply_update_table_item จริงเบื้องหลัง แค่แทนที่บรรทัดแรกของข้อความผลลัพธ์ด้วย receipt เฉพาะของคำสั่งนี้)"""
+    m = _RECOMMENDATION_REPLACE_RE.match(query.strip())
+    if m is None:
+        return None
+    target_text, model_index_text, price_clause_text = m.groups()
+    model_index = int(model_index_text)
+
+    if not recommendations:
+        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
+    if model_index < 1 or model_index > len(recommendations):
+        return {
+            "matched": False,
+            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
+        }
+
+    target = _resolve_table_target(target_text, table)
+    if target is None:
+        return None  # กำกวม/ไม่เจอรายการในตาราง — ปล่อยให้ agent ตัดสินใจแทน
+
+    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
+    if price_mode is None:
+        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
+
+    model = recommendations[model_index - 1]
+    fields = {"description": model["name"]}
+    if price_mode == "explicit":
+        fields["unit_price"] = price_value
+    elif price_mode == "markup":
+        base_price = model.get("price_thb")
+        if base_price is None:
+            return {
+                "matched": False,
+                "message": (
+                    f"รุ่น '{model['name']}' ไม่มีราคาฐานให้บวกกำไรได้ครับ "
+                    f"({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'})"
+                ),
+            }
+        fields["unit_price"] = round(base_price * (1 + price_value / 100), 2)
+    elif price_mode == "none" and model.get("price_thb") is not None:
+        fields["unit_price"] = model["price_thb"]
+    # price_mode == "original" หรือ ("none" และ price_thb เป็น null) -> ไม่แก้ราคา แก้แค่ชื่อ
+
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+    old_unit_price = filled_rows[target["item_no"] - 1]["values"].get("unit_price")
+    price_changed = "unit_price" in fields
+
+    result = apply_update_table_item(document_id, user_id, target["item_no"], fields)
+    if result.get("matched"):
+        if not price_changed and model.get("price_thb") is None:
+            result["message"] += (
+                f"\n\nยังไม่ได้เปลี่ยนราคา ({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'}) "
+                "พิมพ์ราคาที่ต้องการได้เลยครับ"
+            )
+        base_line = f"✓ แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']}"
+        if price_changed:
+            # ราคาถูกกำหนดจริง (explicit/markup/none ที่ใช้ price_thb ของรุ่นตรงๆ) ถึงจะมี "→" + วงเล็บที่มา —
+            # เหตุการณ์จริงที่แก้: ไม่ได้เปลี่ยนราคาเลย (null/ราคาเดิม) แต่ยังโชว์ "X → X (ราคาอ้างอิงจาก ...)"
+            # ซึ่งชวนเข้าใจผิดว่าราคาเปลี่ยนไปแล้วจริงๆ ทั้งที่ไม่ได้อ้างอิงเว็บอะไรเลย
+            new_unit_price = fields["unit_price"]
+            if price_mode == "explicit":
+                price_tag = "(ราคาที่กำหนดเอง)"
+            else:
+                domain = _extract_domain_from_url(model.get("source_url"))
+                price_tag = f"(ราคาอ้างอิงจาก {domain})" if domain else ""
+            receipt_line = (
+                f"{base_line} — ราคา/หน่วย {_format_money_value(old_unit_price)} → "
+                f"{_format_money_value(new_unit_price)}"
+            )
+            if price_tag:
+                receipt_line += f" {price_tag}"
+        else:
+            price_text = f"{_format_money_value(old_unit_price)} บาท" if old_unit_price is not None else "ไม่ระบุ"
+            receipt_line = f"{base_line} — ราคาเดิม {price_text}"
+        message_lines = result["message"].splitlines()
+        message_lines[0] = receipt_line
+        result["message"] = "\n".join(message_lines)
+    return result
+
+
+def _resolve_recommendation_add_command(
+    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
+) -> Optional[dict]:
+    """parse + apply คำสั่ง "เพิ่มรุ่นที่ K [จำนวน Q] [ราคา X | บวกกำไร P%]" ทันทีด้วยโค้ดล้วนๆ ไม่ผ่าน LLM เลย คืน
+    {"matched": bool, "message": str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย"""
+    m = _RECOMMENDATION_ADD_RE.match(query.strip())
+    if m is None:
+        return None
+    model_index_text, remainder = m.groups()
+    model_index = int(model_index_text)
+
+    if not recommendations:
+        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
+    if model_index < 1 or model_index > len(recommendations):
+        return {
+            "matched": False,
+            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
+        }
+    model = recommendations[model_index - 1]
+
+    qty_match = _RECOMMENDATION_QTY_CLAUSE_RE.search(remainder)
+    qty = float(qty_match.group(1)) if qty_match else 1
+    price_clause_text = _RECOMMENDATION_QTY_CLAUSE_RE.sub("", remainder).strip()
+    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
+    if price_mode is None:
+        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
+
+    fields = {"description": model["name"], "qty": qty, "unit": model.get("unit") or "ชิ้น"}
+    if price_mode == "explicit":
+        fields["unit_price"] = price_value
+    elif price_mode == "markup":
+        base_price = model.get("price_thb")
+        if base_price is None:
+            return {
+                "matched": False,
+                "message": (
+                    f"รุ่น '{model['name']}' ไม่มีราคาฐานให้บวกกำไรได้ครับ "
+                    f"({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'})"
+                ),
+            }
+        fields["unit_price"] = round(base_price * (1 + price_value / 100), 2)
+    elif model.get("price_thb") is not None:  # price_mode เป็น "none"/"original" (ไม่มีราคาเดิมให้ใช้ตอนเพิ่มใหม่)
+        fields["unit_price"] = model["price_thb"]
+
+    result = apply_add_table_item(document_id, user_id, fields)
+    if result.get("matched") and "unit_price" not in fields:
+        result["message"] += (
+            f"\n\nยังไม่ได้ใส่ราคา ({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'}) พิมพ์ราคาที่ต้องการได้เลยครับ"
+        )
+    return result
+
+
+def _resolve_recommendation_command_dispatch(
+    query: str, active_docs: list[dict], chat_id: int, user_id: int,
+) -> Optional[dict]:
+    """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบ
+    เสนอราคาที่เปิดอยู่ได้ไหม ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — ดู
+    _resolve_recommendation_replace_command/_resolve_recommendation_add_command) แล้ว apply ทันทีถ้าใช่ — ไม่ต้อง
+    พึ่ง LLM เลยสักครั้ง (เหมือน _resolve_direct_structural_dispatch) คืน {"document_id":, "answer":} หรือ None ถ้า
+    ข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    if target_doc is None:
+        return None
+
+    base_bytes, _ = get_working_copy(target_doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return None
+
+    recommendations = get_chat_last_recommendations(chat_id) or []
+
+    result = _resolve_recommendation_replace_command(query, target_doc["id"], user_id, recommendations, table)
+    if result is None:
+        result = _resolve_recommendation_add_command(query, target_doc["id"], user_id, recommendations, table)
+    if result is None:
+        return None
+    return {"document_id": target_doc["id"], "answer": result["message"]}
 
 
 def _resolve_direct_structural_dispatch(

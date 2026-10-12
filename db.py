@@ -320,6 +320,21 @@ class ChatLastListing(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class ChatLastRecommendations(Base):
+    """รายการคำแนะนำสินค้าล่าสุดที่ advisor เสนอในแชทนี้ (จาก present_recommendations — ดู main.py) ใช้โดยคำสั่ง
+    เชื่อมเข้าเอกสาร ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K") แปล "รุ่นที่ K" เป็นรายการจริงด้วยโค้ด 1 แชท
+    มีรายการล่าสุดได้แค่ชุดเดียว (chat_id เป็น primary key ตรงๆ แทนที่แถวเดิมเสมอเมื่อมีคำแนะนำชุดใหม่)
+
+    items: [{"name":, "key_specs":, "price_thb":, "price_note":, "unit":, "source_url":, "compatible":,
+    "compatibility_note":}, ...] — หลังกรอง source_url ที่ยืนยันกับผลค้นจริงไม่ได้ทิ้งแล้ว (ดู
+    execute_present_recommendations)"""
+    __tablename__ = "chat_last_recommendations"
+
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    items = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class FileCategory(Base):
     """หมวดหมู่ (โฟลเดอร์) ของคลังไฟล์ Excel ที่แอดมินจัดการ — "None" ไม่ใช่แถวในตารางนี้
     (แทนด้วย library_files.category_id = NULL) ชื่อ "none" (ไม่สนตัวพิมพ์เล็กใหญ่) ถูกสงวนไว้
@@ -1594,6 +1609,28 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
         session.delete(row)
         session.commit()
         return {"version_no": version_no, "label_map": label_map}
+
+
+def set_chat_last_recommendations(chat_id: int, items: list[dict]) -> None:
+    """บันทึกทับรายการคำแนะนำสินค้าล่าสุดของแชทนี้เสมอ (upsert — 1 แชทมีชุดล่าสุดได้แค่ชุดเดียว) เรียกจาก
+    execute_present_recommendations (main.py) ทุกครั้งที่ advisor ส่งคำแนะนำสำเร็จ"""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        row = session.get(ChatLastRecommendations, chat_id)
+        if row is None:
+            row = ChatLastRecommendations(chat_id=chat_id, items=items, created_at=now)
+            session.add(row)
+        else:
+            row.items = items
+            row.created_at = now
+        session.commit()
+
+
+def get_chat_last_recommendations(chat_id: int) -> Optional[list[dict]]:
+    """คืนรายการคำแนะนำสินค้าล่าสุดของแชทนี้ หรือ None ถ้ายังไม่เคยมีเลย"""
+    with SessionLocal() as session:
+        row = session.get(ChatLastRecommendations, chat_id)
+        return row.items if row is not None else None
 
 
 def set_chat_last_listing(chat_id: int, kind: str, items: list[dict]) -> None:
