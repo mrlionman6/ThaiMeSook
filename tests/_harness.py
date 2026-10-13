@@ -74,6 +74,10 @@ WANTED_MAIN_FUNCS = {
     "_extract_domain_from_url", "_safe_markdown_url",
     "_resolve_recommendation_command_dispatch", "_resolve_recommendation_replace_command",
     "_resolve_recommendation_add_command", "_parse_recommendation_price_clause",
+    "_apply_recommendation_replace", "_apply_recommendation_add",
+    "_resolve_recommendation_intent_with_llm", "_resolve_recommendation_intent_price",
+    "_normalize_recommendation_intent_text", "_query_has_recommendation_intent_verb",
+    "_sanitize_recommendation_text",
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
@@ -118,6 +122,8 @@ WANTED_MAIN_CONSTS = {
     "_BAHTTEXT_FORMULA_RE", "_SIMPLE_CELL_REFERENCE_RE", "_PREVIEW_NOT_COMPUTABLE_TITLE",
     "_PREVIEW_MAX_COLUMNS", "_PREVIEW_MAX_ROWS_PER_PAGE", "_PREVIEW_DEFAULT_MAX_ROWS",
     "_PREVIEW_CACHE", "_PREVIEW_CACHE_MAX_ENTRIES",
+    "RESOLVE_RECOMMENDATION_ACTION_TOOL", "_RECOMMENDATION_INTENT_SYSTEM_PROMPT", "_RECOMMENDATION_INTENT_VERBS",
+    "_CITE_TAG_RE", "_TRAILING_TEXT_ARTIFACT_RE", "_REPEATED_WHITESPACE_RE",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -140,6 +146,7 @@ class _FakeDb:
         self.last_recommendations: dict[int, list] = {}
         self.closed_ids: set[int] = set()
         self.library_files: dict[int, dict] = {}
+        self.chat_messages: dict[int, list[dict]] = {}  # chat_id -> [{"role","content"}, ...] เรียงเก่า->ใหม่
         self._next_document_id = 1
         self._next_version_id = 1
         self._next_edit_log_id = 1
@@ -235,6 +242,11 @@ class _FakeDb:
         if doc and doc["user_id"] == user_id:
             return doc
         return None
+
+    def get_chat_messages(self, chat_id):
+        """ตัวแทน db.get_chat_messages — เทสต์ seed ประวัติแชทโดยเขียนตรงเข้า self.chat_messages[chat_id] เอง
+        (ดู _resolve_recommendation_intent_with_llm/_answer_document_reading_question ที่เรียกใช้ฟังก์ชันนี้)"""
+        return [dict(m) for m in self.chat_messages.get(chat_id, [])]
 
     def add_library_file(self, file_id: int, filename: str, storage_key: str) -> None:
         self.library_files[file_id] = {"file_id": file_id, "filename": filename, "storage_key": storage_key}
@@ -501,6 +513,7 @@ def build_namespace() -> dict:
         "create_editable_document": fake_db.create_editable_document,
         "get_library_file": fake_db.get_library_file,
         "storage_get": fake_db.storage_get,
+        "get_chat_messages": fake_db.get_chat_messages,
     }
 
     main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
