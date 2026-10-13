@@ -1996,11 +1996,16 @@ def _is_document_reading_question(query: str) -> bool:
     ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปนมาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X
     ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถามอ่านอย่างเดียว — อีกเหตุการณ์จริง: "เเทน
     ลงในรายการเลย" (สระเอซ้ำ) มีคำว่า "รายการ" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ normalize "เเ"→"แ" ก่อน ทำให้ "แทน" ไม่
-    ตรงเลยสักคำ) normalize "เเ"→"แ" ก่อนเช็คทุกเงื่อนไขในฟังก์ชันนี้เสมอ "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ
-    (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น
-    "ดูดี" ในชื่อบริษัท)"""
+    ตรงเลยสักคำ) มีคำว่า "คลัง" ปนมา -> ไม่ใช่ reading question เช่นกัน ไม่ว่าจะมีคำอ้างอิงไฟล์ปนมาด้วยหรือไม่ก็ตาม
+    (เหตุการณ์จริงที่แก้: เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" มีคำว่า "เอกสาร" ปนมาด้วย ถูกเข้าใจผิดเป็น
+    คำถามเกี่ยวกับไฟล์ที่เปิดอยู่ ตอบค่าในไฟล์นั้นแทนที่จะเป็นรายการในคลังทั้งหมด — ดู _looks_like_library_query)
+    normalize "เเ"→"แ" ก่อนเช็คทุกเงื่อนไขในฟังก์ชันนี้เสมอ "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก
+    word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ใน
+    ชื่อบริษัท)"""
     stripped = query.strip().replace("เเ", "แ")
     if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
+        return False
+    if "คลัง" in stripped:
         return False
     lowered = stripped.lower()
     if any(kw.lower() in lowered for kw in _DOCUMENT_REFERENCE_KEYWORDS):
@@ -4581,6 +4586,39 @@ def _build_saved_query(query: str, image_data: Optional[dict]) -> str:
     return query
 
 
+def _categorize_anthropic_api_error(error: Exception) -> str:
+    """แปล anthropic.APIError (และ subclass) เป็นข้อความภาษาไทยที่เหมาะสมสำหรับผู้ใช้เห็น — ไม่โชว์รายละเอียด
+    ทางเทคนิค (status code/ชื่อคลาส exception) ให้ผู้ใช้เห็นเลย เหตุการณ์จริงที่แก้: เครดิต API หมด ->
+    anthropic.BadRequestError 400 "credit balance is too low" หลุดออกจาก ask_question ไม่มีใครจับ -> FastAPI คืน
+    500 เป็น text/plain (ไม่ใช่ JSON) -> หน้าเว็บ parse JSON ไม่ได้ พัง
+
+    เรียงเช็คตามความเฉพาะเจาะจง: ข้อความมีคำว่า "credit balance" (เครดิต API หมด) -> บอกตรงๆ ว่าโควตาหมด ต้อง
+    แจ้งแอดมิน; RateLimitError หรือ status_code 529 (Anthropic "overloaded" — สถานะนี้ไม่มี subclass เฉพาะใน SDK
+    เช็ค status_code ตรงๆ แทนชื่อคลาส เพราะ SDK แมป >=500 ทั้งหมดเป็น InternalServerError เหมือนกันหมด) -> บอกว่า
+    ผู้ใช้งานหนาแน่น ลองใหม่ได้; อื่นๆ ทั้งหมด (connection error/timeout/5xx อื่นๆ) -> ข้อความทั่วไป"""
+    message = str(error)
+    if "credit balance" in message.lower():
+        return "ระบบ AI ใช้งานไม่ได้ชั่วคราว (โควตา API หมด) กรุณาแจ้งผู้ดูแลระบบครับ"
+    status_code = getattr(error, "status_code", None)
+    if isinstance(error, anthropic.RateLimitError) or status_code == 529:
+        return "ระบบ AI มีผู้ใช้งานหนาแน่น กรุณาลองใหม่อีกครั้งในอีกสักครู่ครับ"
+    return "ระบบ AI ขัดข้องชั่วคราว กรุณาลองใหม่อีกครั้งครับ"
+
+
+def _ask_question_api_error_response(error: Exception, chat_id: Optional[int]) -> dict:
+    """จัดการ anthropic.APIError (และ subclass) ที่หลุดออกมาจาก advisor_answer/rag_answer ใน ask_question() — คืน
+    JSON ปกติเสมอ ({"answer","sources","chat_id"} สถานะ 200) ไม่ใช่ 500 ที่ทำให้หน้าเว็บ parse JSON ไม่ได้ (ดู
+    docstring ของ _categorize_anthropic_api_error) ตั้งใจไม่บันทึกข้อความนี้เป็นคำตอบ assistant ใน DB เลย (ให้
+    ask_question() return ค่านี้ตรงๆ แทนที่จะเดินต่อไปถึงจุด add_chat_message) — กันประวัติแชทเพี้ยนด้วยคำตอบ
+    error ที่ไม่ใช่คำตอบจริง ผู้ใช้พิมพ์คำถามเดิมซ้ำได้ทันทีโดยไม่มีข้อความ error ค้างอยู่ในประวัติให้สับสน/ปนกับ
+    บริบทจริงของบทสนทนาที่ AI จะเห็นในเทิร์นถัดๆ ไป
+
+    log [APIError] type=<ชื่อคลาส> status=<status_code> เท่านั้น (ห้าม log ข้อความ exception หรือเนื้อหาคำถาม
+    ผู้ใช้ — อาจมีข้อมูลอ่อนไหวปนอยู่)"""
+    print(f"[APIError] type={type(error).__name__} status={getattr(error, 'status_code', None)}")
+    return {"answer": _categorize_anthropic_api_error(error), "sources": [], "chat_id": chat_id}
+
+
 @app.post("/ask")
 async def ask_question(
     request: Request,
@@ -4847,7 +4885,15 @@ async def ask_question(
             log_doc_id = direct_target_doc["id"] if direct_target_doc else None
             print(f"[Route] chat={chat_id} branch=structural_to_agent active_doc={log_doc_id}")
 
-        if len(active_docs) == 1 and not reading_question and not structural_route:
+        # ไม่ใช่คำสั่งแก้ไฟล์เลย (structural_route เป็น False แล้วแน่ๆ ณ จุดนี้) แต่ดูเหมือนคำถามเกี่ยวกับคลัง
+        # เอกสารทั้งคลัง (ดู _looks_like_library_query) -> ข้ามตัวแยก intent ของไฟล์ที่เปิดอยู่ (single/multi-doc
+        # classifier ด้านล่าง) ไปเลย ไม่ต้องเสี่ยงให้ LLM ตัวนั้นตัดสินใจแทน (มันรู้จักแค่ structural/edit/
+        # finalize/compare/close/unrelated — ไม่มีตัวเลือก "เกี่ยวกับคลังทั้งหมด ไม่ใช่ไฟล์นี้" ให้เลือกเลย) —
+        # เหตุการณ์จริงที่แก้: เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" เคยหลุดเข้า branch นี้ก่อนถึงเส้นทาง
+        # library ด้านล่างเสมอ ปล่อยให้ตกไปเช็ค question_route ตามปกติต่อแทน (legal/library/advisor)
+        library_route_query = not structural_route and _looks_like_library_query(query)
+
+        if len(active_docs) == 1 and not reading_question and not structural_route and not library_route_query:
             editable_doc = active_docs[0]
             print(f"[Route] chat={chat_id} branch=single_doc_classifier active_doc={editable_doc['id']}")
             _, editable_doc_label_map = get_working_copy(editable_doc)
@@ -4910,7 +4956,7 @@ async def ask_question(
 
             # intent == "unrelated" -> ไม่ return ที่นี่ ปล่อยให้ตกไปทำงาน flow /ask ปกติด้านล่างต่อเลย
 
-        elif len(active_docs) >= 2 and not reading_question and not structural_route:
+        elif len(active_docs) >= 2 and not reading_question and not structural_route and not library_route_query:
             print(f"[Route] chat={chat_id} branch=multi_doc_classifier active_doc=None")
             valid_ids = {doc["id"] for doc in active_docs}
             docs_by_id = {doc["id"]: doc for doc in active_docs}
@@ -5046,9 +5092,12 @@ async def ask_question(
 
     if question_route == "advisor":
         print(f"[Route] chat={chat_id} branch=advisor")
-        answer, sources = advisor_answer(
-            query, history=history, user_id=user_id, chat_id=chat_id, active_docs=active_docs,
-        )
+        try:
+            answer, sources = advisor_answer(
+                query, history=history, user_id=user_id, chat_id=chat_id, active_docs=active_docs,
+            )
+        except anthropic.APIError as e:
+            return _ask_question_api_error_response(e, chat_id)
     elif (library_guest_message := _resolve_library_route_access(question_route, user_id)) is not None:
         # ไม่ได้ล็อกอิน (guest) -> คลังเอกสารใช้ไม่ได้เลย ตอบข้อความคงที่จากโค้ดตรงๆ กันสับสนเหมือนเดิมที่เส้นทาง
         # advisor ตอบว่า "ไม่มีคลังเอกสารเชื่อมอยู่" ทั้งที่มีคลังจริงๆ แค่ต้องล็อกอินก่อนเท่านั้น
@@ -5057,10 +5106,13 @@ async def ask_question(
     else:
         if question_route == "library":
             print(f"[Route] chat={chat_id} branch=library")
-        answer, sources = rag_answer(
-            query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id,
-            structural_route=structural_route, skip_legal_context=(question_route == "library"),
-        )
+        try:
+            answer, sources = rag_answer(
+                query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id,
+                structural_route=structural_route, skip_legal_context=(question_route == "library"),
+            )
+        except anthropic.APIError as e:
+            return _ask_question_api_error_response(e, chat_id)
     if image_data:
         # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง — Vision อ่านภาพคลาดเคลื่อนได้มากกว่าอ่านไฟล์จริง
         answer += IMAGE_ANSWER_DISCLAIMER
@@ -5089,28 +5141,39 @@ async def ask_question_stream(
 
     def event_generator():
         nonlocal chat_id
-        for event in rag_answer_stream(query, history=history, image_data=image_data, user_id=user_id):
-            if event["type"] == "delta":
-                yield json.dumps({"type": "delta", "text": event["text"]}, ensure_ascii=False) + "\n"
-            else:  # event["type"] == "done"
-                full_answer = event["full_answer"]
-                sources = event["sources"]
-                final_chat_id = chat_id
+        try:
+            for event in rag_answer_stream(query, history=history, image_data=image_data, user_id=user_id):
+                if event["type"] == "delta":
+                    yield json.dumps({"type": "delta", "text": event["text"]}, ensure_ascii=False) + "\n"
+                else:  # event["type"] == "done"
+                    full_answer = event["full_answer"]
+                    sources = event["sources"]
+                    final_chat_id = chat_id
 
-                if user_id:
-                    saved_query = _build_saved_query(query, image_data)
-                    if final_chat_id is None:
-                        title = saved_query.strip()[:50] or "แชทใหม่"
-                        final_chat_id = create_chat_session(user_id, title=title)
+                    if user_id:
+                        saved_query = _build_saved_query(query, image_data)
+                        if final_chat_id is None:
+                            title = saved_query.strip()[:50] or "แชทใหม่"
+                            final_chat_id = create_chat_session(user_id, title=title)
 
-                    add_chat_message(final_chat_id, "user", saved_query)
-                    add_chat_message(final_chat_id, "assistant", full_answer)
-                    touch_chat_session(final_chat_id)
+                        add_chat_message(final_chat_id, "user", saved_query)
+                        add_chat_message(final_chat_id, "assistant", full_answer)
+                        touch_chat_session(final_chat_id)
 
-                yield json.dumps(
-                    {"type": "done", "chat_id": final_chat_id, "sources": sources},
-                    ensure_ascii=False,
-                ) + "\n"
+                    yield json.dumps(
+                        {"type": "done", "chat_id": final_chat_id, "sources": sources},
+                        ensure_ascii=False,
+                    ) + "\n"
+        except anthropic.APIError as e:
+            # เหตุการณ์จริงเดียวกับ ask_question() (ดู _ask_question_api_error_response) แต่ format ต่างกัน
+            # (NDJSON ไม่ใช่ JSON object เดี่ยว) — ไม่มี "answer" ให้คืนตรงๆ แบบ /ask เลย ต้องส่งเป็น "delta" ก้อน
+            # เดียว (ข้อความ error) ตามด้วย "done" ปิดท้ายให้ frontend จบ stream ได้ปกติ ไม่บันทึกข้อความนี้เป็น
+            # คำตอบ assistant ใน DB เช่นกัน (เหตุผลเดียวกับ _ask_question_api_error_response)
+            print(f"[APIError] type={type(e).__name__} status={getattr(e, 'status_code', None)}")
+            yield json.dumps(
+                {"type": "delta", "text": _categorize_anthropic_api_error(e)}, ensure_ascii=False,
+            ) + "\n"
+            yield json.dumps({"type": "done", "chat_id": chat_id, "sources": []}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 

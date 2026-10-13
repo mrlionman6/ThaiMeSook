@@ -2053,3 +2053,63 @@ def test_build_chat_export_text_strips_markdown_from_message_content(ns):
     assert "แนะนำ รุ่น A — ลิงก์ (https://x.com)" in text
     assert "**" not in text
     assert "[ลิงก์]" not in text
+
+
+# ---------- feat/library-search-and-api-errors ส่วน A: API error ต้องไม่เป็น 500 + "คลัง" ตอนมีไฟล์เปิดอยู่ ----------
+# เหตุการณ์จริงที่แก้ (1): เครดิต API หมด -> anthropic.BadRequestError 400 "credit balance is too low" หลุดออก
+# จาก ask_question -> FastAPI คืน 500 เป็น text/plain -> หน้าเว็บ parse JSON ไม่ได้ พัง
+# เหตุการณ์จริงที่แก้ (2): เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" -> branch=document_reading (เพราะ
+# "เอกสาร" อยู่ใน _DOCUMENT_REFERENCE_KEYWORDS) -> แสดงค่าในไฟล์แทนรายการในคลังทั้งหมด
+
+def test_categorize_anthropic_api_error_detects_credit_balance_exhausted(ns):
+    error = ns["anthropic"].BadRequestError("Your credit balance is too low to access the Anthropic API", status_code=400)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "โควตา" in message
+    assert "แจ้งผู้ดูแลระบบ" in message
+
+
+def test_categorize_anthropic_api_error_detects_rate_limit(ns):
+    error = ns["anthropic"].RateLimitError("rate limited", status_code=429)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "หนาแน่น" in message
+
+
+def test_categorize_anthropic_api_error_detects_overloaded_by_status_code(ns):
+    """Anthropic "overloaded" ไม่มี subclass เฉพาะใน SDK — มาเป็น status_code=529 บน InternalServerError
+    (SDK แมป >=500 ทั้งหมดเป็นคลาสนี้) ต้องยังได้ข้อความ "หนาแน่น" เหมือน RateLimitError"""
+    error = ns["anthropic"].InternalServerError("Overloaded", status_code=529)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "หนาแน่น" in message
+
+
+def test_categorize_anthropic_api_error_falls_back_to_generic_message(ns):
+    error = ns["anthropic"].InternalServerError("some other internal error", status_code=500)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "ขัดข้องชั่วคราว" in message
+    assert "หนาแน่น" not in message
+    assert "โควตา" not in message
+
+
+def test_ask_question_api_error_response_returns_normal_json_shape(ns):
+    """ต้องคืน dict รูปแบบเดียวกับคำตอบปกติ ({"answer","sources","chat_id"}) ให้ ask_question() return ได้ตรงๆ —
+    sources ว่างเสมอ ไม่ raise ออกไปให้ FastAPI คืน 500 เด็ดขาด"""
+    error = ns["anthropic"].RateLimitError("rate limited", status_code=429)
+    result = ns["_ask_question_api_error_response"](error, chat_id=42)
+    assert result == {"answer": ns["_categorize_anthropic_api_error"](error), "sources": [], "chat_id": 42}
+
+
+def test_is_document_reading_question_excludes_library_keyword(ns):
+    """มีคำว่า "คลัง" ปนมา -> ไม่ใช่ reading question เด็ดขาด แม้มีคำอ้างอิงไฟล์ (เช่น "เอกสาร") ปนมาด้วยก็ตาม —
+    เหตุการณ์จริงที่แก้: เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" เคยถูกตีความเป็นคำถามเกี่ยวกับไฟล์ที่เปิดอยู่
+    (มีคำว่า "เอกสาร") ตอบค่าในไฟล์นั้นแทนที่จะเป็นรายการในคลังทั้งหมด"""
+    assert ns["_is_document_reading_question"]("ในคลังมีเอกสารอะไรบ้าง") is False
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+
+
+def test_library_query_with_active_document_still_routes_to_library(ns, box_doc):
+    """"ในคลังมีเอกสารอะไรบ้าง" ขณะมีไฟล์เปิดอยู่ (box_doc) ต้องไปถึงเส้นทาง library ได้จริง — ไม่ใช่แค่ไม่ถูกจับ
+    เป็น reading question เฉยๆ แต่ _classify_question_route (ซึ่งเป็นตัวตัดสินสุดท้ายใน ask_question หลังข้าม
+    ตัวแยก intent ของไฟล์ที่เปิดอยู่ไปแล้ว — ดู library_route_query ใน ask_question) ก็ต้องตอบ library ด้วย"""
+    assert ns["_is_document_reading_question"]("ในคลังมีเอกสารอะไรบ้าง") is False
+    assert ns["_looks_like_library_query"]("ในคลังมีเอกสารอะไรบ้าง") is True
+    assert ns["_classify_question_route"]("ในคลังมีเอกสารอะไรบ้าง") == "library"

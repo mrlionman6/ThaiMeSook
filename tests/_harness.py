@@ -81,6 +81,7 @@ WANTED_MAIN_FUNCS = {
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_query_matches_existing_customer", "_looks_like_library_query", "_resolve_library_route_access",
     "_query_matches_document_code_context", "_normalize_customer_name", "_normalize_library_search_text",
+    "_categorize_anthropic_api_error", "_ask_question_api_error_response",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
@@ -298,6 +299,40 @@ class _FakeDb:
         return value
 
 
+# ตัวแทน module "anthropic" จริง (ไม่ได้ติดตั้งในสภาพแวดล้อมทดสอบนี้ — ดู requirements.txt) เท่าที่
+# _categorize_anthropic_api_error/_ask_question_api_error_response ใน main.py ต้องใช้ (isinstance check +
+# except anthropic.APIError) จำลองลำดับชั้นจริงของ SDK เท่าที่จำเป็น: APIError เป็นฐานของทุกตัว, APIStatusError
+# (มี .status_code) เป็นฐานของ BadRequestError/RateLimitError/InternalServerError
+class _FakeAnthropicAPIError(Exception):
+    pass
+
+
+class _FakeAnthropicAPIStatusError(_FakeAnthropicAPIError):
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _FakeAnthropicBadRequestError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicRateLimitError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicInternalServerError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicModule:
+    APIError = _FakeAnthropicAPIError
+    APIStatusError = _FakeAnthropicAPIStatusError
+    BadRequestError = _FakeAnthropicBadRequestError
+    RateLimitError = _FakeAnthropicRateLimitError
+    InternalServerError = _FakeAnthropicInternalServerError
+
+
 class _FakeAnthropicContentBlock:
     def __init__(self, text: str):
         self.text = text
@@ -511,6 +546,7 @@ def build_namespace() -> dict:
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
         "word_tokenize": word_tokenize,
         "client": fake_client,
+        "anthropic": _FakeAnthropicModule,
         "StorageNotConfiguredError": StorageNotConfiguredError,
         "get_editable_document_raw": fake_db.get_editable_document_raw,
         "get_editable_document": fake_db.get_editable_document,
