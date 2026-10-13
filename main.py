@@ -391,6 +391,9 @@ MAX_TOOL_ITERATIONS = 8  # เดิม 5 — คำสั่งหลายข�
 # กันเผลอวน loop เรียก tool ไม่รู้จบ (งานทั่วไปปกติ 1-2 รอบก็พอ)
 ADVISOR_MAX_TOOL_ITERATIONS = 12  # เส้นทาง advisor เท่านั้น (ดู advisor_answer) — ค้นเว็บหลายรอบ+เปรียบเทียบสินค้า
 # ใช้รอบมากกว่าเส้นทางอื่นจริง (pause_turn ไม่กินโควตานี้อยู่แล้ว ดู run_agentic_tool_loop)
+ADVISOR_MAX_TOKENS = 8000  # เส้นทาง advisor เท่านั้น — เดิมใช้ 2500 เท่าเส้นทางอื่น แต่ present_recommendations
+# ต้องเขียนรายละเอียดสินค้าหลายรุ่นเป็นภาษาไทยยาว เคยชน max_tokens กลางคันจน input ของ tool_use ไม่สมบูรณ์
+# (เหตุการณ์จริงที่แก้ — log: stop_reason=max_tokens tools=present_recommendations ดู run_agentic_tool_loop)
 
 # คำนวณภาษีขั้นบันไดด้วยโค้ด Python ล้วนๆ ไม่พึ่ง LLM คำนวณเองเด็ดขาด — กัน hallucination เรื่องตัวเลข
 PERSONAL_INCOME_TAX_BRACKETS = [
@@ -2835,6 +2838,7 @@ MAX_PAUSE_TURNS = 5  # จำนวนรอบ pause_turn ติดกันส
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
     tools_override: Optional[list] = None, model: Optional[str] = None, max_iterations: Optional[int] = None,
+    max_tokens: Optional[int] = None,
 ) -> tuple[str, list[str], bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL — ต้องการเหตุผล/
@@ -2843,6 +2847,10 @@ def run_agentic_tool_loop(
       ทั้งหมด (ใช้โดย advisor_answer — ดู ADVISOR_TOOLS — ให้เครื่องมือเฉพาะ web_search ทั่วไปเท่านั้น ไม่มี
       เครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้) dispatcher ของแต่ละ tool ด้านล่างยังคงเช็คชื่อ tool ตามปกติ
       เหมือนเดิมทุกจุด — ไม่เคยถูกเรียกจริงถ้า tools_override ไม่มี tool นั้นอยู่ด้วย (Claude ไม่เห็น schema เลย)
+    - max_tokens: ถ้าระบุมา ใช้แทน 2500 ทั่วไป (ใช้โดย advisor_answer — ดู ADVISOR_MAX_TOKENS) ใช้ทั้งรอบหลักของ
+      loop, การบังคับเรียก present_recommendations และการเรียกสรุปข้อความด้านล่างเหมือนกันหมด — เหตุการณ์จริงที่
+      แก้: present_recommendations ต้องเขียนรายละเอียดสินค้าหลายรุ่นเป็นภาษาไทยยาว ชน max_tokens=2500 กลางคันจน
+      input ของ tool_use ไม่สมบูรณ์ (ดูการจัดการ stop_reason == "max_tokens" ด้านล่าง)
     - max_iterations: ถ้าระบุมา ใช้แทน MAX_TOOL_ITERATIONS ทั่วไป (ใช้โดย advisor_answer — ดู ADVISOR_MAX_TOOL_
       ITERATIONS — คำถามแนะนำสินค้ามักต้องค้นเว็บหลายรอบกว่าจะสรุปได้) รอบที่ stop_reason == "pause_turn" ไม่กิน
       โควตานี้เลย (ดู pause_count ด้านล่าง — จำกัดแยกต่างหากที่ MAX_PAUSE_TURNS)
@@ -2855,15 +2863,17 @@ def run_agentic_tool_loop(
       เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
       ไม่ใช่ None (ดูการแก้ไขใน ask_question())
     วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ max_iterations (กันวนไม่รู้จบ) พิมพ์
-    "[AgentLoop] iter=<n> stop_reason=<...> tools=<ชื่อ tool ที่เรียกรอบนี้> text_len=<n>" ทุกรอบ (ไม่พิมพ์เนื้อหา
-    ข้อความเลย กันข้อมูลผู้ใช้หลุดเข้า log — ใช้ debug เหตุการณ์จริงที่เจอ: advisor จบด้วย "งานนี้มีหลายขั้นเกินไป"
-    เป็นระยะโดยไม่มีร่องรอยว่า present_recommendations ถูกเรียกไหม)
+    "[AgentLoop] iter=<n> stop_reason=<...> tools=<ชื่อ tool ที่เรียกรอบนี้> text_len=<n> output_tokens=<n>" ทุกรอบ
+    (output_tokens ใส่ก็ต่อเมื่อ response มี usage จริง — ไม่พิมพ์เนื้อหาข้อความเลย กันข้อมูลผู้ใช้หลุดเข้า log —
+    ใช้ debug เหตุการณ์จริงที่เจอ: advisor จบด้วย "งานนี้มีหลายขั้นเกินไป" เป็นระยะโดยไม่มีร่องรอยว่า
+    present_recommendations ถูกเรียกไหม)
 
-    ถ้าวนจนครบ max_iterations (หรือ pause_turn ติดกันเกิน MAX_PAUSE_TURNS) โดยยังไม่เคยเรียก
-    present_recommendations เลยสักครั้ง (เช็คจาก tools_for_this_call ว่ามี tool นี้อยู่ด้วยไหม — มีเฉพาะเส้นทาง
-    advisor) และคำตอบสุดท้ายที่มีอยู่ตอนนี้ว่างเปล่า/ชน iteration limit: บังคับเรียก present_recommendations อีก
-    ครั้งเดียวด้วย tool_choice (ถ้ามี verified_source_urls อย่างน้อย 1 อัน) หรือสรุปเป็นข้อความธรรมดาแทน (ถ้าไม่มี
-    url ที่ยืนยันได้เลย) ก่อนจะยอมใช้ข้อความ fallback "งานนี้มีหลายขั้นเกินไป" เป็นทางเลือกสุดท้ายจริงๆ
+    ถ้าวนจนครบ max_iterations (หรือ pause_turn ติดกันเกิน MAX_PAUSE_TURNS หรือชน stop_reason == "max_tokens" —
+    ดูการตัด tool_use block ที่ไม่สมบูรณ์ทิ้งด้านล่าง) โดยยังไม่เคยเรียก present_recommendations เลยสักครั้ง (เช็ค
+    จาก tools_for_this_call ว่ามี tool นี้อยู่ด้วยไหม — มีเฉพาะเส้นทาง advisor) และคำตอบสุดท้ายที่มีอยู่ตอนนี้
+    ว่างเปล่า/ชน iteration limit/ชน max_tokens: บังคับเรียก present_recommendations อีกครั้งเดียวด้วย tool_choice
+    (ถ้ามี verified_source_urls อย่างน้อย 1 อัน) หรือสรุปเป็นข้อความธรรมดาแทน (ถ้าไม่มี url ที่ยืนยันได้เลย) ก่อนจะ
+    ยอมใช้ข้อความ fallback "งานนี้มีหลายขั้นเกินไป" เป็นทางเลือกสุดท้ายจริงๆ
 
     คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด, มี structural tool ถูกเรียกในเทิร์นนี้ไหม) เสมอ — รายการใบยืนยัน
     มาจาก _build_action_receipt() เฉพาะ tool ที่เปลี่ยนข้อมูลจริง (open_library_file, select_list_item ตอนเปิด
@@ -2884,11 +2894,19 @@ def run_agentic_tool_loop(
     applied_messages: list[str] = []
     present_recommendations_called = False
     effective_max_iterations = max_iterations if max_iterations is not None else MAX_TOOL_ITERATIONS
+    effective_max_tokens = max_tokens if max_tokens is not None else 2500
 
     def _add_receipt(tool_name: str, result: dict) -> None:
         receipt = _build_action_receipt(tool_name, result)
         if receipt and receipt not in action_receipts:
             action_receipts.append(receipt)
+
+    def _output_tokens_log_suffix(resp) -> str:
+        """ต่อท้าย log [AgentLoop] ด้วย output_tokens จริงถ้า response มี usage ติดมา (บาง response เช่นตอน
+        ทดสอบ/mock อาจไม่มี) ไม่มีก็ไม่ต่ออะไรเลย แทนที่จะพิมพ์ output_tokens=None ให้สับสน"""
+        usage = getattr(resp, "usage", None)
+        output_tokens = getattr(usage, "output_tokens", None) if usage is not None else None
+        return f" output_tokens={output_tokens}" if output_tokens is not None else ""
 
     def _track_applied_result(tool_name: str, result: dict) -> None:
         """จัดการผลของ tool ที่แก้โครงสร้างไฟล์ทันที (change_rate/update_table_item/delete_table_item/
@@ -2934,7 +2952,7 @@ def run_agentic_tool_loop(
 
         response = client.messages.create(
             model=model or "claude-haiku-4-5-20251001",
-            max_tokens=2500,  # เดิม 1500 — เพิ่มเพราะคำตอบสาย investment advisor มักมี breakdown + อ้างอิงกฎหมายยาวขึ้น
+            max_tokens=effective_max_tokens,  # เดิม 2500 คงที่ — advisor ส่ง ADVISOR_MAX_TOKENS=8000 แทน (ดู docstring)
             system=system_prompt,
             tools=tools_for_this_call,
             messages=messages,
@@ -2948,6 +2966,7 @@ def run_agentic_tool_loop(
         print(
             f"[AgentLoop] iter={iteration} stop_reason={response.stop_reason} "
             f"tools={','.join(tool_names_called) if tool_names_called else '-'} text_len={response_text_len}"
+            f"{_output_tokens_log_suffix(response)}"
         )
 
         for block in response.content:
@@ -2980,6 +2999,24 @@ def run_agentic_tool_loop(
                 break
             continuing_pause = True
             continue
+
+        if response.stop_reason == "max_tokens":
+            # Claude ถูกตัดกลางคัน (เหตุการณ์จริงที่แก้: มักเกิดตอนกำลังเขียน input ของ present_recommendations
+            # ภาษาไทยยาวๆ) assistant message ล่าสุดที่เพิ่ง append ไปข้างบนอาจมี tool_use block ที่ input ไม่
+            # สมบูรณ์ (JSON ถูกตัดกลางคัน) ค้างอยู่ — ไม่เคย execute/ส่ง tool_result คู่กันเลย (ไม่เข้าเงื่อนไข
+            # stop_reason == "tool_use" ด้านล่าง) ถ้าปล่อยไว้ การเรียก client.messages.create ครั้งถัดไปด้วย
+            # messages เดิม (forced call/summary call ด้านล่าง) จะโดน Anthropic API 400 จริง (tool_use ทุกอันต้อง
+            # มี tool_result คู่กันเสมอ) ตัดทิ้งเฉพาะ tool_use block (คงข้อความส่วนที่เขียนไปแล้วไว้ เช่น
+            # ส่วนเกณฑ์การเลือกสินค้าที่ Claude อธิบายก่อนเริ่มเรียก tool) ถ้าไม่เหลือ content อะไรเลยในข้อความนั้น
+            # ลบทั้ง message ทิ้ง (message ที่มี content ว่างเปล่าเองก็ไม่ใช่รูปแบบที่ API ยอมรับอยู่แล้ว)
+            last_message = messages[-1]
+            last_message["content"] = [c for c in last_message["content"] if c.get("type") != "tool_use"]
+            if not last_message["content"]:
+                messages.pop()
+            hit_iteration_limit = True  # ไม่ใช่ iteration limit เป๊ะๆ แต่ทริกเกอร์ fallback เดียวกัน (บังคับเรียก
+            # present_recommendations ด้านล่างแม้ final_text_so_far จะไม่ว่างเปล่าก็ตาม — ข้อความที่มีอยู่เป็นแค่
+            # ส่วนเกณฑ์ก่อนหน้า tool_use ที่ถูกตัดทิ้ง ไม่ใช่คำตอบที่สมบูรณ์)
+            break
 
         if response.stop_reason != "tool_use":
             break  # Claude ตอบจบแล้วจริงๆ (end_turn) ไม่ต้องเรียก tool อะไรต่อ
@@ -3189,14 +3226,15 @@ def run_agentic_tool_loop(
             if verified_source_urls:
                 try:
                     forced_response = client.messages.create(
-                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=effective_max_tokens,
+                        system=system_prompt,
                         tools=tools_for_this_call,
                         tool_choice={"type": "tool", "name": "present_recommendations"},
                         messages=messages,
                     )
                     print(
                         f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
-                        f"tools=present_recommendations text_len=0"
+                        f"tools=present_recommendations text_len=0{_output_tokens_log_suffix(forced_response)}"
                     )
                     tool_use_block = next((b for b in forced_response.content if b.type == "tool_use"), None)
                     if tool_use_block is not None:
@@ -3225,14 +3263,15 @@ def run_agentic_tool_loop(
                     nudge_appended = True
                 try:
                     summary_response = client.messages.create(
-                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=effective_max_tokens,
+                        system=system_prompt,
                         tools=tools_for_this_call, tool_choice={"type": "none"},
                         messages=messages,
                     )
                     summary_text_len = sum(len(b.text) for b in summary_response.content if b.type == "text")
                     print(
                         f"[AgentLoop] iter=forced_summary stop_reason={summary_response.stop_reason} "
-                        f"tools=- text_len={summary_text_len}"
+                        f"tools=- text_len={summary_text_len}{_output_tokens_log_suffix(summary_response)}"
                     )
                     summary_text = _build_final_answer_with_citations(summary_response.content)
                     if summary_text:
@@ -4146,6 +4185,7 @@ def advisor_answer(
     raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
         tools_override=ADVISOR_TOOLS, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
+        max_tokens=ADVISOR_MAX_TOKENS,
     )
     answer = _normalize_polite_particles(raw_answer)
     # offer_line อาจถูกต่อท้ายไปแล้วจาก _render_recommendations_answer (ตอน Claude เรียก present_recommendations

@@ -826,6 +826,14 @@ def test_rag_answer_allows_structural_route_when_tool_called(ns):
     assert "ยืนยัน" in answer  # ข้อความจริงจาก tool (จำลองผ่าน fake loop) ไม่ถูก block
 
 
+def test_rag_answer_does_not_override_default_max_tokens(ns):
+    """เส้นทางอื่น (ไม่ใช่ advisor) ต้องไม่ส่ง max_tokens เข้า run_agentic_tool_loop เลย — ปล่อยให้ใช้ค่าเริ่มต้น
+    2500 เหมือนเดิม (ดู ADVISOR_MAX_TOKENS ที่เฉพาะ advisor_answer เท่านั้นที่ส่งมา)"""
+    ns["_fake_agentic_loop"].set_response("คำตอบปกติ", [], False)
+    ns["rag_answer"]("มาตรา 10 พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวว่าอย่างไร", user_id=1, chat_id=1)
+    assert ns["_fake_agentic_loop"].last_call_args["max_tokens"] is None
+
+
 def test_rag_answer_blocks_fabricated_edit_claim_without_receipts(ns, doc1):
     """LLM ตอบ "✓ แก้แล้ว" โดยไม่มี receipt จาก tool เลย (และมีเอกสารเปิดอยู่ในแชทจริง) -> ต้องถูก block"""
     ns["_fake_agentic_loop"].set_response("✓ แก้รายการเรียบร้อยแล้วครับ", [], False)
@@ -961,6 +969,9 @@ def test_advisor_answer_sends_chat_history_and_has_no_legal_kb_text_in_system_pr
     assert sources == []
     call_args = ns["_fake_agentic_loop"].last_call_args
     assert call_args["tools_override"] == ns["ADVISOR_TOOLS"]
+    # advisor ต้องส่ง max_tokens=ADVISOR_MAX_TOKENS (8000) เข้า run_agentic_tool_loop เสมอ — เดิมใช้ 2500 เท่า
+    # เส้นทางอื่น แต่ present_recommendations เขียนรายละเอียดสินค้าหลายรุ่นยาวจนชน max_tokens กลางคันมาแล้วจริง
+    assert call_args["max_tokens"] == ns["ADVISOR_MAX_TOKENS"]
     sent_messages = call_args["messages"]
     assert len(sent_messages) == len(history) + 1
     assert sent_messages[-1]["content"] == "มีรุ่นไหนให้เลือกบ้าง พร้อมบอกราคามาเลย"
@@ -1273,6 +1284,95 @@ def test_run_agentic_tool_loop_forced_calls_survive_exception_and_fall_back_grac
     assert answer == "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
     assert receipts == []
     assert structural is False
+
+
+def test_run_agentic_tool_loop_forces_present_recommendations_when_hitting_max_tokens(ns):
+    """เหตุการณ์จริงที่แก้: [AgentLoop] iter=1 stop_reason=max_tokens tools=present_recommendations text_len=451
+    — Claude เขียนข้อความเกณฑ์การเลือกไปก่อนแล้วเริ่มเรียก present_recommendations แต่ input ภาษาไทยยาวเกินจน
+    ชน max_tokens กลางคัน (JSON ไม่สมบูรณ์) ต้องถือเป็นเงื่อนไขบังคับเรียกซ้ำเหมือนข้อความว่าง/ชน iteration limit
+    และต้องตัด tool_use block ที่ไม่สมบูรณ์ทิ้งจาก messages ก่อน ไม่งั้น API จริงจะ 400 (tool_use ไม่มี tool_result
+    คู่กัน)"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    incomplete_input = {"criteria": ["ความจุ"]}  # จงใจไม่ครบ (ไม่มี items/summary) จำลอง JSON ที่ถูกตัดกลางคัน
+    fake_client.response_queue = [
+        _FakeAgenticResponse(
+            [
+                _FakeAgenticOtherBlock("web_search_tool_result", content=[{"url": "https://shop.com", "title": "ร้าน"}]),
+                _FakeAgenticTextBlock("เกณฑ์ที่ใช้พิจารณา: ความจุ, ราคา"),
+                _FakeAgenticToolUseBlock("incomplete_1", "present_recommendations", incomplete_input),
+            ],
+            stop_reason="max_tokens",
+        ),
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("forced_1", "present_recommendations", _FORCED_RECOMMENDATION_INPUT)],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    assert fake_client.call_count == 2  # รอบหลัก 1 (ชน max_tokens) + forced 1 ไม่ต้องลองรอบหลักซ้ำ
+    assert fake_client.last_call_kwargs["tool_choice"] == {"type": "tool", "name": "present_recommendations"}
+    sent_messages = fake_client.last_call_kwargs["messages"]
+    # ไม่มี tool_use block ค้างอยู่ใน messages ที่ส่งไปเลยสักที่ (ตัวที่ input ไม่สมบูรณ์ต้องถูกตัดทิ้งไปแล้ว)
+    for message in sent_messages:
+        content = message["content"]
+        if isinstance(content, list):
+            assert all(block.get("type") != "tool_use" for block in content)
+    # ข้อความเกณฑ์ (text block) ที่เขียนไว้ก่อนชน max_tokens ต้องยังอยู่ ไม่ถูกตัดทิ้งไปด้วย
+    assistant_messages = [m for m in sent_messages if m["role"] == "assistant"]
+    assert len(assistant_messages) == 1
+    assert any(
+        block.get("type") == "text" and "เกณฑ์" in block.get("text", "")
+        for block in assistant_messages[0]["content"]
+    )
+    assert sent_messages[-1] == {"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"}
+    assert "1. รุ่น D (บังคับเรียก)" in answer
+    assert receipts == []
+    assert structural is False
+
+
+def test_run_agentic_tool_loop_max_tokens_drops_whole_assistant_message_when_empty_after_strip(ns):
+    """ถ้า assistant message รอบที่ชน max_tokens มีแค่ tool_use block ที่ไม่สมบูรณ์ล้วนๆ (ไม่มี text/block อื่นเลย)
+    ตัด tool_use ทิ้งแล้วเหลือ content ว่างเปล่า -> ต้องลบทั้ง message ทิ้งไปเลย ไม่ใช่ปล่อยให้มี assistant message
+    ที่ content เป็น list ว่างเปล่าค้างอยู่ (ไม่ใช่รูปแบบที่ Anthropic API ยอมรับ) — รอบแรกเรียก open_library_file
+    เป็น "ตัวเติม" ให้มี verified_source_urls อยู่แล้วก่อนชน max_tokens (ตัว tool_use ของรอบแรกจับคู่กับ
+    tool_result ปกติแล้ว ไม่ใช่ตัวที่ไม่สมบูรณ์ — ต้องไม่ถูกตัดทิ้งไปด้วย)"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse(
+            [
+                _FakeAgenticOtherBlock("web_search_tool_result", content=[{"url": "https://shop.com", "title": "ร้าน"}]),
+                _FakeAgenticToolUseBlock("filler", "open_library_file", {}),
+            ],
+            stop_reason="tool_use",
+        ),
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("incomplete_1", "present_recommendations", {})],
+            stop_reason="max_tokens",
+        ),
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("forced_1", "present_recommendations", _FORCED_RECOMMENDATION_INPUT)],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    sent_messages = fake_client.last_call_kwargs["messages"]
+    assistant_messages = [m for m in sent_messages if m["role"] == "assistant"]
+    # เหลือแค่ assistant message ของรอบแรก (filler) — รอบที่ชน max_tokens (content ว่างเปล่าหลังตัด tool_use)
+    # ถูกลบทั้ง message ทิ้งไปแล้ว
+    assert len(assistant_messages) == 1
+    assert "1. รุ่น D (บังคับเรียก)" in answer
 
 
 def test_run_agentic_tool_loop_pause_turn_three_times_does_not_consume_iteration_quota(ns):
