@@ -3177,46 +3177,68 @@ def run_agentic_tool_loop(
             # advisor จบโดยไม่ได้เรียก present_recommendations เลย ทั้งที่เส้นทางนี้มี tool นี้ให้ใช้เสมอ (ข้อความ
             # สุดท้ายว่างเปล่า หรือชน max_iterations) — บังคับเรียกอีกครั้งเดียวด้วย tool_choice ก่อนจะยอมปล่อย
             # fallback (เหตุการณ์จริงที่แก้: AI ค้นเว็บเสร็จแล้วแต่ไม่เรียก present_recommendations จนหมดรอบ)
+            # ทั้งสองการเรียกพิเศษนี้ต้องส่ง tools=tools_for_this_call เดิมเสมอ (ไม่ใช่ตัดเหลือ tool เดียว/ไม่มี
+            # tool เลย) เพราะ messages ที่ส่งไปมี server_tool_use/web_search_tool_result บล็อกติดอยู่แล้วจากรอบ
+            # ก่อนหน้า — Anthropic API จริงจะ 400 ถ้า tools ที่ส่งมาไม่ครอบคลุม tool ที่ประวัติอ้างถึง
+            nudge_appended = False
+            if messages and messages[-1].get("role") == "assistant":
+                # กัน assistant content block ล่าสุด (ที่ยังไม่จบประโยค/ไม่มี text เลย) ชนกับ tool_choice ที่บังคับ
+                # เรียกถัดไป — เติม user turn สั้นๆ ขอให้สรุปก่อนเสมอ (เหมือน prompt จริงจากผู้ใช้ ไม่ใช่ prefill)
+                messages.append({"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"})
+                nudge_appended = True
             if verified_source_urls:
-                forced_response = client.messages.create(
-                    model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
-                    tools=[PRESENT_RECOMMENDATIONS_TOOL],
-                    tool_choice={"type": "tool", "name": "present_recommendations"},
-                    messages=messages,
-                )
-                print(
-                    f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
-                    f"tools=present_recommendations text_len=0"
-                )
-                tool_use_block = next((b for b in forced_response.content if b.type == "tool_use"), None)
-                if tool_use_block is not None:
-                    present_recommendations_called = True
-                    result = _safe_execute_tool(
-                        "present_recommendations", execute_present_recommendations,
-                        tool_use_block.input, chat_id, verified_source_urls,
+                try:
+                    forced_response = client.messages.create(
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        tools=tools_for_this_call,
+                        tool_choice={"type": "tool", "name": "present_recommendations"},
+                        messages=messages,
                     )
-                    if "error" in result:
-                        applied_messages.append(result["error"])
-                    else:
-                        has_open_document = bool(
-                            user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
+                    print(
+                        f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
+                        f"tools=present_recommendations text_len=0"
+                    )
+                    tool_use_block = next((b for b in forced_response.content if b.type == "tool_use"), None)
+                    if tool_use_block is not None:
+                        present_recommendations_called = True
+                        result = _safe_execute_tool(
+                            "present_recommendations", execute_present_recommendations,
+                            tool_use_block.input, chat_id, verified_source_urls,
                         )
-                        applied_messages.append(_render_recommendations_answer(result, has_open_document))
+                        if "error" in result:
+                            applied_messages.append(result["error"])
+                        else:
+                            has_open_document = bool(
+                                user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
+                            )
+                            applied_messages.append(_render_recommendations_answer(result, has_open_document))
+                except Exception as e:
+                    # ไม่ปล่อยให้ API ล้ม/timeout ของการเรียกพิเศษนี้หลุดออกไปเป็น 500 ถึงผู้ใช้เด็ดขาด — ไปต่อที่
+                    # summary call ด้านล่าง (หรือ fallback เดิมถ้านั่นก็ล้มอีก) ไม่พิมพ์เนื้อหา exception เลย
+                    print(f"[AgentLoop] forced call failed: {type(e).__name__}")
             if not applied_messages:
-                # ไม่มี url ที่ยืนยันได้เลย (หรือการบังคับเรียกข้างบนไม่ได้คำตอบ) — เรียกอีกครั้งเดียวแบบไม่มี
-                # tools ให้สรุปเป็นข้อความธรรมดาจากผลค้นที่มีอยู่แทน
-                summary_response = client.messages.create(
-                    model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
-                    messages=messages,
-                )
-                summary_text_len = sum(len(b.text) for b in summary_response.content if b.type == "text")
-                print(
-                    f"[AgentLoop] iter=forced_summary stop_reason={summary_response.stop_reason} "
-                    f"tools=- text_len={summary_text_len}"
-                )
-                summary_text = _build_final_answer_with_citations(summary_response.content)
-                if summary_text:
-                    applied_messages.append(summary_text)
+                # ไม่มี url ที่ยืนยันได้เลย (หรือการบังคับเรียกข้างบนไม่ได้คำตอบ/ล้มเหลว) — เรียกอีกครั้งเดียวด้วย
+                # tool_choice={"type":"none"} (ห้าม Claude เรียก tool ใดๆ ต่ออีก แต่ยังต้องส่ง tools=
+                # tools_for_this_call เดิมด้วยเหตุผลเดียวกับด้านบน) ให้สรุปเป็นข้อความธรรมดาจากผลค้นที่มีอยู่แทน
+                if not nudge_appended and messages and messages[-1].get("role") == "assistant":
+                    messages.append({"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"})
+                    nudge_appended = True
+                try:
+                    summary_response = client.messages.create(
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        tools=tools_for_this_call, tool_choice={"type": "none"},
+                        messages=messages,
+                    )
+                    summary_text_len = sum(len(b.text) for b in summary_response.content if b.type == "text")
+                    print(
+                        f"[AgentLoop] iter=forced_summary stop_reason={summary_response.stop_reason} "
+                        f"tools=- text_len={summary_text_len}"
+                    )
+                    summary_text = _build_final_answer_with_citations(summary_response.content)
+                    if summary_text:
+                        applied_messages.append(summary_text)
+                except Exception as e:
+                    print(f"[AgentLoop] forced call failed: {type(e).__name__}")
 
     if applied_messages:
         # มี tool แก้โครงสร้างไฟล์สำเร็จในเทิร์นนี้ (หรือ present_recommendations ถูกบังคับเรียกสำเร็จ) — ใช้

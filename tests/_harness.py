@@ -297,10 +297,13 @@ class _FakeAnthropicMessages:
     def create(self, **kwargs):
         self._client.last_call_kwargs = kwargs
         self._client.call_count += 1
+        if self._client.response_queue:
+            # response_queue (ถ้ามีของเหลืออยู่) มาก่อน raise_on_create เสมอ — ให้เทสต์คุม control flow ของ
+            # run_agentic_tool_loop ตัวจริงได้ (เช่น รอบปกติสำเร็จก่อน แล้วค่อยให้การเรียกพิเศษ "หลัง" loop ปกติ
+            # ล้มเหลว โดยตั้ง raise_on_create ไว้ด้วยพร้อมกัน — คิวว่างเมื่อไหร่ค่อยเริ่มใช้ raise_on_create)
+            return self._client.response_queue.pop(0)
         if self._client.raise_on_create is not None:
             raise self._client.raise_on_create
-        if self._client.response_queue:
-            return self._client.response_queue.pop(0)
         return _FakeAnthropicResponse(self._client.response_text)
 
 

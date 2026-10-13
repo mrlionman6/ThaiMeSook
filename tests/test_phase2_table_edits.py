@@ -1176,7 +1176,16 @@ def test_run_agentic_tool_loop_forces_present_recommendations_when_ends_empty_af
 
     assert fake_client.call_count == 2
     assert fake_client.last_call_kwargs["tool_choice"] == {"type": "tool", "name": "present_recommendations"}
-    assert fake_client.last_call_kwargs["tools"] == [ns["PRESENT_RECOMMENDATIONS_TOOL"]]
+    # tools ของการเรียกบังคับต้องเป็น tools_for_this_call เดิมทั้งชุด (มีทั้ง web_search และ
+    # present_recommendations) ไม่ใช่ตัดเหลือ present_recommendations ตัวเดียว — ประวัติ messages มี
+    # server_tool_use/web_search_tool_result ติดมาแล้ว ตัด web_search ออกจาก tools เสี่ยง API จริง 400
+    sent_tool_names = {t.get("name") for t in fake_client.last_call_kwargs["tools"] if isinstance(t, dict)}
+    assert "web_search" in sent_tool_names
+    assert "present_recommendations" in sent_tool_names
+    # จบด้วย end_turn (assistant content ล่าสุดไม่มี text เลย) — ต้องเติม user turn สั้นๆ ขอสรุปก่อนเรียกบังคับ
+    # เสมอ (กัน assistant content ว่างๆ ชนกับ tool_choice) — messages ที่ส่งไปต้องจบด้วย role "user" จริงๆ
+    sent_messages = fake_client.last_call_kwargs["messages"]
+    assert sent_messages[-1] == {"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"}
     assert "1. รุ่น D (บังคับเรียก)" in answer
     assert receipts == []
     assert structural is False
@@ -1211,13 +1220,17 @@ def test_run_agentic_tool_loop_forces_present_recommendations_when_hitting_max_i
 
     assert fake_client.call_count == 3
     assert fake_client.last_call_kwargs["tool_choice"] == {"type": "tool", "name": "present_recommendations"}
+    sent_tool_names = {t.get("name") for t in fake_client.last_call_kwargs["tools"] if isinstance(t, dict)}
+    assert "web_search" in sent_tool_names
+    assert "present_recommendations" in sent_tool_names
     assert "1. รุ่น D (บังคับเรียก)" in answer
 
 
 def test_run_agentic_tool_loop_falls_back_to_plain_summary_when_no_verified_url(ns):
     """ไม่มี verified_source_urls เลย (ไม่เคยค้นเว็บได้ผลจริง) และจบด้วยข้อความว่าง ไม่เรียก present_recommendations
-    -> ไม่บังคับเรียก present_recommendations ด้วย tool_choice (ไม่มี url ให้ยืนยันเลย) แต่เรียกอีกครั้งแบบไม่มี
-    tools ให้สรุปเป็นข้อความธรรมดาแทน"""
+    -> ไม่บังคับเรียก present_recommendations ด้วย tool_choice (ไม่มี url ให้ยืนยันเลย) แต่เรียกอีกครั้งด้วย
+    tool_choice={"type":"none"} (ยังต้องส่ง tools=tools_for_this_call เดิมเสมอ — ห้ามส่งแบบไม่มี tools เลย
+    เพราะประวัติอาจมี tool block ติดมาแล้ว) ให้สรุปเป็นข้อความธรรมดาแทน"""
     real_loop = ns["_real_run_agentic_tool_loop"]
     fake_client = ns["_fake_client"]
     fake_client.response_queue = [
@@ -1231,9 +1244,35 @@ def test_run_agentic_tool_loop_falls_back_to_plain_summary_when_no_verified_url(
     )
 
     assert fake_client.call_count == 2
-    assert "tools" not in fake_client.last_call_kwargs
-    assert "tool_choice" not in fake_client.last_call_kwargs
+    assert fake_client.last_call_kwargs["tools"] == ns["ADVISOR_TOOLS"]
+    assert fake_client.last_call_kwargs["tool_choice"] == {"type": "none"}
     assert answer == "สรุปจากข้อมูลที่มีครับ ยังไม่มีราคาที่ยืนยันได้ชัดเจน"
+
+
+def test_run_agentic_tool_loop_forced_calls_survive_exception_and_fall_back_gracefully(ns):
+    """การเรียกพิเศษหลัง loop (ทั้ง forced tool_choice call และ summary call) ต้อง "กลืน" exception ของตัวเองไว้
+    เสมอ ไม่ปล่อยหลุดออกไปถึงผู้ใช้เป็น 500 — จำลอง API ล้มทั้งคู่ (raise_on_create ติดตั้งไว้ตั้งแต่ก่อนเรียก แต่
+    response_queue ยังมีรอบหลักรอบแรกให้ผ่านไปตามปกติก่อน — ดู _FakeAnthropicMessages.create: คิวมาก่อน
+    raise_on_create เสมอ) -> ต้องได้ข้อความ fallback เดิม ไม่ crash เลย"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticOtherBlock("web_search_tool_result", content=[{"url": "https://shop.com", "title": "ร้าน"}])],
+            stop_reason="end_turn",
+        ),
+    ]
+    fake_client.raise_on_create = RuntimeError("simulated API failure")
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    assert fake_client.call_count == 3  # รอบหลัก 1 + forced (ล้ม) 1 + summary (ล้ม) 1
+    assert answer == "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
+    assert receipts == []
+    assert structural is False
 
 
 def test_run_agentic_tool_loop_pause_turn_three_times_does_not_consume_iteration_quota(ns):
