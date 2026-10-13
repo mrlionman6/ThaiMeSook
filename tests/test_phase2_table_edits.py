@@ -967,6 +967,33 @@ def test_classify_question_route_detects_library_without_llm_call(ns, query):
     assert ns["_fake_client"].last_call_kwargs is None
 
 
+@pytest.mark.parametrize("query", [
+    "แนะนำสาย CAT-6 ที่ดีที่สุด", "หัว RJ-45 ยี่ห้อไหนดี", "กล้อง IPC-2125 ดีไหม",
+])
+def test_looks_like_library_query_does_not_match_product_model_codes(ns, query):
+    """เหตุการณ์จริงที่แก้: _LIBRARY_DOCUMENT_CODE_RE (รูปแบบ "ตัวอักษร-ตัวเลข") แมตช์รหัสรุ่นสินค้าด้วย ทำให้
+    คำถามแนะนำสินค้าถูกตัดสินเป็น library ผิดๆ ด้วยโค้ด (ไม่ได้เรียก present_recommendations เลย) — ต้องคืน False
+    ปล่อยให้ Haiku classifier ตัดสินแทน (มีตัวอย่างรหัสรุ่นสินค้าสอนไว้แล้วว่าเป็น advisor)"""
+    assert ns["_looks_like_library_query"](query) is False
+
+
+@pytest.mark.parametrize("query", [
+    "SSF-02", "SSF-02 ครับ", "เปิดใบ SSF-02", "เอกสารเลขที่ ASA-02",
+])
+def test_looks_like_library_query_matches_real_document_codes(ns, query):
+    """รหัสเอกสารที่ "เกือบทั้งหมด" คือตัวข้อความเอง (เหลือแค่คำลงท้ายสุภาพ/ว่างเปล่า) หรือมีคำอ้างอิงเอกสารปนมา
+    ด้วย (ใบ/เอกสาร/เลขที่/ไฟล์/เปิด) ต้องยังคืน True เหมือนเดิม — ไม่ใช่รหัสรุ่นสินค้าที่ปนมาเฉยๆ ในคำถามอื่น"""
+    assert ns["_looks_like_library_query"](query) is True
+
+
+def test_looks_like_library_query_single_word_customer_is_not_enough(ns):
+    """"ลูกค้า" เดี่ยวๆ ถูกตัดออกจาก _LIBRARY_ROUTE_KEYWORDS โดยตั้งใจ (กว้างเกินไป) — "แนะนำโปรแกรมจัดการลูกค้า"
+    ต้องไม่ถูกตัดสินเป็น library ด้วยโค้ดอีกต่อไป (ปล่อยให้ Haiku classifier ตัดสินแทน) แต่ "รายชื่อลูกค้าทั้งหมด"
+    (คำเฉพาะเจาะจงกว่ามาก) ยังต้องเป็น library เหมือนเดิม"""
+    assert ns["_looks_like_library_query"]("แนะนำโปรแกรมจัดการลูกค้า") is False
+    assert ns["_looks_like_library_query"]("รายชื่อลูกค้าทั้งหมด") is True
+
+
 def test_classify_question_route_uses_history_for_continuation_message(ns):
     """"ของบริษัทป่าไม้เขียวจำกัด" เดี่ยวๆ ไม่มีคำเชิงคลังเอกสารปนมาเองเลยสักคำ (ไม่ตรง _looks_like_library_query
     ด้วยโค้ด) ต้องตกไปถาม Haiku classifier พร้อมส่งประวัติสนทนา (มี "คลังใบเสนอราคา" อยู่) ไปด้วย — fake classifier

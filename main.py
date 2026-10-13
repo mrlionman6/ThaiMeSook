@@ -3942,11 +3942,13 @@ QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT = (
     "- legal: คำถามเชิงความรู้กฎหมาย/ภาษี/การลงทุน/การจดทะเบียนธุรกิจในประเทศไทย (เช่น พ.ร.บ.ต่างด้าว, BOI, "
     "ภาษีนิติบุคคล, work permit, การถือครองที่ดิน)\n"
     "- library: คำถามเกี่ยวกับการค้นหา/เปิด/ดูรายการเอกสาร ใบเสนอราคา รายชื่อลูกค้า โปรเจกต์ หรือเทมเพลตในคลัง"
-    "เอกสารของผู้ใช้ (เช่น เลขที่เอกสาร, ชื่อบริษัทลูกค้า, \"ในคลังมีเอกสารอะไรบ้าง\") รวมถึงข้อความสั้นๆ ที่ต่อ"
-    "เนื่องจากคำถามแบบนี้ในประวัติสนทนาด้วย (เช่น ผู้ใช้เพิ่งถามถึงคลังเอกสารแล้วพิมพ์ชื่อบริษัทตามมาเฉยๆ ในเทิร์น"
-    "ถัดไป)\n"
+    "เอกสารของผู้ใช้ (เช่น เลขที่เอกสารในคลัง, ชื่อบริษัทลูกค้า, \"ในคลังมีเอกสารอะไรบ้าง\") รวมถึงข้อความสั้นๆ "
+    "ที่ต่อเนื่องจากคำถามแบบนี้ในประวัติสนทนาด้วย (เช่น ผู้ใช้เพิ่งถามถึงคลังเอกสารแล้วพิมพ์ชื่อบริษัทตามมาเฉยๆ "
+    "ในเทิร์นถัดไป) ไม่ใช่รหัสรุ่น/ยี่ห้อสินค้า\n"
     "- advisor: คำถามอื่นๆ ทั้งหมดที่ไม่ใช่กฎหมาย/ภาษี/การลงทุน/คลังเอกสารโดยตรง (เช่น แนะนำ/เปรียบเทียบสินค้า "
-    "อุปกรณ์ รุ่น ราคา หรือคำถามธุรกิจทั่วไปอื่นๆ) ถ้าไม่แน่ใจระหว่าง legal/library กับ advisor ให้เลือก advisor"
+    "อุปกรณ์ รุ่น ราคา หรือคำถามธุรกิจทั่วไปอื่นๆ — รวมถึงคำถามแนะนำ/เปรียบเทียบสินค้าที่มีรหัสรุ่นสินค้าปนมาด้วย "
+    "เช่น \"สาย CAT-6\"/\"หัว RJ-45\"/\"กล้อง IPC-2125\" ก็ยังเป็น advisor ไม่ใช่ library เพราะไม่ใช่เลขที่เอกสาร"
+    "ในคลัง) ถ้าไม่แน่ใจระหว่าง legal/library กับ advisor ให้เลือก advisor"
 )
 
 
@@ -3980,20 +3982,51 @@ def _classify_legal_or_advisor_route(query: str, history: Optional[list] = None)
 
 # คำที่บ่งบอกว่าข้อความนี้น่าจะเกี่ยวกับคลังเอกสาร/ลูกค้า/โปรเจกต์/เทมเพลต — ดู _looks_like_library_query
 _LIBRARY_ROUTE_KEYWORDS = (
-    "คลัง", "เปิดไฟล์", "เปิดใบ", "เปิดเอกสาร", "เอกสารของ", "ใบเสนอราคาของ", "รายชื่อลูกค้า", "ลูกค้า",
+    # "ลูกค้า" เดี่ยวๆ ถูกตัดออกโดยตั้งใจ (เหตุการณ์จริงที่แก้: กว้างเกินไป จับคำถามอื่นที่พูดถึงลูกค้าเฉยๆ ผิด
+    # เป็น library — ปล่อยให้ Haiku classifier ตัดสินแทนถ้าไม่มีคำอื่นในชุดนี้ปนมาด้วย) คง "รายชื่อลูกค้า" ไว้
+    # (เฉพาะเจาะจงกว่ามาก แทบไม่มีทางหมายถึงอย่างอื่น)
+    "คลัง", "เปิดไฟล์", "เปิดใบ", "เปิดเอกสาร", "เอกสารของ", "ใบเสนอราคาของ", "รายชื่อลูกค้า",
     "โปรเจกต์", "โปรเจค", "เทมเพลต", "template",
 )
-# รูปแบบเลขที่เอกสาร เช่น "SSF-02"/"ASA-02"/"DEF-01" (ตัวอักษร 2-5 ตัว ตามด้วย "-" แล้วตัวเลข 1-5 หลัก)
+# รูปแบบเลขที่เอกสาร เช่น "SSF-02"/"ASA-02"/"DEF-01" (ตัวอักษร 2-5 ตัว ตามด้วย "-" แล้วตัวเลข 1-5 หลัก) — ดู
+# _query_matches_document_code_context ก่อนใช้จริง (รูปแบบนี้แมตช์รหัสรุ่นสินค้าด้วย เช่น CAT-6/RJ-45/IPC-2125)
 _LIBRARY_DOCUMENT_CODE_RE = re.compile(r"\b[A-Za-z]{2,5}-\d{1,5}\b")
+# คำลงท้ายสุภาพที่ถือว่า "แทบไม่มีเนื้อหาอะไรเพิ่ม" หลังตัดรหัสเอกสารออกแล้ว — ดู _query_matches_document_code_context
+_LIBRARY_DOCUMENT_CODE_TRAILING_WORDS = ("ครับ", "ค่ะ", "คะ", "นะ")
+# คำอ้างอิงเอกสารที่ต้องมีปนมาด้วยถ้าข้อความไม่ได้ "เกือบทั้งหมด" เป็นรหัสเอกสารเฉยๆ — แคบกว่า
+# _LIBRARY_ROUTE_KEYWORDS โดยตั้งใจ (ดู _query_matches_document_code_context)
+_LIBRARY_DOCUMENT_REFERENCE_WORDS = ("ใบ", "เอกสาร", "เลขที่", "ไฟล์", "เปิด")
+
+
+def _query_matches_document_code_context(query: str) -> bool:
+    """เช็คว่า "รหัสเอกสาร" ที่เจอในข้อความนี้ (ดู _LIBRARY_DOCUMENT_CODE_RE) น่าจะหมายถึงเลขที่เอกสารในคลังจริงๆ
+    ไม่ใช่รหัสรุ่น/ยี่ห้อสินค้า — เหตุการณ์จริงที่แก้: "แนะนำสาย CAT-6 ที่ดีที่สุด"/"หัว RJ-45 ยี่ห้อไหนดี"/"กล้อง
+    IPC-2125 ดีไหม" ก็ตรงรูปแบบ _LIBRARY_DOCUMENT_CODE_RE เหมือนกันหมด ทำให้ถูกตัดสินเป็น library ผิดๆ ด้วยโค้ด
+    ทั้งที่เป็นคำถามแนะนำสินค้า (ไม่ได้เรียก present_recommendations เลย)
+
+    True เมื่อ: (ก) ข้อความเกือบทั้งหมดคือรหัสนั้นเอง (ตัดรหัส+ช่องว่างรอบๆ ออกแล้วเหลือว่างเปล่า หรือเหลือแค่คำ
+    ลงท้ายสุภาพ — ดู _LIBRARY_DOCUMENT_CODE_TRAILING_WORDS) หรือ (ข) มีคำอ้างอิงเอกสารปนมาด้วย (ดู
+    _LIBRARY_DOCUMENT_REFERENCE_WORDS) ไม่เข้าเงื่อนไขไหนเลย -> คืน False ไม่ตัดสินเป็น library ด้วยโค้ด ปล่อยให้
+    Haiku classifier (มีตัวอย่างรหัสรุ่นสินค้าสอนไว้แล้ว — ดู QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT) ตัดสินแทน"""
+    match = _LIBRARY_DOCUMENT_CODE_RE.search(query)
+    if match is None:
+        return False
+    remainder = (query[:match.start()] + query[match.end():]).strip()
+    if remainder == "" or remainder in _LIBRARY_DOCUMENT_CODE_TRAILING_WORDS:
+        return True
+    return any(word in query for word in _LIBRARY_DOCUMENT_REFERENCE_WORDS)
 
 
 def _query_matches_existing_customer(query: str) -> bool:
     """เช็คว่าข้อความนี้มีชื่อ/รหัสบริษัทลูกค้าที่มีอยู่จริงในทะเบียนปนอยู่ไหม ใช้ find_customers ที่มีอยู่แล้ว
-    ตรงๆ (เทียบ customer_code/customer_name หลัง normalize — ห้ามเขียน logic ค้นหาใหม่ซ้ำ) กัน query ว่างเปล่า/
-    "*" เอง (find_customers คืนลูกค้าทั้งหมดในกรณีนั้น ไม่ใช่ "ตรงกับชื่อลูกค้า" จริงๆ) และกันคำสั้นเกินไปที่แมตช์
-    มั่วได้ง่าย (เช่น 1 ตัวอักษร)"""
+    ตรงๆ (เทียบ customer_code/customer_name หลัง normalize — ห้ามเขียน logic ค้นหาใหม่ซ้ำ) กัน query เป็น "*"
+    เอง (find_customers คืนลูกค้าทั้งหมดในกรณีนั้น ไม่ใช่ "ตรงกับชื่อลูกค้า" จริงๆ) และกันข้อความสั้นเกินไปที่แมตช์
+    มั่วได้ง่าย — เช็คความยาวขั้นต่ำ 4 ตัวอักษร "หลัง" normalize ด้วย _normalize_customer_name (ตัดบริษัท/จำกัด/
+    วรรณยุกต์ออกไปแล้ว) ไม่ใช่ความยาวดิบของข้อความ กันข้อความสั้นๆ ที่เหลือแค่คำทั่วไปหลัง normalize แมตช์มั่ว"""
     stripped = query.strip()
-    if len(stripped) < 2 or stripped == "*":
+    if stripped == "*":
+        return False
+    if len(_normalize_customer_name(stripped)) < 4:
         return False
     return bool(find_customers(stripped))
 
@@ -4011,7 +4044,7 @@ def _looks_like_library_query(query: str) -> bool:
     lowered = normalized.lower()
     if any(keyword.lower() in lowered for keyword in _LIBRARY_ROUTE_KEYWORDS):
         return True
-    if _LIBRARY_DOCUMENT_CODE_RE.search(normalized):
+    if _query_matches_document_code_context(normalized):
         return True
     return _query_matches_existing_customer(normalized)
 

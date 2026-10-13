@@ -80,6 +80,7 @@ WANTED_MAIN_FUNCS = {
     "_sanitize_recommendation_text",
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_query_matches_existing_customer", "_looks_like_library_query", "_resolve_library_route_access",
+    "_query_matches_document_code_context", "_normalize_customer_name", "_normalize_library_search_text",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
@@ -126,6 +127,8 @@ WANTED_MAIN_CONSTS = {
     "RESOLVE_RECOMMENDATION_ACTION_TOOL", "_RECOMMENDATION_INTENT_SYSTEM_PROMPT", "_RECOMMENDATION_INTENT_VERBS",
     "_CITE_TAG_RE", "_TRAILING_TEXT_ARTIFACT_RE", "_REPEATED_WHITESPACE_RE",
     "_LIBRARY_ROUTE_KEYWORDS", "_LIBRARY_DOCUMENT_CODE_RE", "_LIBRARY_LOGIN_REQUIRED_MESSAGE",
+    "_LIBRARY_DOCUMENT_CODE_TRAILING_WORDS", "_LIBRARY_DOCUMENT_REFERENCE_WORDS",
+    "_CUSTOMER_NAME_NOISE_WORDS", "_THAI_TONE_MARKS_RE",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
