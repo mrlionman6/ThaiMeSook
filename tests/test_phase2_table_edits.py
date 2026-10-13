@@ -953,6 +953,61 @@ def test_classify_legal_or_advisor_route_defaults_to_advisor_on_api_failure(ns):
     assert ns["_classify_legal_or_advisor_route"]("คำถามอะไรสักอย่างที่กำกวม") == "advisor"
 
 
+# ---------- fix/library-route: เส้นทาง "library" (คลังเอกสาร/ลูกค้า/โปรเจกต์/เทมเพลต ไม่มีไฟล์เปิดอยู่เลย) ----------
+# เหตุการณ์จริงที่แก้: "SSF-02"/"ในคลังมีเอกสารอะไรบ้าง"/"คลังใบเสนอราคา"/"ของบริษัทป่าไม้เขียวจำกัด" (ไม่มีไฟล์
+# เปิดอยู่) -> [Route] branch=advisor -> ตอบว่า "ไม่มีคลังเอกสารเชื่อมอยู่" เพราะ advisor ใช้ ADVISOR_TOOLS
+# (web_search + present_recommendations) ไม่มี LIBRARY_TOOLS เลย — เครื่องมือคลังมีเฉพาะในเส้นทาง rag_answer
+
+@pytest.mark.parametrize("query", ["SSF-02", "ในคลังมีเอกสารอะไรบ้าง", "คลังใบเสนอราคา", "เปิดใบ SSF-02"])
+def test_classify_question_route_detects_library_without_llm_call(ns, query):
+    """ทั้ง 4 ข้อความต้องถูกตัดสินเป็น library ด้วยโค้ดล้วนๆ (คำสำคัญ/รูปแบบเลขที่เอกสาร) ไม่ต้องเรียก Haiku
+    classifier เลยสักครั้ง (ประหยัด API call เหมือน _has_legal_keyword)"""
+    result = ns["_classify_question_route"](query)
+    assert result == "library"
+    assert ns["_fake_client"].last_call_kwargs is None
+
+
+def test_classify_question_route_uses_history_for_continuation_message(ns):
+    """"ของบริษัทป่าไม้เขียวจำกัด" เดี่ยวๆ ไม่มีคำเชิงคลังเอกสารปนมาเองเลยสักคำ (ไม่ตรง _looks_like_library_query
+    ด้วยโค้ด) ต้องตกไปถาม Haiku classifier พร้อมส่งประวัติสนทนา (มี "คลังใบเสนอราคา" อยู่) ไปด้วย — fake classifier
+    ในเทสต์นี้ตั้งค่าให้ตอบ "library" กลับมา (จำลองว่า Haiku ตัดสินถูกจากบริบทในประวัติ)"""
+    ns["_fake_client"].response_text = '{"category": "library"}'
+    history = [
+        {"role": "user", "content": "คลังใบเสนอราคา"},
+        {"role": "assistant", "content": "ต้องการดูของบริษัทไหนครับ"},
+    ]
+    result = ns["_classify_question_route"]("ของบริษัทป่าไม้เขียวจำกัด", history=history)
+    assert result == "library"
+    sent_content = ns["_fake_client"].last_call_kwargs["messages"][0]["content"]
+    assert "คลังใบเสนอราคา" in sent_content
+
+
+@pytest.mark.parametrize("query,expected", [
+    ("แนะนำตู้ Rack 9U ที่ดีที่สุด", "advisor"),
+    ("ธุรกิจบัญชีสามมีอะไรบ้าง", "legal"),
+])
+def test_classify_question_route_unaffected_for_non_library_questions(ns, query, expected):
+    """คำถามแนะนำสินค้าทั่วไปยังเป็น advisor และคำถามกฎหมายยังเป็น legal เหมือนเดิมทุกประการ ไม่ถูกเหมาเข่งเป็น
+    library ผิดๆ (ไม่ตั้งค่า fake client ไว้เลย — ถ้าหลุดไปเรียก Haiku classifier โดยไม่ได้ตั้งใจ จะได้ "advisor"
+    เสมอ ซึ่งพอดีตรงกับ query แรกอยู่แล้ว ต้องเช็ค legal แยกด้วยเพื่อยืนยันว่าไม่ได้บังเอิญผ่านเพราะ fallback)"""
+    assert ns["_classify_question_route"](query) == expected
+
+
+def test_resolve_library_route_access_requires_login(ns):
+    assert ns["_resolve_library_route_access"]("library", None) == ns["_LIBRARY_LOGIN_REQUIRED_MESSAGE"]
+    assert ns["_resolve_library_route_access"]("library", 1) is None
+    assert ns["_resolve_library_route_access"]("advisor", None) is None
+    assert ns["_resolve_library_route_access"]("legal", None) is None
+
+
+def test_rag_answer_skips_legal_context_for_library_route(ns):
+    """rag_answer(skip_legal_context=True) ต้องส่งต่อ skip_legal_context=True ให้ _prepare_rag_context ตรงๆ
+    (ใช้โดย ask_question() สำหรับเส้นทาง library เท่านั้น — ไม่กระทบเส้นทาง legal ที่ไม่ส่ง parameter นี้มาเลย)"""
+    ns["_fake_agentic_loop"].set_response("มีเอกสาร 3 รายการครับ", [], False)
+    ns["rag_answer"]("ในคลังมีเอกสารอะไรบ้าง", user_id=1, chat_id=1, skip_legal_context=True)
+    assert ns["_fake_rag_context"].last_call_kwargs["skip_legal_context"] is True
+
+
 def test_advisor_answer_sends_chat_history_and_has_no_legal_kb_text_in_system_prompt(ns):
     """advisor_answer ต้องส่งประวัติสนทนาเข้าไปด้วย (ให้ AI เข้าใจว่าผู้ใช้เพิ่งตอบคำถามที่เคยถูกถามกลับไปแล้ว)
     และ system prompt ต้องไม่มีคำเชิงความรู้ฐาน KB กฎหมายเฉพาะทาง (BOI/FBA/พ.ร.บ.ต่างด้าว) ปนเลยสักคำ — ต่างจาก

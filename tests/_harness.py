@@ -79,6 +79,7 @@ WANTED_MAIN_FUNCS = {
     "_normalize_recommendation_intent_text", "_query_has_recommendation_intent_verb",
     "_sanitize_recommendation_text",
     "_classify_question_route", "_classify_legal_or_advisor_route",
+    "_query_matches_existing_customer", "_looks_like_library_query", "_resolve_library_route_access",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
@@ -124,6 +125,7 @@ WANTED_MAIN_CONSTS = {
     "_PREVIEW_CACHE", "_PREVIEW_CACHE_MAX_ENTRIES",
     "RESOLVE_RECOMMENDATION_ACTION_TOOL", "_RECOMMENDATION_INTENT_SYSTEM_PROMPT", "_RECOMMENDATION_INTENT_VERBS",
     "_CITE_TAG_RE", "_TRAILING_TEXT_ARTIFACT_RE", "_REPEATED_WHITESPACE_RE",
+    "_LIBRARY_ROUTE_KEYWORDS", "_LIBRARY_DOCUMENT_CODE_RE", "_LIBRARY_LOGIN_REQUIRED_MESSAGE",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -460,8 +462,13 @@ class _FakeRagContext:
 
     def __init__(self):
         self.top_chunks: list = []
+        self.last_call_kwargs: Optional[dict] = None
 
-    def __call__(self, query, history, image_data, user_id=None, chat_id=None):
+    def __call__(self, query, history, image_data, user_id=None, chat_id=None, skip_legal_context=False):
+        self.last_call_kwargs = {
+            "query": query, "history": history, "image_data": image_data, "user_id": user_id,
+            "chat_id": chat_id, "skip_legal_context": skip_legal_context,
+        }
         return {
             "early_exit": False, "system_prompt": "ระบบทดสอบ", "messages": [{"role": "user", "content": query}],
             "top_chunks": self.top_chunks, "scores": [0.9] * len(self.top_chunks),
@@ -470,6 +477,16 @@ class _FakeRagContext:
 
 def _fake_log_if_low_confidence(query, answer, top_chunks, scores):
     pass
+
+
+def _fake_find_customers(query: str) -> list:
+    """Stub เปล่าๆ แทน find_customers จริง (ดู main.py) — การทดสอบ _looks_like_library_query/
+    _classify_question_route ในชุดนี้ไม่ครอบคลุมเงื่อนไข "ข้อความตรงกับชื่อลูกค้าที่มีอยู่จริง" เพราะ
+    find_customers พึ่ง dependency chain ของคลังเอกสาร (get_all_customers/_get_enriched_library_files/
+    get_file_categories_with_counts/get_all_library_file_meta/get_library_files) ที่ยังไม่มีใน fake DB นี้ —
+    ไม่คุ้มที่จะสร้าง fake ทั้งชุดสำหรับเงื่อนไขเดียวของ PR นี้ (ดู docstring ของ _looks_like_library_query ใน
+    main.py และรายละเอียดใน PR description)"""
+    return []
 
 
 def build_namespace() -> dict:
@@ -514,6 +531,7 @@ def build_namespace() -> dict:
         "get_library_file": fake_db.get_library_file,
         "storage_get": fake_db.storage_get,
         "get_chat_messages": fake_db.get_chat_messages,
+        "find_customers": _fake_find_customers,
     }
 
     main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
