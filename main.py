@@ -3616,7 +3616,7 @@ def _build_library_file_listing_text(limit: int = 100) -> str:
     return "\n".join(lines)
 
 
-def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None):
+def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None, skip_legal_context=False):
     """ขั้นตอนเตรียมข้อมูลทั้งหมดก่อนเรียก Claude ตัวตอบจริง — ใช้ร่วมกันทั้งโหมด
     non-streaming (rag_answer) และ streaming (rag_answer_stream) กันโค้ดซ้ำซ้อน
 
@@ -3629,6 +3629,11 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
     การเลือกล้วนๆ หรือรายการไม่สดพอ) ถ้ามี ต่อท้าย system prompt ด้วยเนื้อหารายการ + กติกาให้ใช้ select_list_item
     และเปลี่ยนหัวข้อบริบทเป็น "ข้อมูลอ้างอิงจากฐานความรู้..." แทน "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง..."
     กันสับสนกับเลขข้อในรายการ (เช่น "ข้อ 2" ในผลค้น KB ปนกับ "ข้อ 2" ในรายการไฟล์)
+
+    skip_legal_context: ใช้โดยเส้นทาง library เท่านั้น (ดู _classify_question_route/rag_answer) — ข้ามการค้น KB
+    กฎหมาย (hybrid_search/rerank_with_scores) ทั้งหมด และไม่ต่อท้าย "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง..." เข้าไปใน
+    system prompt เลย (คำถามคลังเอกสาร/ลูกค้า/โปรเจกต์ไม่เกี่ยวกับฐานความรู้กฎหมายเลย เสียเวลาค้นฟรีๆ และอาจ
+    ปนข้อมูลกฎหมายที่ไม่เกี่ยวข้องเข้าไปในคำตอบโดยไม่ตั้งใจ) ไม่กระทบเส้นทาง legal เลย (ค่าเริ่มต้น False)
 
     คืนค่า dict เสมอ:
     - ถ้าภาพไม่เกี่ยวข้อง: {"early_exit": True, "message": ...}
@@ -3649,10 +3654,13 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
     else:
         query_for_search = query
 
-    search_query = rewrite_query_for_retrieval(query_for_search, history)
-    candidates = hybrid_search(search_query, k=5)
-    top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=5)
-    context = "\n".join([f"- {c}" for c in top_chunks])
+    if skip_legal_context:
+        top_chunks, scores, context = [], [], ""
+    else:
+        search_query = rewrite_query_for_retrieval(query_for_search, history)
+        candidates = hybrid_search(search_query, k=5)
+        top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=5)
+        context = "\n".join([f"- {c}" for c in top_chunks])
 
     system_prompt = (
         "คุณเป็นผู้ช่วยธุรกิจทั่วไปสำหรับผู้ประกอบการในประเทศไทย ตอบคำถามธุรกิจได้กว้าง "
@@ -3761,13 +3769,14 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None)
             "- ถ้าผู้ใช้ปฏิเสธหรือเปลี่ยนเรื่อง ให้ตอบเรื่องใหม่ตามปกติโดยไม่ต้องพูดถึงรายการนี้อีก\n"
         )
 
-    context_header = (
-        "ข้อมูลอ้างอิงจากฐานความรู้ด้านกฎหมาย/การลงทุน (อาจไม่เกี่ยวกับคำถามนี้):\n"
-        if has_pending_listing else
-        "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n"
-    )
+    if has_pending_listing:
+        context_block = "ข้อมูลอ้างอิงจากฐานความรู้ด้านกฎหมาย/การลงทุน (อาจไม่เกี่ยวกับคำถามนี้):\n" + context + "\n\n"
+    elif skip_legal_context:
+        context_block = ""  # เส้นทาง library ไม่ค้น KB กฎหมายเลย (context ว่างเปล่าอยู่แล้ว) ไม่ต้องมีหัวข้อนี้เลย
+    else:
+        context_block = "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n" + context + "\n\n"
     current_turn_text = (
-        context_header + context + "\n\n"
+        context_block +
         "คำถาม: " + (query if query else "(ผู้ใช้แนบภาพมาโดยไม่ได้พิมพ์คำถามเพิ่ม กรุณาดูภาพแล้วช่วยอธิบาย/ให้ความรู้ที่เกี่ยวข้อง)")
     )
 
@@ -3839,7 +3848,10 @@ def _normalize_polite_particles(text: str) -> str:
     return text
 
 
-def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None, structural_route=False):
+def rag_answer(
+    query, history=None, image_data=None, user_id=None, chat_id=None, structural_route=False,
+    skip_legal_context=False,
+):
     """เวอร์ชันไม่ stream — รอคำตอบเต็มก่อนคืนค่าทีเดียว มี LanguageGuard retry + agentic tool use
     (calculate_tax, web_search, และ find_customers/list_customer_documents/list_project_documents/
     list_templates/open_library_file ถ้ามี user_id) ผ่าน run_agentic_tool_loop() — user_id/chat_id เป็น
@@ -3849,9 +3861,14 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
     แก้โครงสร้างไฟล์ (เปลี่ยนอัตรา/ลบ-เพิ่ม-แก้รายการในตาราง) — ใช้เป็นเงื่อนไข guard ด้านล่าง (ดู
     _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE): ถ้าเส้นทางนี้แต่ไม่มี structural tool ถูกเรียกเลยในเทิร์นนี้ (Claude
     เขียนคำตอบเองแทนที่จะเรียก tool) ให้แทนคำตอบด้วยข้อความคงที่ แทนที่จะปล่อยให้ Claude "แต่ง" preview/ผล
-    การแก้ขึ้นเองซึ่งไม่จริง"""
+    การแก้ขึ้นเองซึ่งไม่จริง
+
+    skip_legal_context: ส่งต่อให้ _prepare_rag_context ตรงๆ — ใช้โดยเส้นทาง library เท่านั้น (ดู
+    _classify_question_route) ไม่กระทบเส้นทาง legal/structural เลย (ค่าเริ่มต้น False)"""
     history = history or []
-    ctx = _prepare_rag_context(query, history, image_data, user_id=user_id, chat_id=chat_id)
+    ctx = _prepare_rag_context(
+        query, history, image_data, user_id=user_id, chat_id=chat_id, skip_legal_context=skip_legal_context,
+    )
 
     if ctx["early_exit"]:
         return ctx["message"], []
@@ -3920,43 +3937,147 @@ def rag_answer(query, history=None, image_data=None, user_id=None, chat_id=None,
 
 QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT = (
     "คุณกำลังช่วยตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในแชทผู้ช่วยธุรกิจ/กฎหมายไทย ควรตอบทางไหน ตอบกลับมาเป็น JSON "
-    'object เดียวเท่านั้น รูปแบบ: {"category": "legal" หรือ "advisor"} ห้ามมีข้อความอื่นนอกเหนือจาก JSON\n\n'
+    'object เดียวเท่านั้น รูปแบบ: {"category": "legal" หรือ "advisor" หรือ "library"} ห้ามมีข้อความอื่นนอกเหนือจาก '
+    "JSON\n\n"
     "- legal: คำถามเชิงความรู้กฎหมาย/ภาษี/การลงทุน/การจดทะเบียนธุรกิจในประเทศไทย (เช่น พ.ร.บ.ต่างด้าว, BOI, "
     "ภาษีนิติบุคคล, work permit, การถือครองที่ดิน)\n"
-    "- advisor: คำถามอื่นๆ ทั้งหมดที่ไม่ใช่กฎหมาย/ภาษี/การลงทุนโดยตรง (เช่น แนะนำ/เปรียบเทียบสินค้า อุปกรณ์ รุ่น "
-    "ราคา หรือคำถามธุรกิจทั่วไปอื่นๆ) ถ้าไม่แน่ใจระหว่าง legal กับ advisor ให้เลือก advisor"
+    "- library: คำถามเกี่ยวกับการค้นหา/เปิด/ดูรายการเอกสาร ใบเสนอราคา รายชื่อลูกค้า โปรเจกต์ หรือเทมเพลตในคลัง"
+    "เอกสารของผู้ใช้ (เช่น เลขที่เอกสารในคลัง, ชื่อบริษัทลูกค้า, \"ในคลังมีเอกสารอะไรบ้าง\") รวมถึงข้อความสั้นๆ "
+    "ที่ต่อเนื่องจากคำถามแบบนี้ในประวัติสนทนาด้วย (เช่น ผู้ใช้เพิ่งถามถึงคลังเอกสารแล้วพิมพ์ชื่อบริษัทตามมาเฉยๆ "
+    "ในเทิร์นถัดไป) ไม่ใช่รหัสรุ่น/ยี่ห้อสินค้า\n"
+    "- advisor: คำถามอื่นๆ ทั้งหมดที่ไม่ใช่กฎหมาย/ภาษี/การลงทุน/คลังเอกสารโดยตรง (เช่น แนะนำ/เปรียบเทียบสินค้า "
+    "อุปกรณ์ รุ่น ราคา หรือคำถามธุรกิจทั่วไปอื่นๆ — รวมถึงคำถามแนะนำ/เปรียบเทียบสินค้าที่มีรหัสรุ่นสินค้าปนมาด้วย "
+    "เช่น \"สาย CAT-6\"/\"หัว RJ-45\"/\"กล้อง IPC-2125\" ก็ยังเป็น advisor ไม่ใช่ library เพราะไม่ใช่เลขที่เอกสาร"
+    "ในคลัง) ถ้าไม่แน่ใจระหว่าง legal/library กับ advisor ให้เลือก advisor"
 )
 
 
-def _classify_legal_or_advisor_route(query: str) -> str:
+def _classify_legal_or_advisor_route(query: str, history: Optional[list] = None) -> str:
     """ตัวแยกประเภทชั้นสุดท้ายด้วย Haiku — ใช้เฉพาะตอนโค้ดตัดสินใจเองไม่ได้ชัดเจน (ดู _classify_question_route —
-    เรียกเฉพาะตอน _has_legal_keyword(query) เป็น False เท่านั้น) คืน "legal" หรือ "advisor" เสมอ ไม่ raise เลย
-    (เรียก API ล้มเหลว/parse ไม่ได้ -> fallback เป็น "advisor" ปลอดภัยกว่า เพราะเป็นเส้นทางที่ไม่มีข้อผูกมัดต้อง
-    ตอบตาม KB กฎหมายเป็นพิเศษ — ตอบผิดเส้นทางแค่ขาดบริบทฐานความรู้ไป ไม่ถึงกับเสี่ยงให้ข้อมูลกฎหมายผิด)"""
+    เรียกเฉพาะตอน _has_legal_keyword(query) และ _looks_like_library_query(query) เป็น False ทั้งคู่เท่านั้น) คืน
+    "legal"/"advisor"/"library" เสมอ ไม่ raise เลย (เรียก API ล้มเหลว/parse ไม่ได้ -> fallback เป็น "advisor"
+    ปลอดภัยกว่า เพราะเป็นเส้นทางที่ไม่มีข้อผูกมัดต้องตอบตาม KB กฎหมายเป็นพิเศษ — ตอบผิดเส้นทางแค่ขาดบริบทฐาน
+    ความรู้ไป ไม่ถึงกับเสี่ยงให้ข้อมูลกฎหมายผิด)
+
+    history (ถ้ามี): ส่งประวัติแชทล่าสุด 4 ข้อความ (ตัดข้อความละไม่เกิน 300 ตัวอักษร) ไปด้วยเสมอ — เหตุการณ์จริง
+    ที่แก้: ผู้ใช้พิมพ์ "คลังใบเสนอราคา" แล้วต่อด้วย "ของบริษัทป่าไม้เขียวจำกัด" เฉยๆ ในเทิร์นถัดไป (ไม่มีคำเชิง
+    คลังเอกสารปนมาเองเลยสักคำ) ไม่มีบริบทประกอบก็ดูเหมือนคำถามทั่วไป (advisor) แต่จริงๆ เป็นคำถามต่อเนื่องเรื่อง
+    คลังเอกสาร"""
+    history_lines = [f"{m['role']}: {(m.get('content') or '')[:300]}" for m in (history or [])[-4:]]
+    history_text = ("ประวัติสนทนาล่าสุด:\n" + "\n".join(history_lines) + "\n\n") if history_lines else ""
     try:
         response = client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=50,
             system=QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"ข้อความล่าสุดของผู้ใช้: {query}"}],
+            messages=[{"role": "user", "content": f"{history_text}ข้อความล่าสุดของผู้ใช้: {query}"}],
         )
         parsed = _parse_json_response(response.content[0].text, dict)
         category = (parsed or {}).get("category")
     except Exception as e:
         print(f"[QuestionDomainClassifier] classify_failed exception_type={type(e).__name__}")
         category = None
-    return category if category in ("legal", "advisor") else "advisor"
+    return category if category in ("legal", "advisor", "library") else "advisor"
 
 
-def _classify_question_route(query: str) -> str:
+# คำที่บ่งบอกว่าข้อความนี้น่าจะเกี่ยวกับคลังเอกสาร/ลูกค้า/โปรเจกต์/เทมเพลต — ดู _looks_like_library_query
+_LIBRARY_ROUTE_KEYWORDS = (
+    # "ลูกค้า" เดี่ยวๆ ถูกตัดออกโดยตั้งใจ (เหตุการณ์จริงที่แก้: กว้างเกินไป จับคำถามอื่นที่พูดถึงลูกค้าเฉยๆ ผิด
+    # เป็น library — ปล่อยให้ Haiku classifier ตัดสินแทนถ้าไม่มีคำอื่นในชุดนี้ปนมาด้วย) คง "รายชื่อลูกค้า" ไว้
+    # (เฉพาะเจาะจงกว่ามาก แทบไม่มีทางหมายถึงอย่างอื่น)
+    "คลัง", "เปิดไฟล์", "เปิดใบ", "เปิดเอกสาร", "เอกสารของ", "ใบเสนอราคาของ", "รายชื่อลูกค้า",
+    "โปรเจกต์", "โปรเจค", "เทมเพลต", "template",
+)
+# รูปแบบเลขที่เอกสาร เช่น "SSF-02"/"ASA-02"/"DEF-01" (ตัวอักษร 2-5 ตัว ตามด้วย "-" แล้วตัวเลข 1-5 หลัก) — ดู
+# _query_matches_document_code_context ก่อนใช้จริง (รูปแบบนี้แมตช์รหัสรุ่นสินค้าด้วย เช่น CAT-6/RJ-45/IPC-2125)
+_LIBRARY_DOCUMENT_CODE_RE = re.compile(r"\b[A-Za-z]{2,5}-\d{1,5}\b")
+# คำลงท้ายสุภาพที่ถือว่า "แทบไม่มีเนื้อหาอะไรเพิ่ม" หลังตัดรหัสเอกสารออกแล้ว — ดู _query_matches_document_code_context
+_LIBRARY_DOCUMENT_CODE_TRAILING_WORDS = ("ครับ", "ค่ะ", "คะ", "นะ")
+# คำอ้างอิงเอกสารที่ต้องมีปนมาด้วยถ้าข้อความไม่ได้ "เกือบทั้งหมด" เป็นรหัสเอกสารเฉยๆ — แคบกว่า
+# _LIBRARY_ROUTE_KEYWORDS โดยตั้งใจ (ดู _query_matches_document_code_context)
+_LIBRARY_DOCUMENT_REFERENCE_WORDS = ("ใบ", "เอกสาร", "เลขที่", "ไฟล์", "เปิด")
+
+
+def _query_matches_document_code_context(query: str) -> bool:
+    """เช็คว่า "รหัสเอกสาร" ที่เจอในข้อความนี้ (ดู _LIBRARY_DOCUMENT_CODE_RE) น่าจะหมายถึงเลขที่เอกสารในคลังจริงๆ
+    ไม่ใช่รหัสรุ่น/ยี่ห้อสินค้า — เหตุการณ์จริงที่แก้: "แนะนำสาย CAT-6 ที่ดีที่สุด"/"หัว RJ-45 ยี่ห้อไหนดี"/"กล้อง
+    IPC-2125 ดีไหม" ก็ตรงรูปแบบ _LIBRARY_DOCUMENT_CODE_RE เหมือนกันหมด ทำให้ถูกตัดสินเป็น library ผิดๆ ด้วยโค้ด
+    ทั้งที่เป็นคำถามแนะนำสินค้า (ไม่ได้เรียก present_recommendations เลย)
+
+    True เมื่อ: (ก) ข้อความเกือบทั้งหมดคือรหัสนั้นเอง (ตัดรหัส+ช่องว่างรอบๆ ออกแล้วเหลือว่างเปล่า หรือเหลือแค่คำ
+    ลงท้ายสุภาพ — ดู _LIBRARY_DOCUMENT_CODE_TRAILING_WORDS) หรือ (ข) มีคำอ้างอิงเอกสารปนมาด้วย (ดู
+    _LIBRARY_DOCUMENT_REFERENCE_WORDS) ไม่เข้าเงื่อนไขไหนเลย -> คืน False ไม่ตัดสินเป็น library ด้วยโค้ด ปล่อยให้
+    Haiku classifier (มีตัวอย่างรหัสรุ่นสินค้าสอนไว้แล้ว — ดู QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT) ตัดสินแทน"""
+    match = _LIBRARY_DOCUMENT_CODE_RE.search(query)
+    if match is None:
+        return False
+    remainder = (query[:match.start()] + query[match.end():]).strip()
+    if remainder == "" or remainder in _LIBRARY_DOCUMENT_CODE_TRAILING_WORDS:
+        return True
+    return any(word in query for word in _LIBRARY_DOCUMENT_REFERENCE_WORDS)
+
+
+def _query_matches_existing_customer(query: str) -> bool:
+    """เช็คว่าข้อความนี้มีชื่อ/รหัสบริษัทลูกค้าที่มีอยู่จริงในทะเบียนปนอยู่ไหม ใช้ find_customers ที่มีอยู่แล้ว
+    ตรงๆ (เทียบ customer_code/customer_name หลัง normalize — ห้ามเขียน logic ค้นหาใหม่ซ้ำ) กัน query เป็น "*"
+    เอง (find_customers คืนลูกค้าทั้งหมดในกรณีนั้น ไม่ใช่ "ตรงกับชื่อลูกค้า" จริงๆ) และกันข้อความสั้นเกินไปที่แมตช์
+    มั่วได้ง่าย — เช็คความยาวขั้นต่ำ 4 ตัวอักษร "หลัง" normalize ด้วย _normalize_customer_name (ตัดบริษัท/จำกัด/
+    วรรณยุกต์ออกไปแล้ว) ไม่ใช่ความยาวดิบของข้อความ กันข้อความสั้นๆ ที่เหลือแค่คำทั่วไปหลัง normalize แมตช์มั่ว"""
+    stripped = query.strip()
+    if stripped == "*":
+        return False
+    if len(_normalize_customer_name(stripped)) < 4:
+        return False
+    return bool(find_customers(stripped))
+
+
+def _looks_like_library_query(query: str) -> bool:
+    """เช็คด้วยโค้ดล้วนๆ (ไม่เสีย API call) ว่าข้อความนี้ "น่าจะ" เป็นคำถามเกี่ยวกับคลังเอกสาร/ลูกค้า/โปรเจกต์/
+    เทมเพลตไหม — ใช้ก่อนเรียก Haiku classifier เสมอ (ดู _classify_question_route) normalize "เเ"→"แ" ก่อนเช็คทุก
+    เงื่อนไข (เหตุการณ์จริงเดียวกับที่แก้ใน _is_document_reading_question — ผู้ใช้พิมพ์สระเอซ้ำบ่อย)
+
+    เหตุการณ์จริงที่แก้: "SSF-02"/"ในคลังมีเอกสารอะไรบ้าง"/"คลังใบเสนอราคา" (ไม่มีไฟล์เปิดอยู่ในแชทเลย) หลุดไปทาง
+    advisor (ไม่มี LIBRARY_TOOLS ให้ใช้เลย — ดู ADVISOR_TOOLS) ตอบว่า "ไม่มีคลังเอกสารเชื่อมอยู่" ทั้งที่มีคลังจริงๆ
+    เครื่องมือคลังมีเฉพาะในเส้นทาง rag_answer -> run_agentic_tool_loop (ประกอบ LIBRARY_TOOLS อัตโนมัติเมื่อมี
+    user_id+chat_id อยู่แล้ว — ดู tools_for_this_call) จึงไม่ต้องส่ง tools_override อะไรเพิ่มเลยสำหรับเส้นทางนี้"""
+    normalized = query.replace("เเ", "แ")
+    lowered = normalized.lower()
+    if any(keyword.lower() in lowered for keyword in _LIBRARY_ROUTE_KEYWORDS):
+        return True
+    if _query_matches_document_code_context(normalized):
+        return True
+    return _query_matches_existing_customer(normalized)
+
+
+_LIBRARY_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระบบก่อนถึงจะใช้คลังเอกสารได้ครับ"
+
+
+def _resolve_library_route_access(question_route: str, user_id: Optional[int]) -> Optional[str]:
+    """คืนข้อความคงที่จากโค้ดถ้าเส้นทาง library ถูกเลือกแต่ไม่ได้ล็อกอิน (guest ใช้คลังเอกสารไม่ได้เลย —
+    LIBRARY_TOOLS ต้องมีทั้ง user_id และ chat_id เสมอถึงจะถูกประกอบเข้า tools list — ดู tools_for_this_call ใน
+    run_agentic_tool_loop) คืน None ถ้าใช้ได้ตามปกติ (ไม่ใช่ library route เลย หรือเป็น library route แต่ล็อกอิน
+    อยู่แล้ว — ask_question() ไปเรียก rag_answer ต่อตามปกติ) แยกออกมาเป็นฟังก์ชันเดี่ยวเพื่อให้ทดสอบได้โดยไม่ต้อง
+    พึ่ง FastAPI/Request จริง (เหมือน _resolve_direct_structural_dispatch/_resolve_recommendation_command_
+    dispatch)"""
+    if question_route == "library" and not user_id:
+        return _LIBRARY_LOGIN_REQUIRED_MESSAGE
+    return None
+
+
+def _classify_question_route(query: str, history: Optional[list] = None) -> str:
     """ตัดสินใจว่าคำถามนี้ (ผ่านด่านกรองคำถามเกี่ยวกับไฟล์/คำสั่งแก้โครงสร้างใน ask_question() มาแล้วทั้งหมด —
     ไม่ใช่ reading_question/structural_route เด็ดขาด) ควรไปทาง "legal" (RAG ฐานความรู้กฎหมายเดิม ผ่าน
-    rag_answer) หรือ "advisor" (ไม่มี context ฐานความรู้กฎหมายปนเลย ผ่าน advisor_answer) คืน "legal" ทันทีถ้ามีคำ
-    เชิงความรู้กฎหมายปนมา (ดู _has_legal_keyword — เร็ว ไม่เสีย API call) ไม่งั้นถาม Haiku เป็นตัวแยกประเภทชั้น
-    สุดท้าย (ดู _classify_legal_or_advisor_route)"""
+    rag_answer), "library" (คลังเอกสาร/ลูกค้า/โปรเจกต์/เทมเพลต ผ่าน rag_answer เหมือนกัน แต่ข้าม RAG context
+    ฐานความรู้กฎหมาย — ดู skip_legal_context ของ rag_answer/_prepare_rag_context), หรือ "advisor" (ไม่มี context
+    ฐานความรู้กฎหมายปนเลย ผ่าน advisor_answer) คืน "legal" ทันทีถ้ามีคำเชิงความรู้กฎหมายปนมา (ดู _has_legal_keyword
+    — เร็ว ไม่เสีย API call) "library" ทันทีถ้าดูเหมือนคำถามคลังเอกสาร (ดู _looks_like_library_query — เร็วเช่น
+    กัน) ไม่งั้นถาม Haiku เป็นตัวแยกประเภทชั้นสุดท้าย (ดู _classify_legal_or_advisor_route — ส่ง history ต่อไปด้วย
+    ให้ตัดสินข้อความต่อเนื่องสั้นๆ ได้แม่นขึ้น)"""
     if _has_legal_keyword(query):
         return "legal"
-    return _classify_legal_or_advisor_route(query)
+    if _looks_like_library_query(query):
+        return "library"
+    return _classify_legal_or_advisor_route(query, history=history)
 
 
 _ADVISOR_REPLACEMENT_OFFER_LINE = "สั่งต่อได้ เช่น 'แทนรายการที่ 5 ด้วยรุ่นที่ 1' หรือ 'เพิ่มรุ่นที่ 2 จำนวน 2'"
@@ -4035,7 +4156,10 @@ def _advisor_system_prompt(document_context: str = "") -> str:
         "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ (เช่น ผู้ใช้เพิ่งตอบคำถามที่คุณถามไปก่อนหน้า) "
         "ให้ใช้บริบทนั้นประกอบการตอบด้วยเสมอ ห้ามถามคำถามเดิมซ้ำอีก\n"
         "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใช้ \"ค่ะ\" เด็ดขาด\n"
-        "- ห้ามใส่ข้อความ disclaimer ทางกฎหมายท้ายคำตอบ (ไม่เกี่ยวกับคำถามประเภทนี้)"
+        "- ห้ามใส่ข้อความ disclaimer ทางกฎหมายท้ายคำตอบ (ไม่เกี่ยวกับคำถามประเภทนี้)\n"
+        "- ห้ามบอกผู้ใช้ว่าระบบไม่มีคลังเอกสาร/ไฟล์เชื่อมอยู่เด็ดขาดไม่ว่ากรณีใด ถ้าผู้ใช้ถามถึงไฟล์/เอกสาร/คลัง"
+        "ที่ไม่ได้เปิดอยู่ในแชทนี้ ให้แนะนำให้พิมพ์คำสั่งตรงๆ แทน เช่น \"เปิดใบเสนอราคาของ <ชื่อลูกค้า>\" หรือ "
+        "\"ในคลังมีเอกสารอะไรบ้าง\""
     )
     if document_context:
         prompt += (
@@ -4918,17 +5042,24 @@ async def ask_question(
     if structural_route or image_data or not query.strip():
         question_route = "legal"
     else:
-        question_route = _classify_question_route(query)
+        question_route = _classify_question_route(query, history=history)
 
     if question_route == "advisor":
         print(f"[Route] chat={chat_id} branch=advisor")
         answer, sources = advisor_answer(
             query, history=history, user_id=user_id, chat_id=chat_id, active_docs=active_docs,
         )
+    elif (library_guest_message := _resolve_library_route_access(question_route, user_id)) is not None:
+        # ไม่ได้ล็อกอิน (guest) -> คลังเอกสารใช้ไม่ได้เลย ตอบข้อความคงที่จากโค้ดตรงๆ กันสับสนเหมือนเดิมที่เส้นทาง
+        # advisor ตอบว่า "ไม่มีคลังเอกสารเชื่อมอยู่" ทั้งที่มีคลังจริงๆ แค่ต้องล็อกอินก่อนเท่านั้น
+        print(f"[Route] chat={chat_id} branch=library_guest")
+        answer, sources = library_guest_message, []
     else:
+        if question_route == "library":
+            print(f"[Route] chat={chat_id} branch=library")
         answer, sources = rag_answer(
             query, history=history, image_data=image_data, user_id=user_id, chat_id=chat_id,
-            structural_route=structural_route,
+            structural_route=structural_route, skip_legal_context=(question_route == "library"),
         )
     if image_data:
         # ข้อความเตือนตายตัว เขียนในโค้ดเสมอ ไม่ใช่ให้ Claude เขียนเอง — Vision อ่านภาพคลาดเคลื่อนได้มากกว่าอ่านไฟล์จริง
