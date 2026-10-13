@@ -1796,6 +1796,50 @@ def test_answer_document_reading_question_sends_chat_history(ns, doc1):
     assert "ตารางรายการ" in sent_messages[-1]["content"]
 
 
+def test_is_document_reading_question_treats_replace_command_as_edit_not_reading(ns):
+    """เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" (สระเอซ้ำ) มีคำว่า "รายการ" (_DOCUMENT_REFERENCE_KEYWORDS) แต่เดิม
+    _DOCUMENT_EDIT_COMMAND_WORDS ไม่มี "แทน" และไม่ normalize "เเ"→"แ" ก่อนเช็ค ทำให้ถูกตีความเป็นคำถามเชิงอ่านไฟล์
+    ผิดๆ ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ (ทำให้ไปไม่ถึง _resolve_recommendation_command_dispatch เลยสักครั้ง)"""
+    assert ns["_is_document_reading_question"]("เเทน ลงในรายการเลย") is False
+    assert ns["_is_document_reading_question"]("แทนลงในรายการเลย") is False
+    # ยังต้องไม่กระทบคำถามเชิงอ่านไฟล์จริงๆ เลย
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+    assert ns["_is_document_reading_question"]("ยอดรวมทั้งสิ้นเท่าไร") is True
+
+
+def test_recommendation_dispatch_checked_before_document_reading_in_routing_order(ns, box_doc):
+    """จำลองลำดับการตัดสินใจจริงใน ask_question() (ย้าย _resolve_recommendation_command_dispatch ไปเช็คก่อนบล็อก
+    reading_question/document_content_question แล้ว) ด้วยการเรียกฟังก์ชันตัดสินใจทั้งสองตัวตรงๆ ตามลำดับเดียวกัน
+    โดยไม่ต้องพึ่ง FastAPI/Request จริงเลย (เหมือนการทดสอบ _resolve_direct_structural_dispatch): "เเทน ลงในรายการ
+    เลย" ต้องถูก recommendation dispatch จัดการจบก่อนเลย (ask_question() จะ return ทันทีที่จุดนี้ ไม่มีทางไปถึง
+    _is_document_reading_question อีกต่อไป) ส่วน "มีรายการอะไรบ้าง" ต้องตกไปที่ document_reading เหมือนเดิมทุก
+    ประการ (dispatch คืน None เพราะไม่มีคำกริยาที่เกี่ยวข้องเลย)"""
+    ns["set_chat_last_recommendations"](1, [{
+        "name": "Seagate SkyHawk AI 16TB", "key_specs": "7200RPM", "price_thb": 19500, "price_note": None,
+        "unit": "ตัว", "source_url": "https://shop.example/skyhawk", "compatible": True,
+        "compatibility_note": None,
+    }])
+    ns["_fake_db"].chat_messages[1] = [{"role": "user", "content": "อยากได้ 16tb 2 ตัว"}]
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "replace", "target_item_index": 6, "recommendation_index": 1, "quantity": 2,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    # ----- ลำดับที่ 1 ใน ask_question(): recommendation dispatch เช็คก่อนเสมอตอนนี้ -----
+    replace_dispatch = ns["_resolve_recommendation_command_dispatch"]("เเทน ลงในรายการเลย", [box_doc], 1, 1)
+    assert replace_dispatch is not None  # จัดการจบแล้ว — ask_question() return ตรงนี้เลย ไม่เช็ค reading_question ต่อ
+
+    # ----- คำถามอ่านข้อมูลธรรมดา ต้องยังตกไป document_reading เหมือนเดิม (dispatch คืน None ก่อนเสมอ) -----
+    reading_dispatch = ns["_resolve_recommendation_command_dispatch"]("มีรายการอะไรบ้าง", [box_doc], 1, 1)
+    assert reading_dispatch is None
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+
+
 # ---------- feat/advisor-route: ส่งตารางรายการเป็น context + เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขาย ----------
 # ต้องเป็นกติกาทั่วไปที่ใช้ได้กับสินค้า "ทุกประเภท" ไม่ hardcode ตามสินค้าใดสินค้าหนึ่ง — ทดสอบด้วย 3 ประเภทสินค้า
 # ที่ต่างกันมาก (กล้องวงจรปิด/ฮาร์ดดิสก์/สายสัญญาณ) ยืนยันว่า system prompt มีตารางรายการจริง + คำสั่งเรื่องเกณฑ์

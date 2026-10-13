@@ -1978,7 +1978,7 @@ _DOCUMENT_REFERENCE_KEYWORDS = (
 )
 
 
-_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน")
+_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน", "แทน")
 
 
 def _is_document_reading_question(query: str) -> bool:
@@ -1992,11 +1992,14 @@ def _is_document_reading_question(query: str) -> bool:
     เพิ่มที่ _query_mentions_table_item_or_label สำหรับเงื่อนไขเสริมกรณีเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์
     ตรงๆ โดยไม่มีคำเหล่านี้ปนมาเลย (เช็คแยกต่างหากเพราะต้องมี target_doc ประกอบ ฟังก์ชันนี้รับแค่ query เดียว)
 
-    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปน
-    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้
-    ไม่ใช่คำถามอ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ)
-    หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
-    stripped = query.strip()
+    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS — รวม "แทน" ด้วย ดู _resolve_recommendation_intent_with_llm) ->
+    ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปนมาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X
+    ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถามอ่านอย่างเดียว — อีกเหตุการณ์จริง: "เเทน
+    ลงในรายการเลย" (สระเอซ้ำ) มีคำว่า "รายการ" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ normalize "เเ"→"แ" ก่อน ทำให้ "แทน" ไม่
+    ตรงเลยสักคำ) normalize "เเ"→"แ" ก่อนเช็คทุกเงื่อนไขในฟังก์ชันนี้เสมอ "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ
+    (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น
+    "ดูดี" ในชื่อบริษัท)"""
+    stripped = query.strip().replace("เเ", "แ")
     if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
         return False
     lowered = stripped.lower()
@@ -4642,6 +4645,22 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
+        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
+        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้แต่ตีความ
+        # จากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อกคำถามเชิงอ่าน
+        # ด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง _is_document_reading_
+        # question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคยมาถึงจุดนี้เลยสักครั้ง)
+        # dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ "none") จึงปล่อยให้ตกไปเช็ค
+        # reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
+        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
+        if recommendation_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+            answer = recommendation_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
         # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่ — ส่ง
         # ตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง ห้ามให้
@@ -4675,19 +4694,6 @@ async def ask_question(
 
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
-
-        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
-        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K") ลอง parse ด้วยโค้ดก่อนเช็คคำสั่งแก้โครงสร้าง
-        # ทั่วไปเสมอ (ไม่ชนกันอยู่แล้ว — คำขึ้นต้น "แทน"/"เพิ่มรุ่นที่" ไม่ตรงรูปแบบ "เปลี่ยน/แก้ X เป็น Y" เลย แต่
-        # จัดลำดับให้ชัดเจนไว้ก่อน)
-        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
-        if recommendation_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
-            answer = recommendation_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
 
         # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
         # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
