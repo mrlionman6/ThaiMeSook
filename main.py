@@ -389,6 +389,8 @@ MAX_ANSWER_RETRIES = 2  # ลองใหม่ได้สูงสุดกี
 # ---------- Agentic Tools: Tax Calculator + Web Search (จำกัดเว็บราชการ) ----------
 MAX_TOOL_ITERATIONS = 8  # เดิม 5 — คำสั่งหลายขั้นแบบ "เปิดไฟล์จากคลังแล้วเปรียบเทียบ" ใช้จริง 4-5 รอบแล้ว
 # กันเผลอวน loop เรียก tool ไม่รู้จบ (งานทั่วไปปกติ 1-2 รอบก็พอ)
+ADVISOR_MAX_TOOL_ITERATIONS = 12  # เส้นทาง advisor เท่านั้น (ดู advisor_answer) — ค้นเว็บหลายรอบ+เปรียบเทียบสินค้า
+# ใช้รอบมากกว่าเส้นทางอื่นจริง (pause_turn ไม่กินโควตานี้อยู่แล้ว ดู run_agentic_tool_loop)
 
 # คำนวณภาษีขั้นบันไดด้วยโค้ด Python ล้วนๆ ไม่พึ่ง LLM คำนวณเองเด็ดขาด — กัน hallucination เรื่องตัวเลข
 PERSONAL_INCOME_TAX_BRACKETS = [
@@ -2797,6 +2799,12 @@ def _build_final_answer_with_citations(content_blocks: list) -> str:
 
     text_parts = [block.text for block in relevant_blocks if block.type == "text"]
     final_text = "".join(text_parts).strip()
+    if not final_text and last_search_index is not None:
+        # ตัดเหลือเฉพาะข้อความหลัง search block สุดท้ายแล้วว่างเปล่า (เช่น Claude จบด้วย web_search_tool_result
+        # เป็น block สุดท้ายพอดี ไม่มี text block ต่อท้ายเลย) — ใช้ข้อความทั้งหมดแทนดีกว่าปล่อยว่างเปล่า
+        relevant_blocks = content_blocks
+        text_parts = [block.text for block in relevant_blocks if block.type == "text"]
+        final_text = "".join(text_parts).strip()
 
     seen_urls = set()
     citations: list[tuple[str, str]] = []
@@ -2821,9 +2829,12 @@ def _build_final_answer_with_citations(content_blocks: list) -> str:
     return final_text + "\n\nแหล่งที่มา:\n" + "\n".join(source_lines)
 
 
+MAX_PAUSE_TURNS = 5  # จำนวนรอบ pause_turn ติดกันสูงสุดก่อนเลิกรอ (ดู run_agentic_tool_loop) ไม่กินโควตา max_iterations
+
+
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
-    tools_override: Optional[list] = None, model: Optional[str] = None,
+    tools_override: Optional[list] = None, model: Optional[str] = None, max_iterations: Optional[int] = None,
 ) -> tuple[str, list[str], bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL — ต้องการเหตุผล/
@@ -2832,6 +2843,9 @@ def run_agentic_tool_loop(
       ทั้งหมด (ใช้โดย advisor_answer — ดู ADVISOR_TOOLS — ให้เครื่องมือเฉพาะ web_search ทั่วไปเท่านั้น ไม่มี
       เครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้) dispatcher ของแต่ละ tool ด้านล่างยังคงเช็คชื่อ tool ตามปกติ
       เหมือนเดิมทุกจุด — ไม่เคยถูกเรียกจริงถ้า tools_override ไม่มี tool นั้นอยู่ด้วย (Claude ไม่เห็น schema เลย)
+    - max_iterations: ถ้าระบุมา ใช้แทน MAX_TOOL_ITERATIONS ทั่วไป (ใช้โดย advisor_answer — ดู ADVISOR_MAX_TOOL_
+      ITERATIONS — คำถามแนะนำสินค้ามักต้องค้นเว็บหลายรอบกว่าจะสรุปได้) รอบที่ stop_reason == "pause_turn" ไม่กิน
+      โควตานี้เลย (ดู pause_count ด้านล่าง — จำกัดแยกต่างหากที่ MAX_PAUSE_TURNS)
     - web_search: Anthropic execute ให้อัตโนมัติที่ฝั่ง server (ไม่ต้องทำอะไรฝั่งเรา)
     - calculate_tax/estimate_investment_cost: custom tool ต้อง execute เอง แล้วส่งผลกลับเข้า conversation
     - find_customers/list_customer_documents/list_project_documents/list_templates/open_library_file/
@@ -2840,7 +2854,16 @@ def run_agentic_tool_loop(
       chat_id (อยู่ในแชทจริง) เท่านั้น — ไม่ใช่แค่ปฏิเสธตอน dispatch แต่ไม่ส่ง tool พวกนี้เข้าไปใน request
       เลยถ้าไม่ล็อกอิน/ไม่มีแชท caller (rag_answer) ต้องส่ง chat_id ที่เป็นแชทจริงมาเสมอเมื่อ user_id
       ไม่ใช่ None (ดูการแก้ไขใน ask_question())
-    วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ MAX_TOOL_ITERATIONS (กันวนไม่รู้จบ)
+    วนจนกว่า Claude จะตอบจบจริง (stop_reason != "tool_use") หรือครบ max_iterations (กันวนไม่รู้จบ) พิมพ์
+    "[AgentLoop] iter=<n> stop_reason=<...> tools=<ชื่อ tool ที่เรียกรอบนี้> text_len=<n>" ทุกรอบ (ไม่พิมพ์เนื้อหา
+    ข้อความเลย กันข้อมูลผู้ใช้หลุดเข้า log — ใช้ debug เหตุการณ์จริงที่เจอ: advisor จบด้วย "งานนี้มีหลายขั้นเกินไป"
+    เป็นระยะโดยไม่มีร่องรอยว่า present_recommendations ถูกเรียกไหม)
+
+    ถ้าวนจนครบ max_iterations (หรือ pause_turn ติดกันเกิน MAX_PAUSE_TURNS) โดยยังไม่เคยเรียก
+    present_recommendations เลยสักครั้ง (เช็คจาก tools_for_this_call ว่ามี tool นี้อยู่ด้วยไหม — มีเฉพาะเส้นทาง
+    advisor) และคำตอบสุดท้ายที่มีอยู่ตอนนี้ว่างเปล่า/ชน iteration limit: บังคับเรียก present_recommendations อีก
+    ครั้งเดียวด้วย tool_choice (ถ้ามี verified_source_urls อย่างน้อย 1 อัน) หรือสรุปเป็นข้อความธรรมดาแทน (ถ้าไม่มี
+    url ที่ยืนยันได้เลย) ก่อนจะยอมใช้ข้อความ fallback "งานนี้มีหลายขั้นเกินไป" เป็นทางเลือกสุดท้ายจริงๆ
 
     คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด, มี structural tool ถูกเรียกในเทิร์นนี้ไหม) เสมอ — รายการใบยืนยัน
     มาจาก _build_action_receipt() เฉพาะ tool ที่เปลี่ยนข้อมูลจริง (open_library_file, select_list_item ตอนเปิด
@@ -2859,6 +2882,8 @@ def run_agentic_tool_loop(
     action_receipts: list[str] = []
     structural_tool_called = False
     applied_messages: list[str] = []
+    present_recommendations_called = False
+    effective_max_iterations = max_iterations if max_iterations is not None else MAX_TOOL_ITERATIONS
 
     def _add_receipt(tool_name: str, result: dict) -> None:
         receipt = _build_action_receipt(tool_name, result)
@@ -2895,7 +2920,18 @@ def run_agentic_tool_loop(
     # แต่งขึ้นเอง (ดู execute_present_recommendations)
     verified_source_urls: set = set()
 
-    for _ in range(MAX_TOOL_ITERATIONS):
+    iteration = 0
+    pause_count = 0
+    hit_iteration_limit = False
+    continuing_pause = False
+    while True:
+        if not continuing_pause:
+            iteration += 1
+            if iteration > effective_max_iterations:
+                hit_iteration_limit = True
+                break
+        continuing_pause = False
+
         response = client.messages.create(
             model=model or "claude-haiku-4-5-20251001",
             max_tokens=2500,  # เดิม 1500 — เพิ่มเพราะคำตอบสาย investment advisor มักมี breakdown + อ้างอิงกฎหมายยาวขึ้น
@@ -2906,6 +2942,13 @@ def run_agentic_tool_loop(
 
         # แปลงเป็น dict ชัดเจนก่อนส่งกลับเข้า messages กัน serialize พลาด (ปลอดภัยกว่าพึ่ง SDK แปลงให้เอง)
         messages.append({"role": "assistant", "content": [block.model_dump() for block in response.content]})
+
+        tool_names_called = [block.name for block in response.content if block.type == "tool_use"]
+        response_text_len = sum(len(block.text) for block in response.content if block.type == "text")
+        print(
+            f"[AgentLoop] iter={iteration} stop_reason={response.stop_reason} "
+            f"tools={','.join(tool_names_called) if tool_names_called else '-'} text_len={response_text_len}"
+        )
 
         for block in response.content:
             if block.type == "text":
@@ -2925,9 +2968,17 @@ def run_agentic_tool_loop(
             # server tool (เช่น web_search ที่ใช้เวลาค้นนาน) ยังทำงานไม่เสร็จในเทิร์นนี้ — ไม่ใช่ tool_use ที่
             # เราต้อง execute เอง และไม่ใช่ end_turn จริง เก็บข้อความ/citation ของรอบนี้ไว้ก่อน (ดู
             # paused_content_blocks ด้านบน) แล้วส่ง messages เดิม (รวม assistant content ล่าสุดที่เพิ่งต่อไป
-            # ด้านบน) กลับเข้า loop เพื่อเรียกต่อในรอบถัดไปโดยไม่แก้ไขอะไรเพิ่ม (นับรวมเป็น 1 รอบใน
-            # MAX_TOOL_ITERATIONS เหมือนเดิม กันวนไม่รู้จบถ้า pause_turn ไม่เคยจบสักที)
+            # ด้านบน) กลับเข้า loop เพื่อเรียกต่อในรอบถัดไปโดยไม่แก้ไขอะไรเพิ่ม (ไม่กินโควตา effective_max_
+            # iterations — นับแยกที่ pause_count จำกัดที่ MAX_PAUSE_TURNS กันวนไม่รู้จบถ้า pause_turn ไม่เคยจบสักที)
             paused_content_blocks.extend(response.content)
+            pause_count += 1
+            if pause_count > MAX_PAUSE_TURNS:
+                hit_iteration_limit = True  # ไม่ใช่ iteration limit เป๊ะๆ แต่ทริกเกอร์ fallback เดียวกัน
+                # response.content ถูกรวมเข้า paused_content_blocks ไปแล้วข้างบน — เคลียร์ response ทิ้งกัน
+                # _build_final_answer_with_citations ด้านล่างเอา content ของรอบนี้มานับซ้ำสอง
+                response = None
+                break
+            continuing_pause = True
             continue
 
         if response.stop_reason != "tool_use":
@@ -3089,6 +3140,7 @@ def run_agentic_tool_loop(
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
             elif block.type == "tool_use" and block.name == "present_recommendations":
+                present_recommendations_called = True
                 result = _safe_execute_tool(
                     "present_recommendations", execute_present_recommendations,
                     block.input, chat_id, verified_source_urls,
@@ -3112,20 +3164,88 @@ def run_agentic_tool_loop(
         # ไม่ใช่ส่วนหนึ่งของคำตอบสุดท้ายรอบนี้อีกต่อไปแล้ว (ดู docstring ของ paused_content_blocks ด้านบน)
         paused_content_blocks.clear()
         messages.append({"role": "user", "content": tool_results})
-    else:
-        # for...else: ส่วนนี้ทำงานเฉพาะตอนวนครบ MAX_TOOL_ITERATIONS โดยไม่เคย break เลยสักครั้ง — แปลว่า
-        # ทุกรอบ Claude ยังขอเรียก tool อยู่ต่อเนื่อง (งานหลายขั้นเกินไปสำหรับเพดานที่ตั้งไว้) ถ้า stop_reason
-        # ล่าสุดยังเป็น tool_use อยู่ (ไม่ได้บังเอิญจบพอดีที่รอบสุดท้าย) ต้องบอกผู้ใช้ตรงๆ ไม่ปล่อยคำตอบว่าง/
-        # ขาดกลางคัน (response ล่าสุดมักมีแต่ tool_use block ไม่มี text block เลย -> text_parts จะว่างเปล่า)
-        if response.stop_reason == "tool_use":
-            return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
+    # จบ while loop — hit_iteration_limit บอกว่าชน effective_max_iterations (หรือ MAX_PAUSE_TURNS) โดยยังไม่จบจริง
+
+    present_recommendations_tool_available = any(
+        isinstance(t, dict) and t.get("name") == "present_recommendations" for t in tools_for_this_call
+    )
+    if not applied_messages and present_recommendations_tool_available and not present_recommendations_called:
+        final_text_so_far = _build_final_answer_with_citations(
+            paused_content_blocks + (response.content if response is not None else [])
+        )
+        if not final_text_so_far or hit_iteration_limit:
+            # advisor จบโดยไม่ได้เรียก present_recommendations เลย ทั้งที่เส้นทางนี้มี tool นี้ให้ใช้เสมอ (ข้อความ
+            # สุดท้ายว่างเปล่า หรือชน max_iterations) — บังคับเรียกอีกครั้งเดียวด้วย tool_choice ก่อนจะยอมปล่อย
+            # fallback (เหตุการณ์จริงที่แก้: AI ค้นเว็บเสร็จแล้วแต่ไม่เรียก present_recommendations จนหมดรอบ)
+            # ทั้งสองการเรียกพิเศษนี้ต้องส่ง tools=tools_for_this_call เดิมเสมอ (ไม่ใช่ตัดเหลือ tool เดียว/ไม่มี
+            # tool เลย) เพราะ messages ที่ส่งไปมี server_tool_use/web_search_tool_result บล็อกติดอยู่แล้วจากรอบ
+            # ก่อนหน้า — Anthropic API จริงจะ 400 ถ้า tools ที่ส่งมาไม่ครอบคลุม tool ที่ประวัติอ้างถึง
+            nudge_appended = False
+            if messages and messages[-1].get("role") == "assistant":
+                # กัน assistant content block ล่าสุด (ที่ยังไม่จบประโยค/ไม่มี text เลย) ชนกับ tool_choice ที่บังคับ
+                # เรียกถัดไป — เติม user turn สั้นๆ ขอให้สรุปก่อนเสมอ (เหมือน prompt จริงจากผู้ใช้ ไม่ใช่ prefill)
+                messages.append({"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"})
+                nudge_appended = True
+            if verified_source_urls:
+                try:
+                    forced_response = client.messages.create(
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        tools=tools_for_this_call,
+                        tool_choice={"type": "tool", "name": "present_recommendations"},
+                        messages=messages,
+                    )
+                    print(
+                        f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
+                        f"tools=present_recommendations text_len=0"
+                    )
+                    tool_use_block = next((b for b in forced_response.content if b.type == "tool_use"), None)
+                    if tool_use_block is not None:
+                        present_recommendations_called = True
+                        result = _safe_execute_tool(
+                            "present_recommendations", execute_present_recommendations,
+                            tool_use_block.input, chat_id, verified_source_urls,
+                        )
+                        if "error" in result:
+                            applied_messages.append(result["error"])
+                        else:
+                            has_open_document = bool(
+                                user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
+                            )
+                            applied_messages.append(_render_recommendations_answer(result, has_open_document))
+                except Exception as e:
+                    # ไม่ปล่อยให้ API ล้ม/timeout ของการเรียกพิเศษนี้หลุดออกไปเป็น 500 ถึงผู้ใช้เด็ดขาด — ไปต่อที่
+                    # summary call ด้านล่าง (หรือ fallback เดิมถ้านั่นก็ล้มอีก) ไม่พิมพ์เนื้อหา exception เลย
+                    print(f"[AgentLoop] forced call failed: {type(e).__name__}")
+            if not applied_messages:
+                # ไม่มี url ที่ยืนยันได้เลย (หรือการบังคับเรียกข้างบนไม่ได้คำตอบ/ล้มเหลว) — เรียกอีกครั้งเดียวด้วย
+                # tool_choice={"type":"none"} (ห้าม Claude เรียก tool ใดๆ ต่ออีก แต่ยังต้องส่ง tools=
+                # tools_for_this_call เดิมด้วยเหตุผลเดียวกับด้านบน) ให้สรุปเป็นข้อความธรรมดาจากผลค้นที่มีอยู่แทน
+                if not nudge_appended and messages and messages[-1].get("role") == "assistant":
+                    messages.append({"role": "user", "content": "สรุปผลจากการค้นหาข้างต้นให้ผู้ใช้ตอนนี้เลย"})
+                    nudge_appended = True
+                try:
+                    summary_response = client.messages.create(
+                        model=model or "claude-haiku-4-5-20251001", max_tokens=2500, system=system_prompt,
+                        tools=tools_for_this_call, tool_choice={"type": "none"},
+                        messages=messages,
+                    )
+                    summary_text_len = sum(len(b.text) for b in summary_response.content if b.type == "text")
+                    print(
+                        f"[AgentLoop] iter=forced_summary stop_reason={summary_response.stop_reason} "
+                        f"tools=- text_len={summary_text_len}"
+                    )
+                    summary_text = _build_final_answer_with_citations(summary_response.content)
+                    if summary_text:
+                        applied_messages.append(summary_text)
+                except Exception as e:
+                    print(f"[AgentLoop] forced call failed: {type(e).__name__}")
 
     if applied_messages:
-        # มี tool แก้โครงสร้างไฟล์สำเร็จในเทิร์นนี้ — ใช้ข้อความผลลัพธ์จากโค้ดตรงๆ เป็นคำตอบสุดท้ายเสมอ ไม่ให้
-        # Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด (ดู docstring ด้านบน)
+        # มี tool แก้โครงสร้างไฟล์สำเร็จในเทิร์นนี้ (หรือ present_recommendations ถูกบังคับเรียกสำเร็จ) — ใช้
+        # ข้อความผลลัพธ์จากโค้ดตรงๆ เป็นคำตอบสุดท้ายเสมอ ไม่ให้ Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด
         return "\n\n".join(applied_messages), action_receipts, structural_tool_called
 
-    final_text = _build_final_answer_with_citations(paused_content_blocks + response.content)
+    final_text = _build_final_answer_with_citations(paused_content_blocks + (response.content if response is not None else []))
     if not final_text:
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
@@ -3925,17 +4045,41 @@ def execute_present_recommendations(tool_input: dict, chat_id: Optional[int], ve
     return {"criteria": criteria, "items": verified_items, "impacts": impacts, "summary": summary}
 
 
+# อักขระที่ปลอดภัยอยู่แล้วใน URL ตาม RFC 3986 (ไม่ต้อง percent-encode ซ้ำ) — ใช้กับ urllib.parse.quote ตอนทำ
+# source_url ให้ปลอดภัยต่อ markdown link syntax (ดู _render_recommendation_item_line) กันช่องว่าง/วงเล็บ/อักขระ
+# ที่ไม่ใช่ ASCII ที่ Claude อาจแปะมาทำลายไวยากรณ์ [label](url) หรือทำให้ลิงก์ขาดกลางคัน
+_URL_SAFE_CHARACTERS = ":/?#[]@!$&'*+,;=%-._~"
+
+
+def _safe_markdown_url(url: Optional[str]) -> Optional[str]:
+    """percent-encode url ให้ใส่ใน markdown link [ลิงก์](<url>) ได้อย่างปลอดภัย (ช่องว่าง/วงเล็บ/อักขระไทยที่ยัง
+    ไม่ถูก encode ทำลายไวยากรณ์ markdown ได้ — เหตุการณ์จริงที่แก้: URL ไทยยาวๆ ที่มีช่องว่างทำให้ลิงก์ขาดกลางคัน)
+    คืน None ถ้า url ไม่ใช่ http(s) (กันลิงก์ที่ไม่ปลอดภัย เช่น javascript:/data: หลุดเข้าไปในคำตอบ)"""
+    if not isinstance(url, str) or not url:
+        return None
+    if not re.match(r"^https?://", url, re.IGNORECASE):
+        return None
+    return urllib.parse.quote(url, safe=_URL_SAFE_CHARACTERS)
+
+
 def _render_recommendation_item_line(index: int, item: dict) -> str:
     """ประกอบบรรทัดเดียวของรายการแนะนำที่ index นี้ — รูปแบบตายตัว
     "<index>. <name> — <key_specs> — ราคา <price_thb> บาท/<unit> — [ลิงก์](<source_url>)" (หรือใช้ price_note
-    แทนส่วนราคาถ้า price_thb เป็น null) ต่อท้ายด้วย "⚠ <compatibility_note>" ถ้า compatible เป็น false"""
+    แทนส่วนราคาถ้า price_thb เป็น null) ต่อท้ายด้วย "⚠ <compatibility_note>" ถ้า compatible เป็น false
+
+    source_url ถูก percent-encode ก่อนเสมอ (ดู _safe_markdown_url) กันช่องว่าง/วงเล็บ/อักขระไทยทำลายไวยากรณ์
+    markdown — ถ้า url ไม่ใช่ http(s) (parse ไม่ผ่าน _safe_markdown_url) ไม่ทำเป็นลิงก์เลย ตัดส่วน "— [ลิงก์](...)"
+    ทิ้งทั้งหมด (ปลอดภัยกว่าใส่ url เดิมตรงๆ ที่อาจไม่ใช่ลิงก์จริง)"""
     price_thb = item.get("price_thb")
     unit = item.get("unit")
     if price_thb is not None:
         price_part = f"ราคา {price_thb:,.0f} บาท" + (f"/{unit}" if unit else "")
     else:
         price_part = item.get("price_note") or "ไม่พบราคาที่ชัดเจน"
-    line = f"{index}. {item.get('name')} — {item.get('key_specs')} — {price_part} — [ลิงก์]({item.get('source_url')})"
+    line = f"{index}. {item.get('name')} — {item.get('key_specs')} — {price_part}"
+    safe_url = _safe_markdown_url(item.get("source_url"))
+    if safe_url:
+        line += f" — [ลิงก์]({safe_url})"
     if item.get("compatible") is False:
         line += f" ⚠ {item.get('compatibility_note') or 'อาจไม่เข้ากันกับระบบเดิม'}"
     return line
@@ -4001,7 +4145,7 @@ def advisor_answer(
 
     raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
-        tools_override=ADVISOR_TOOLS, model=ADVISOR_MODEL,
+        tools_override=ADVISOR_TOOLS, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
     )
     answer = _normalize_polite_particles(raw_answer)
     # offer_line อาจถูกต่อท้ายไปแล้วจาก _render_recommendations_answer (ตอน Claude เรียก present_recommendations
