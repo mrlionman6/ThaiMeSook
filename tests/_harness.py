@@ -69,9 +69,9 @@ WANTED_MAIN_FUNCS = {
     "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
     "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
     "_advisor_target_doc", "_advisor_document_context",
-    "run_agentic_tool_loop", "_build_final_answer_with_citations", "_safe_execute_tool",
+    "run_agentic_tool_loop", "_build_final_answer_with_citations", "_safe_execute_tool", "_build_action_receipt",
     "execute_present_recommendations", "_render_recommendation_item_line", "_render_recommendations_answer",
-    "_extract_domain_from_url",
+    "_extract_domain_from_url", "_safe_markdown_url",
     "_resolve_recommendation_command_dispatch", "_resolve_recommendation_replace_command",
     "_resolve_recommendation_add_command", "_parse_recommendation_price_clause",
     "_classify_question_route", "_classify_legal_or_advisor_route",
@@ -106,7 +106,7 @@ WANTED_MAIN_CONSTS = {
     "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
     "PRESENT_RECOMMENDATIONS_TOOL", "ADVISOR_MODEL", "_NO_VERIFIED_RECOMMENDATIONS_MESSAGE",
-    "_SEARCH_TOOL_BLOCK_TYPES",
+    "_SEARCH_TOOL_BLOCK_TYPES", "ADVISOR_MAX_TOOL_ITERATIONS", "MAX_PAUSE_TURNS", "_URL_SAFE_CHARACTERS",
     "_RECOMMENDATION_REPLACE_RE", "_RECOMMENDATION_ADD_RE", "_RECOMMENDATION_QTY_CLAUSE_RE",
     "_PRICE_CLAUSE_EXPLICIT_RE", "_PRICE_CLAUSE_ORIGINAL_RE", "_PRICE_CLAUSE_MARKUP_RE",
     "QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT",
@@ -426,10 +426,11 @@ class _FakeAgenticLoop:
     def set_response(self, text: str, receipts: list, structural_tool_called: bool) -> None:
         self.response = (text, receipts, structural_tool_called)
 
-    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None):
+    def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None,
+                 max_iterations=None):
         self.last_call_args = {
             "system_prompt": system_prompt, "messages": initial_messages, "user_id": user_id, "chat_id": chat_id,
-            "tools_override": tools_override, "model": model,
+            "tools_override": tools_override, "model": model, "max_iterations": max_iterations,
         }
         return self.response
 

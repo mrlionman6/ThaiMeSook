@@ -1133,6 +1133,203 @@ def test_run_agentic_tool_loop_present_recommendations_filters_unverified_source
     assert saved[0]["name"] == "รุ่น A"
 
 
+# ---------- fix/advisor-robust: advisor ค้นเว็บแล้วไม่เรียก present_recommendations จนจบด้วยข้อความว่าง ----------
+# เหตุการณ์จริงที่แก้: log มี [Route] branch=advisor แต่ไม่มี [ToolCall] present_recommendations เลย — Claude ค้น
+# เว็บเสร็จแล้วแต่ไม่ยอมเรียก present_recommendations เอง จนจบเทิร์น (ข้อความว่าง) หรือชน max_iterations ไปเลย
+_FORCED_RECOMMENDATION_INPUT = {
+    "criteria": ["ความจุ", "ราคา"],
+    "items": [{
+        "name": "รุ่น D (บังคับเรียก)", "key_specs": "สเปก D", "price_thb": 4500, "price_note": None,
+        "unit": "ชิ้น", "source_url": "https://shop.com", "compatible": True, "compatibility_note": None,
+    }],
+    "impacts": [], "summary": "แนะนำรุ่น D ครับ",
+}
+
+
+def test_run_agentic_tool_loop_forces_present_recommendations_when_ends_empty_after_search(ns):
+    """ค้นเว็บ 3 ครั้ง (จำลองรวมอยู่ในรอบเดียว — Anthropic resolve web_search ที่ฝั่ง server เอง) แล้วจบด้วย
+    stop_reason=end_turn โดยไม่มี text block เลย (คำตอบว่างเปล่า) และไม่เรียก present_recommendations เลย ->
+    ต้องบังคับเรียกอีกครั้งด้วย tool_choice={"type":"tool","name":"present_recommendations"} เพราะมี
+    verified_source_urls จากผลค้นจริงอยู่แล้ว"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    search_rounds = []
+    search_urls = ["https://shop.com", "https://shop1.com", "https://shop2.com"]  # shop.com ตรงกับ source_url
+    # ของ _FORCED_RECOMMENDATION_INPUT ให้รอดการตรวจ verified_source_urls ใน execute_present_recommendations
+    for i, url in enumerate(search_urls):
+        search_rounds.append(_FakeAgenticOtherBlock("server_tool_use"))
+        search_rounds.append(_FakeAgenticOtherBlock(
+            "web_search_tool_result", content=[{"url": url, "title": f"ร้าน {i}"}],
+        ))
+    fake_client.response_queue = [
+        _FakeAgenticResponse(search_rounds, stop_reason="end_turn"),
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("forced_1", "present_recommendations", _FORCED_RECOMMENDATION_INPUT)],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    assert fake_client.call_count == 2
+    assert fake_client.last_call_kwargs["tool_choice"] == {"type": "tool", "name": "present_recommendations"}
+    assert fake_client.last_call_kwargs["tools"] == [ns["PRESENT_RECOMMENDATIONS_TOOL"]]
+    assert "1. รุ่น D (บังคับเรียก)" in answer
+    assert receipts == []
+    assert structural is False
+
+
+def test_run_agentic_tool_loop_forces_present_recommendations_when_hitting_max_iterations(ns):
+    """ชน max_iterations (ตั้งไว้ต่ำๆ ในเทสต์นี้) โดยยังไม่เคยเรียก present_recommendations เลย (เรียก
+    open_library_file ซ้ำๆ แทน — ใช้เป็นแค่ "ตัวเติม" ให้วนหลายรอบ ไม่ได้ทดสอบ open_library_file เอง) ->
+    ต้องบังคับเรียก present_recommendations เช่นกันหลังชนเพดาน"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    filler_round = _FakeAgenticResponse(
+        [
+            _FakeAgenticOtherBlock("web_search_tool_result", content=[{"url": "https://shop.com", "title": "ร้าน"}]),
+            _FakeAgenticToolUseBlock("filler", "open_library_file", {}),
+        ],
+        stop_reason="tool_use",
+    )
+    fake_client.response_queue = [
+        filler_round,
+        filler_round,
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("forced_1", "present_recommendations", _FORCED_RECOMMENDATION_INPUT)],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"], max_iterations=2,
+    )
+
+    assert fake_client.call_count == 3
+    assert fake_client.last_call_kwargs["tool_choice"] == {"type": "tool", "name": "present_recommendations"}
+    assert "1. รุ่น D (บังคับเรียก)" in answer
+
+
+def test_run_agentic_tool_loop_falls_back_to_plain_summary_when_no_verified_url(ns):
+    """ไม่มี verified_source_urls เลย (ไม่เคยค้นเว็บได้ผลจริง) และจบด้วยข้อความว่าง ไม่เรียก present_recommendations
+    -> ไม่บังคับเรียก present_recommendations ด้วย tool_choice (ไม่มี url ให้ยืนยันเลย) แต่เรียกอีกครั้งแบบไม่มี
+    tools ให้สรุปเป็นข้อความธรรมดาแทน"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse([], stop_reason="end_turn"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("สรุปจากข้อมูลที่มีครับ ยังไม่มีราคาที่ยืนยันได้ชัดเจน")], stop_reason="end_turn"),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
+    )
+
+    assert fake_client.call_count == 2
+    assert "tools" not in fake_client.last_call_kwargs
+    assert "tool_choice" not in fake_client.last_call_kwargs
+    assert answer == "สรุปจากข้อมูลที่มีครับ ยังไม่มีราคาที่ยืนยันได้ชัดเจน"
+
+
+def test_run_agentic_tool_loop_pause_turn_three_times_does_not_consume_iteration_quota(ns):
+    """pause_turn ติดกัน 3 ครั้ง (ต่ำกว่า MAX_PAUSE_TURNS=5) ก่อนจบด้วย end_turn จริง — ต้องไม่กินโควตา
+    max_iterations เลย (ตั้ง max_iterations=1 ในเทสต์นี้โดยตั้งใจ — ถ้า pause_turn กินโควตาจะชนเพดานทันทีตั้งแต่
+    รอบที่ 2 และตอบ fallback แทนคำตอบจริง)"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse([_FakeAgenticTextBlock("ส่วนที่ 1 ")], stop_reason="pause_turn"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("ส่วนที่ 2 ")], stop_reason="pause_turn"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("ส่วนที่ 3 ")], stop_reason="pause_turn"),
+        _FakeAgenticResponse([_FakeAgenticTextBlock("ส่วนสุดท้าย")], stop_reason="end_turn"),
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=None, chat_id=None, tools_override=[], max_iterations=1,
+    )
+
+    assert fake_client.call_count == 4
+    assert answer == "ส่วนที่ 1 ส่วนที่ 2 ส่วนที่ 3 ส่วนสุดท้าย"
+    assert answer != "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
+
+
+def test_run_agentic_tool_loop_gives_up_after_too_many_pause_turns(ns):
+    """pause_turn เกิน MAX_PAUSE_TURNS (5) ติดกัน — ต้องเลิกรอ (ไม่วนไม่รู้จบ) แล้วคืนข้อความที่สะสมได้จริงจากทุก
+    รอบ pause_turn ก่อนหน้า (ดีกว่าทิ้งข้อความที่มีอยู่แล้วไปเฉยๆ) ไม่นับซ้ำสองของรอบสุดท้าย"""
+    real_loop = ns["_real_run_agentic_tool_loop"]
+    fake_client = ns["_fake_client"]
+    max_pause = ns["MAX_PAUSE_TURNS"]
+    fake_client.response_queue = [
+        _FakeAgenticResponse([_FakeAgenticTextBlock(f"ส่วนที่ {i} ")], stop_reason="pause_turn")
+        for i in range(max_pause + 1)
+    ]
+
+    answer, receipts, structural = real_loop(
+        "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
+        user_id=None, chat_id=None, tools_override=[],
+    )
+
+    assert fake_client.call_count == max_pause + 1
+    expected = "".join(f"ส่วนที่ {i} " for i in range(max_pause + 1)).strip()
+    assert answer == expected
+    assert answer.count("ส่วนที่ 0") == 1  # ไม่นับซ้ำสองของเนื้อหารอบใดเลย (ดู response=None ตอนเลิกรอ)
+
+
+def test_render_recommendation_item_line_percent_encodes_unsafe_url_characters(ns):
+    """source_url ที่มีช่องว่าง/อักขระไทย/วงเล็บ ต้อง percent-encode ก่อนใส่ใน markdown link เสมอ กันลิงก์ขาดกลาง
+    คันหรือวงเล็บของ url ไปปิด markdown link ก่อนเวลา (ทำให้รุ่นถัดไปหายไปจากคำตอบ) — ตรวจว่าทุกรุ่นยังอยู่ครบ
+    เรียงลำดับถูกต้อง ไม่มีรุ่นไหนขาดหายไปเพราะ markdown พัง"""
+    url_space_thai = "https://shop.com/สินค้า ราคาถูก"
+    url_paren = "https://shop.com/product(v2)"
+    url_plain = "https://shop.com/plain"
+    url_unsafe_scheme = "javascript:alert(1)"
+    items = [
+        {
+            "name": "รุ่นช่องว่างไทย", "key_specs": "A", "price_thb": 100, "price_note": None, "unit": "ชิ้น",
+            "source_url": url_space_thai, "compatible": True, "compatibility_note": None,
+        },
+        {
+            "name": "รุ่นมีวงเล็บ", "key_specs": "B", "price_thb": 200, "price_note": None, "unit": "ชิ้น",
+            "source_url": url_paren, "compatible": True, "compatibility_note": None,
+        },
+        {
+            "name": "รุ่นปกติ", "key_specs": "C", "price_thb": 300, "price_note": None, "unit": "ชิ้น",
+            "source_url": url_plain, "compatible": True, "compatibility_note": None,
+        },
+        {
+            "name": "รุ่น URL ไม่ปลอดภัย", "key_specs": "D", "price_thb": 400, "price_note": None, "unit": "ชิ้น",
+            "source_url": url_unsafe_scheme, "compatible": True, "compatibility_note": None,
+        },
+    ]
+    answer = ns["_render_recommendations_answer"](
+        {"criteria": ["ก"], "items": items, "impacts": [], "summary": ""}, False,
+    )
+    lines = [l for l in answer.split("\n") if l]
+    item_lines = [l for l in lines if l[:1].isdigit()]
+    assert len(item_lines) == 4  # ครบทั้ง 4 รุ่น ไม่มีรุ่นไหนหายไปเพราะ markdown พัง
+    assert item_lines[0].startswith("1. รุ่นช่องว่างไทย")
+    assert item_lines[1].startswith("2. รุ่นมีวงเล็บ")
+    assert item_lines[2].startswith("3. รุ่นปกติ")
+    assert item_lines[3].startswith("4. รุ่น URL ไม่ปลอดภัย")
+
+    for line, original_url in ((item_lines[0], url_space_thai), (item_lines[1], url_paren), (item_lines[2], url_plain)):
+        start = line.index("[ลิงก์](") + len("[ลิงก์](")
+        end = line.rindex(")")
+        encoded = line[start:end]
+        assert " " not in encoded
+        assert "(" not in encoded and ")" not in encoded
+        assert ns["urllib"].parse.unquote(encoded) == original_url
+
+    # URL ที่ไม่ใช่ http(s) ต้องไม่ถูกทำเป็นลิงก์เลย (ตัดส่วน "— [ลิงก์](...)" ทิ้งทั้งหมด)
+    assert "[ลิงก์]" not in item_lines[3]
+
+
 def test_render_recommendations_answer_returns_fixed_message_when_no_items_survive_filtering(ns):
     answer = ns["_render_recommendations_answer"]({"criteria": [], "items": [], "impacts": [], "summary": ""}, False)
     assert answer == ns["_NO_VERIFIED_RECOMMENDATIONS_MESSAGE"]
