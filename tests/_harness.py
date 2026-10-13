@@ -107,6 +107,7 @@ WANTED_MAIN_CONSTS = {
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
     "PRESENT_RECOMMENDATIONS_TOOL", "ADVISOR_MODEL", "_NO_VERIFIED_RECOMMENDATIONS_MESSAGE",
     "_SEARCH_TOOL_BLOCK_TYPES", "ADVISOR_MAX_TOOL_ITERATIONS", "MAX_PAUSE_TURNS", "_URL_SAFE_CHARACTERS",
+    "ADVISOR_MAX_TOKENS",
     "_RECOMMENDATION_REPLACE_RE", "_RECOMMENDATION_ADD_RE", "_RECOMMENDATION_QTY_CLAUSE_RE",
     "_PRICE_CLAUSE_EXPLICIT_RE", "_PRICE_CLAUSE_ORIGINAL_RE", "_PRICE_CLAUSE_MARKUP_RE",
     "QUESTION_DOMAIN_CLASSIFIER_SYSTEM_PROMPT",
@@ -430,10 +431,11 @@ class _FakeAgenticLoop:
         self.response = (text, receipts, structural_tool_called)
 
     def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None,
-                 max_iterations=None):
+                 max_iterations=None, max_tokens=None):
         self.last_call_args = {
             "system_prompt": system_prompt, "messages": initial_messages, "user_id": user_id, "chat_id": chat_id,
             "tools_override": tools_override, "model": model, "max_iterations": max_iterations,
+            "max_tokens": max_tokens,
         }
         return self.response
 

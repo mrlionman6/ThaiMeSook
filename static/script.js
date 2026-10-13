@@ -34,16 +34,29 @@ function escapeHtmlAttribute(text) {
 // token.tokens จะมีข้อความเหมือน href เป๊ะในกรณีนี้) แสดงเป็นคำว่า "ลิงก์" แทน URL เต็มที่ยาวเกินจะอ่าน/ล้นกรอบ
 // ข้อความ — ยังคลิกได้ปกติ แค่ข้อความที่เห็นสั้นลง href ที่ไม่ใช่ http(s)/path ภายใน -> แสดงเป็นข้อความธรรมดา
 // ไม่ใช่ลิงก์ที่คลิกได้เลย (ดู isSafeHref)
+// รองรับทั้ง renderer API ของ marked v13+ (arg แรกเป็น token object, ต้องประกอบ HTML เองผ่าน
+// this.parser.parseInline) และ v12 (signature เดิม link(href, title, text) โดย text เป็น HTML ที่ marked
+// render inline มาให้แล้ว) เพราะ static/index.html ตอนนี้โหลด marked 12.0.0 ซึ่งไม่มี this.parser —
+// ถ้าเขียนตาม API ใหม่อย่างเดียวจะพังทันทีที่มีลิงก์ (TypeError: Cannot read properties of undefined
+// (reading 'parseInline'))
 marked.use({
     renderer: {
-        link(token) {
-            const href = token.href;
-            const innerHtml = this.parser.parseInline(token.tokens);
+        link(hrefOrToken, title, text) {
+            let href;
+            let innerHtml;
+            if (typeof hrefOrToken === "object" && hrefOrToken !== null) {
+                href = hrefOrToken.href;
+                title = hrefOrToken.title;
+                innerHtml = this.parser.parseInline(hrefOrToken.tokens);
+            } else {
+                href = hrefOrToken;
+                innerHtml = text;
+            }
             if (!isSafeHref(href)) {
                 return innerHtml;
             }
             const escapedHref = escapeHtmlAttribute(href);
-            const titleAttr = token.title ? ` title="${escapeHtmlAttribute(token.title)}"` : "";
+            const titleAttr = title ? ` title="${escapeHtmlAttribute(title)}"` : "";
             const displayHtml = innerHtml.trim() === href ? "ลิงก์" : innerHtml;
             return `<a href="${escapedHref}"${titleAttr} target="_blank" rel="noopener noreferrer">${displayHtml}</a>`;
         },
@@ -405,8 +418,13 @@ function typewriterReveal(wrapper, fullText, requestChatId) {
 
         index = Math.min(index + chunkSize, fullText.length);
         const partial = fullText.slice(0, index);
-        const rawHtml = marked.parse(partial);
-        wrapper.innerHTML = DOMPurify.sanitize(rawHtml);
+        try {
+            const rawHtml = marked.parse(partial);
+            wrapper.innerHTML = DOMPurify.sanitize(rawHtml);
+        } catch (e) {
+            wrapper.textContent = partial;
+            console.error("marked.parse ล้มเหลว:", e);
+        }
         scrollChatToBottom();
 
         if (index < fullText.length) {
@@ -428,8 +446,13 @@ function appendChatMessage(role, content) {
         wrapper.title = "คลิกเพื่อดูข้อความเต็ม";
         wrapper.addEventListener("click", () => wrapper.classList.toggle("expanded"));
     } else {
-        const rawHtml = marked.parse(content);
-        wrapper.innerHTML = DOMPurify.sanitize(rawHtml);
+        try {
+            const rawHtml = marked.parse(content);
+            wrapper.innerHTML = DOMPurify.sanitize(rawHtml);
+        } catch (e) {
+            wrapper.textContent = content;
+            console.error("marked.parse ล้มเหลว:", e);
+        }
     }
     box.appendChild(wrapper);
     updateTitleVisibility(); // แชทมีข้อความแล้ว → ซ่อนข้อความทักทายทันที
