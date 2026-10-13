@@ -1978,7 +1978,7 @@ _DOCUMENT_REFERENCE_KEYWORDS = (
 )
 
 
-_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน")
+_DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน", "แทน")
 
 
 def _is_document_reading_question(query: str) -> bool:
@@ -1992,11 +1992,14 @@ def _is_document_reading_question(query: str) -> bool:
     เพิ่มที่ _query_mentions_table_item_or_label สำหรับเงื่อนไขเสริมกรณีเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์
     ตรงๆ โดยไม่มีคำเหล่านี้ปนมาเลย (เช็คแยกต่างหากเพราะต้องมี target_doc ประกอบ ฟังก์ชันนี้รับแค่ query เดียว)
 
-    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS) -> ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปน
-    มาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้
-    ไม่ใช่คำถามอ่านอย่างเดียว) "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ)
-    หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ในชื่อบริษัท)"""
-    stripped = query.strip()
+    มีคำสั่งแก้ปนมา (_DOCUMENT_EDIT_COMMAND_WORDS — รวม "แทน" ด้วย ดู _resolve_recommendation_intent_with_llm) ->
+    ไม่ใช่ reading question เด็ดขาด ไม่ว่าจะมีคำอ้างอิงไฟล์ปนมาด้วยก็ตาม (เหตุการณ์จริงที่แก้: "แก้ชื่อลูกค้าเป็น X
+    ได้ไหม" มีคำว่า "ชื่อลูกค้า" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ใช่คำถามอ่านอย่างเดียว — อีกเหตุการณ์จริง: "เเทน
+    ลงในรายการเลย" (สระเอซ้ำ) มีคำว่า "รายการ" ปนมาด้วย แต่เป็นคำสั่งแก้ ไม่ normalize "เเ"→"แ" ก่อน ทำให้ "แทน" ไม่
+    ตรงเลยสักคำ) normalize "เเ"→"แ" ก่อนเช็คทุกเงื่อนไขในฟังก์ชันนี้เสมอ "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ
+    (โทเคนแรกจาก word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น
+    "ดูดี" ในชื่อบริษัท)"""
+    stripped = query.strip().replace("เเ", "แ")
     if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
         return False
     lowered = stripped.lower()
@@ -2295,8 +2298,11 @@ def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = 
 def _answer_document_reading_question(query: str, active_docs: list, user_id: int, chat_id: int) -> tuple[str, Optional[int]]:
     """ตอบคำถามเกี่ยวกับเนื้อหา/ค่าของไฟล์ที่เปิดอยู่โดยตรง ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย — เรียก
     read_document_values ด้วยโค้ดตรงๆ (ไม่รอให้ AI ตัดสินใจเรียกเอง กันพลาดเหมือนที่เคยเจอ) แล้วให้ Claude
-    จัดรูปคำตอบจากผลลัพธ์นี้เท่านั้น (ไม่ใส่ context จากฐานความรู้กฎหมายเข้าไปเลย) คืน (ข้อความคำตอบ, document_id
-    ที่ใช้ตอบ หรือ None ถ้าถามกลับเพราะกำกวม) ใช้เฉพาะคำถามที่ไม่มีคำเชิงกฎหมายปนมา (ดู _has_legal_keyword)"""
+    จัดรูปคำตอบจากผลลัพธ์นี้เท่านั้น (ไม่ใส่ context จากฐานความรู้กฎหมายเข้าไปเลย) ส่งประวัติแชทล่าสุด 6 ข้อความไป
+    ด้วยเสมอ (เหมือน advisor_answer) ให้ AI เข้าใจบริบทคำถามที่เคยถามไปก่อนหน้า — เหตุการณ์จริงที่แก้: ไม่มีประวัติ
+    เลย ทำให้คำถาม/คำสั่งที่อ้างอิงบทสนทนาก่อนหน้า (เช่น "แทน ลงในรายการเลย" หลังเพิ่งเลือกรุ่นแนะนำ) หลุดมาทาง
+    เส้นทางนี้แล้วตอบว่า "ไม่มีข้อมูลการสนทนาที่ผ่านมา" คืน (ข้อความคำตอบ, document_id ที่ใช้ตอบ หรือ None ถ้าถาม
+    กลับเพราะกำกวม) ใช้เฉพาะคำถามที่ไม่มีคำเชิงกฎหมายปนมา (ดู _has_legal_keyword)"""
     focus_doc = get_chat_document_focus(chat_id, user_id)
     target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
 
@@ -2311,6 +2317,10 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
     data = read_document_values(target_doc)
     tool_text = _format_document_values_text(data)
 
+    recent_history = get_chat_messages(chat_id)[-6:]
+    messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    messages.append({"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"})
+
     # ถ้าเรียก Claude จัดรูปคำตอบล้ม (เช่น API ล่ม/timeout) ให้ตอบ tool_text ที่โค้ดจัดไว้แล้วตรงๆ แทน — ข้อมูล
     # ยังถูกต้องครบถ้วนเป๊ะเหมือนเดิม (มาจาก read_document_values ตรงๆ) แค่ไม่ได้เรียบเรียงเป็นประโยคให้สวยงาม
     # เท่านั้น ดีกว่าโยน error ทั้งที่ข้อมูลที่ต้องการตอบมีอยู่ในมือแล้ว
@@ -2319,11 +2329,15 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
             model="claude-haiku-4-5-20251001",
             max_tokens=800,
             system=(
-                "คุณจะได้รับค่าปัจจุบันของไฟล์ Excel (จัดรูปจากโค้ดแล้ว ถูกต้องเป๊ะ ไม่ต้องคำนวณซ้ำ) และคำถามของ"
-                "ผู้ใช้ ตอบคำถามโดยใช้ข้อมูลนี้เท่านั้น ห้ามใช้ความรู้อื่นใดๆ นอกเหนือจากนี้ ห้ามคำนวณหรือเดาค่าเอง "
-                "ถ้าข้อมูลที่ให้มาไม่พอตอบคำถาม ให้บอกตรงๆ ว่าไม่มีข้อมูลนี้ในไฟล์ ตอบเป็นภาษาไทย ลงท้ายด้วย \"ครับ\""
+                "คุณจะได้รับค่าปัจจุบันของไฟล์ Excel (จัดรูปจากโค้ดแล้ว ถูกต้องเป๊ะ ไม่ต้องคำนวณซ้ำ), ประวัติการ"
+                "สนทนาล่าสุด (ถ้ามี) และคำถามของผู้ใช้ ตอบคำถามโดยใช้ข้อมูลนี้เท่านั้น ห้ามใช้ความรู้อื่นใดๆ "
+                "นอกเหนือจากนี้ ห้ามคำนวณหรือเดาค่าเอง ถ้าข้อความล่าสุดดูเหมือนผู้ใช้ต้องการแก้ไฟล์ (เช่น เปลี่ยน/"
+                "แทน/ลบ/เพิ่มรายการ) ไม่ใช่แค่ถามข้อมูลเฉยๆ ให้แนะนำรูปแบบคำสั่งสั้นๆ ที่ชัดเจน (เช่น \"ลองพิมพ์ "
+                "'เปลี่ยนรายการที่ 3 เป็น ...' หรือ 'แทนรายการที่ N ด้วยรุ่นที่ K'\") แทนการบอกว่าไม่มีข้อมูลนี้ใน"
+                "ไฟล์ ถ้าเป็นคำถามข้อมูลจริงๆ ที่ตอบไม่ได้จากข้อมูลที่ให้มา ให้บอกตรงๆ ว่าไม่มีข้อมูลนี้ในไฟล์ "
+                "ตอบเป็นภาษาไทย ลงท้ายด้วย \"ครับ\""
             ),
-            messages=[{"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"}],
+            messages=messages,
         )
         return response.content[0].text.strip(), target_doc["id"]
     except Exception as e:
@@ -4066,22 +4080,61 @@ def _extract_domain_from_url(url: Optional[str]) -> Optional[str]:
     return netloc[4:] if netloc.startswith("www.") else netloc
 
 
+# แท็ก citation ของ web_search (<cite index="...">...</cite>) ที่บางครั้ง Claude แปะปนมาในข้อความอิสระของ
+# present_recommendations เอง (criteria/name/key_specs/ฯลฯ) ทั้งที่ควรเป็นข้อความล้วนๆ — ดู _sanitize_recommendation_text
+_CITE_TAG_RE = re.compile(r"</?cite\b[^>]*>", re.IGNORECASE)
+# เศษ JSON ที่บางครั้งหลุดติดท้ายข้อความมาด้วย (เฉพาะท้ายสุดเท่านั้น) — ดู _sanitize_recommendation_text
+_TRAILING_TEXT_ARTIFACT_RE = re.compile(r'(?:"\}|">|")$')
+_REPEATED_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _sanitize_recommendation_text(text):
+    """ทำความสะอาดข้อความอิสระทุกช่องที่ Claude เขียนเองใน present_recommendations (criteria/name/key_specs/
+    price_note/unit/compatibility_note/impacts/summary) ก่อนเก็บ/แสดงผล — เหตุการณ์จริงที่แก้: บางครั้ง Claude
+    แปะ <cite index="...">...</cite> (citation marker ของ web_search) ปนมาในข้อความเอง, \\" (escaped quote ที่
+    หลุดมาตรงๆ แทนที่จะเป็น " จริง) และเศษ JSON ท้ายข้อความ ("}/">/" — เฉพาะท้ายสุด) หลุดติดมาด้วย ไม่แตะค่าที่
+    ไม่ใช่ string เลย (None/number/bool ผ่านตรงๆ ไม่แปลง)"""
+    if not isinstance(text, str):
+        return text
+    cleaned = _CITE_TAG_RE.sub("", text)
+    cleaned = cleaned.replace('\\"', '"')
+    cleaned = _TRAILING_TEXT_ARTIFACT_RE.sub("", cleaned)
+    cleaned = _REPEATED_WHITESPACE_RE.sub(" ", cleaned).strip()
+    return cleaned
+
+
 def execute_present_recommendations(tool_input: dict, chat_id: Optional[int], verified_urls: set) -> dict:
     """เครื่องมือเดียวที่ advisor_answer ใช้ส่งคำแนะนำสินค้าแบบมีโครงสร้างเสมอ (ดู PRESENT_RECOMMENDATIONS_TOOL) —
     ตรวจ source_url ของแต่ละรุ่นกับ url ที่มาจากผล web_search จริงของเทิร์นนี้ (verified_urls — เก็บไว้แล้วใน
-    run_agentic_tool_loop) ก่อนเสมอ ตัดรุ่นที่ยืนยันแหล่งที่มาไม่ได้ทิ้ง (กัน Claude แต่งรุ่น/URL ขึ้นเอง) บันทึก
-    รายการที่เหลือ (หลังตัด) ไว้ที่ chat_last_recommendations เพื่อให้คำสั่งเชื่อมเข้าเอกสารใช้ต่อได้ (ดู
+    run_agentic_tool_loop) ก่อนเสมอ ตัดรุ่นที่ยืนยันแหล่งที่มาไม่ได้ทิ้ง (กัน Claude แต่งรุ่น/URL ขึ้นเอง) — นับจำนวน
+    ที่ถูกตัดไว้ด้วย (unverified_count) ให้ _render_recommendations_answer ต่อท้ายบรรทัดแจ้งผู้ใช้ ทำความสะอาด
+    ข้อความอิสระทุกช่องก่อนเก็บ/แสดงผล (ดู _sanitize_recommendation_text) บันทึกรายการที่เหลือ (หลังตัด+ทำความ
+    สะอาดแล้ว) ไว้ที่ chat_last_recommendations เพื่อให้คำสั่งเชื่อมเข้าเอกสารใช้ต่อได้ (ดู
     _resolve_recommendation_command_dispatch) คืน dict ให้ _render_recommendations_answer จัดรูปคำตอบสุดท้าย"""
-    criteria = [c for c in (tool_input.get("criteria") or []) if isinstance(c, str) and c.strip()][:5]
+    criteria = [
+        _sanitize_recommendation_text(c) for c in (tool_input.get("criteria") or [])
+        if isinstance(c, str) and c.strip()
+    ][:5]
     raw_items = tool_input.get("items") or []
-    verified_items = [item for item in raw_items if item.get("source_url") in verified_urls][:5]
-    impacts = [i for i in (tool_input.get("impacts") or []) if isinstance(i, str) and i.strip()]
-    summary = (tool_input.get("summary") or "").strip()
+    unverified_count = sum(1 for item in raw_items if item.get("source_url") not in verified_urls)
+    verified_items = [dict(item) for item in raw_items if item.get("source_url") in verified_urls][:5]
+    for item in verified_items:
+        for field in ("name", "key_specs", "price_note", "unit", "compatibility_note"):
+            if field in item:
+                item[field] = _sanitize_recommendation_text(item[field])
+    impacts = [
+        _sanitize_recommendation_text(i) for i in (tool_input.get("impacts") or [])
+        if isinstance(i, str) and i.strip()
+    ]
+    summary = _sanitize_recommendation_text((tool_input.get("summary") or "").strip())
 
     if chat_id:
         set_chat_last_recommendations(chat_id, verified_items)
 
-    return {"criteria": criteria, "items": verified_items, "impacts": impacts, "summary": summary}
+    return {
+        "criteria": criteria, "items": verified_items, "impacts": impacts, "summary": summary,
+        "unverified_count": unverified_count,
+    }
 
 
 # อักขระที่ปลอดภัยอยู่แล้วใน URL ตาม RFC 3986 (ไม่ต้อง percent-encode ซ้ำ) — ใช้กับ urllib.parse.quote ตอนทำ
@@ -4127,9 +4180,11 @@ def _render_recommendation_item_line(index: int, item: dict) -> str:
 def _render_recommendations_answer(result: dict, has_open_document: bool) -> str:
     """จัดรูปคำตอบสุดท้ายของ present_recommendations ด้วยโค้ดล้วนๆ (ไม่ใช่ Claude เขียนเอง — ดู docstring ของ
     PRESENT_RECOMMENDATIONS_TOOL) ไม่มีรุ่นไหนยืนยันแหล่งที่มาได้เลย (ถูกตัดทิ้งหมดใน execute_present_
-    recommendations) คืน _NO_VERIFIED_RECOMMENDATIONS_MESSAGE แทน has_open_document: ต่อท้ายด้วย
-    _ADVISOR_REPLACEMENT_OFFER_LINE เสมอถ้ามีใบเสนอราคาเปิดอยู่ (ไม่สนว่าคำถามเอ่ยถึงรายการเดิมหรือไม่ — ต่างจาก
-    _advisor_offer_line เดิมที่ใช้กับคำตอบข้อความธรรมดา เพราะตอนนี้มีรายการแนะนำเป็นเลข 1-5 ให้อ้างถึงแล้วจริงๆ)"""
+    recommendations) คืน _NO_VERIFIED_RECOMMENDATIONS_MESSAGE แทน มีบางรุ่นถูกตัดเพราะยืนยันแหล่งที่มาไม่ได้ (แต่
+    ยังเหลือรุ่นอื่นที่ยืนยันได้อย่างน้อย 1 รุ่น — ดู unverified_count จาก execute_present_recommendations) ต่อท้าย
+    รายการด้วยบรรทัดแจ้งจำนวนที่ถูกตัดออกไป has_open_document: ต่อท้ายด้วย _ADVISOR_REPLACEMENT_OFFER_LINE เสมอถ้า
+    มีใบเสนอราคาเปิดอยู่ (ไม่สนว่าคำถามเอ่ยถึงรายการเดิมหรือไม่ — ต่างจาก _advisor_offer_line เดิมที่ใช้กับคำตอบ
+    ข้อความธรรมดา เพราะตอนนี้มีรายการแนะนำเป็นเลข 1-5 ให้อ้างถึงแล้วจริงๆ)"""
     items = result.get("items") or []
     if not items:
         return _NO_VERIFIED_RECOMMENDATIONS_MESSAGE
@@ -4142,6 +4197,10 @@ def _render_recommendations_answer(result: dict, has_open_document: bool) -> str
 
     for i, item in enumerate(items, start=1):
         lines.append(_render_recommendation_item_line(i, item))
+
+    unverified_count = result.get("unverified_count") or 0
+    if unverified_count > 0:
+        lines.append(f"(ตัดออก {unverified_count} รุ่นที่ยืนยันแหล่งที่มาจากผลค้นหาไม่ได้)")
 
     impacts = result.get("impacts") or []
     if impacts:
@@ -4586,6 +4645,22 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
+        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
+        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้แต่ตีความ
+        # จากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อกคำถามเชิงอ่าน
+        # ด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง _is_document_reading_
+        # question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคยมาถึงจุดนี้เลยสักครั้ง)
+        # dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ "none") จึงปล่อยให้ตกไปเช็ค
+        # reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
+        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
+        if recommendation_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+            answer = recommendation_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
         # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
         # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่ — ส่ง
         # ตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง ห้ามให้
@@ -4619,19 +4694,6 @@ async def ask_question(
 
         if reading_question:
             print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
-
-        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
-        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K") ลอง parse ด้วยโค้ดก่อนเช็คคำสั่งแก้โครงสร้าง
-        # ทั่วไปเสมอ (ไม่ชนกันอยู่แล้ว — คำขึ้นต้น "แทน"/"เพิ่มรุ่นที่" ไม่ตรงรูปแบบ "เปลี่ยน/แก้ X เป็น Y" เลย แต่
-        # จัดลำดับให้ชัดเจนไว้ก่อน)
-        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
-        if recommendation_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
-            answer = recommendation_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
 
         # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
         # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
@@ -8196,42 +8258,19 @@ def _parse_recommendation_price_clause(text: str) -> tuple[Optional[str], Option
     return None, None
 
 
-def _resolve_recommendation_replace_command(
-    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
-) -> Optional[dict]:
-    """parse + apply คำสั่ง "แทนรายการที่ N ด้วยรุ่นที่ K" (หรือ "แทน <ชื่อรายการในตาราง> ด้วยรุ่นที่ K") ทันทีด้วย
-    โค้ดล้วนๆ ไม่ผ่าน LLM เลย (รูปแบบเดียวกับ _parse_direct_structural_commands) คืน {"matched": bool, "message":
-    str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่น/ตกไปที่ agent ต่อ)
+def _apply_recommendation_replace(
+    document_id: int, user_id: int, target: dict, model: dict, table: dict,
+    price_mode: str, price_value: Optional[float], quantity: Optional[float] = None,
+) -> dict:
+    """apply จริงของคำสั่ง "แทนรายการ X ด้วยรุ่นแนะนำ Y" — ใช้ร่วมกันทั้ง _resolve_recommendation_replace_command
+    (parse ด้วย regex "แทนรายการที่ N ด้วยรุ่นที่ K") และ _resolve_recommendation_intent_with_llm (ตีความด้วย LLM
+    เมื่อข้อความไม่ตรงรูปแบบ regex เลย เช่น "แทน ลงในรายการเลย" หลังเพิ่งเลือกรุ่นจาก present_recommendations ใน
+    เทิร์นก่อนหน้า) ไม่ให้ AI เขียนคำตอบ/receipt เองเด็ดขาด — โค้ดประกอบข้อความผลลัพธ์เองเสมอ
 
-    receipt: ราคาเปลี่ยนจริง (ระบุ "ราคา X"/"บวกกำไร P%"/ไม่ระบุแต่รุ่นมี price_thb) -> "✓ แทนรายการที่ N
-    (<เดิม>) ด้วย <ชื่อรุ่น> — ราคา/หน่วย <เดิม> → <ใหม่> (ราคาที่กำหนดเอง)" (ระบุราคาเอง) หรือ "...(ราคาอ้างอิงจาก
-    <โดเมน>)" (ใช้ price_thb ของรุ่น/บวกกำไร) ไม่เปลี่ยนราคาเลย ("ราคาเดิม"/ไม่ระบุราคาและรุ่นไม่มี price_thb) ->
-    "...ด้วย <ชื่อรุ่น> — ราคาเดิม <ราคา> บาท" (ไม่มี "→"/วงเล็บที่มาเลย กันเข้าใจผิดว่าราคาเปลี่ยนไปแล้วทั้งที่
-    ไม่ได้อ้างอิงเว็บอะไรเลย) ต่อท้ายด้วยยอดล่าสุด + คำแนะนำ "ย้อนการแก้" เหมือน apply_update_table_item ปกติ (ใช้
-    apply_update_table_item จริงเบื้องหลัง แค่แทนที่บรรทัดแรกของข้อความผลลัพธ์ด้วย receipt เฉพาะของคำสั่งนี้)"""
-    m = _RECOMMENDATION_REPLACE_RE.match(query.strip())
-    if m is None:
-        return None
-    target_text, model_index_text, price_clause_text = m.groups()
-    model_index = int(model_index_text)
-
-    if not recommendations:
-        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
-    if model_index < 1 or model_index > len(recommendations):
-        return {
-            "matched": False,
-            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
-        }
-
-    target = _resolve_table_target(target_text, table)
-    if target is None:
-        return None  # กำกวม/ไม่เจอรายการในตาราง — ปล่อยให้ agent ตัดสินใจแทน
-
-    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
-    if price_mode is None:
-        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
-
-    model = recommendations[model_index - 1]
+    target: {"item_no":, "description":} ของรายการในตารางที่จะถูกแทน (ดู _resolve_table_target)
+    price_mode/price_value: ผลจาก _parse_recommendation_price_clause ("explicit"/"markup"/"original"/"none")
+    quantity: ไม่ใช่ None และต่างจากจำนวนเดิมในตาราง -> แก้จำนวนไปพร้อมกับการแก้ชื่อ/ราคาในครั้งเดียว (ไม่ใช่แก้
+    แยกสองครั้ง) คืน {"matched": bool, "message": str} เสมอ"""
     fields = {"description": model["name"]}
     if price_mode == "explicit":
         fields["unit_price"] = price_value
@@ -8252,7 +8291,11 @@ def _resolve_recommendation_replace_command(
 
     filled_rows = [r for r in table["rows"] if not r["is_empty"]]
     old_unit_price = filled_rows[target["item_no"] - 1]["values"].get("unit_price")
+    old_qty = filled_rows[target["item_no"] - 1]["values"].get("qty")
     price_changed = "unit_price" in fields
+    qty_changed = quantity is not None and not _cell_values_equal(old_qty, quantity)
+    if qty_changed:
+        fields["qty"] = quantity
 
     result = apply_update_table_item(document_id, user_id, target["item_no"], fields)
     if result.get("matched"):
@@ -8281,39 +8324,20 @@ def _resolve_recommendation_replace_command(
         else:
             price_text = f"{_format_money_value(old_unit_price)} บาท" if old_unit_price is not None else "ไม่ระบุ"
             receipt_line = f"{base_line} — ราคาเดิม {price_text}"
+        if qty_changed:
+            receipt_line += f" — จำนวน {_format_money_value(old_qty)} → {_format_money_value(quantity)}"
         message_lines = result["message"].splitlines()
         message_lines[0] = receipt_line
         result["message"] = "\n".join(message_lines)
     return result
 
 
-def _resolve_recommendation_add_command(
-    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
-) -> Optional[dict]:
-    """parse + apply คำสั่ง "เพิ่มรุ่นที่ K [จำนวน Q] [ราคา X | บวกกำไร P%]" ทันทีด้วยโค้ดล้วนๆ ไม่ผ่าน LLM เลย คืน
-    {"matched": bool, "message": str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย"""
-    m = _RECOMMENDATION_ADD_RE.match(query.strip())
-    if m is None:
-        return None
-    model_index_text, remainder = m.groups()
-    model_index = int(model_index_text)
-
-    if not recommendations:
-        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
-    if model_index < 1 or model_index > len(recommendations):
-        return {
-            "matched": False,
-            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
-        }
-    model = recommendations[model_index - 1]
-
-    qty_match = _RECOMMENDATION_QTY_CLAUSE_RE.search(remainder)
-    qty = float(qty_match.group(1)) if qty_match else 1
-    price_clause_text = _RECOMMENDATION_QTY_CLAUSE_RE.sub("", remainder).strip()
-    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
-    if price_mode is None:
-        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
-
+def _apply_recommendation_add(
+    document_id: int, user_id: int, model: dict, qty: float, price_mode: str, price_value: Optional[float],
+) -> dict:
+    """apply จริงของคำสั่ง "เพิ่มรุ่นแนะนำ Y เป็นรายการใหม่" — ใช้ร่วมกันทั้ง _resolve_recommendation_add_command
+    (parse ด้วย regex "เพิ่มรุ่นที่ K") และ _resolve_recommendation_intent_with_llm คืน {"matched": bool,
+    "message": str} เสมอ"""
     fields = {"description": model["name"], "qty": qty, "unit": model.get("unit") or "ชิ้น"}
     if price_mode == "explicit":
         fields["unit_price"] = price_value
@@ -8339,14 +8363,319 @@ def _resolve_recommendation_add_command(
     return result
 
 
+def _resolve_recommendation_replace_command(
+    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
+) -> Optional[dict]:
+    """parse คำสั่ง "แทนรายการที่ N ด้วยรุ่นที่ K" (หรือ "แทน <ชื่อรายการในตาราง> ด้วยรุ่นที่ K") ด้วยโค้ดล้วนๆ ไม่
+    ผ่าน LLM เลย (รูปแบบเดียวกับ _parse_direct_structural_commands) แล้ว apply ทันทีผ่าน
+    _apply_recommendation_replace คืน {"matched": bool, "message": str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้
+    เลย (ปล่อยให้ ask_question() ตรวจทางอื่น/ตกไปที่ _resolve_recommendation_intent_with_llm ต่อ)"""
+    m = _RECOMMENDATION_REPLACE_RE.match(query.strip())
+    if m is None:
+        return None
+    target_text, model_index_text, price_clause_text = m.groups()
+    model_index = int(model_index_text)
+
+    if not recommendations:
+        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
+    if model_index < 1 or model_index > len(recommendations):
+        return {
+            "matched": False,
+            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
+        }
+
+    target = _resolve_table_target(target_text, table)
+    if target is None:
+        return None  # กำกวม/ไม่เจอรายการในตาราง — ปล่อยให้ agent ตัดสินใจแทน
+
+    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
+    if price_mode is None:
+        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
+
+    model = recommendations[model_index - 1]
+    return _apply_recommendation_replace(document_id, user_id, target, model, table, price_mode, price_value)
+
+
+def _resolve_recommendation_add_command(
+    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict,
+) -> Optional[dict]:
+    """parse คำสั่ง "เพิ่มรุ่นที่ K [จำนวน Q] [ราคา X | บวกกำไร P%]" ด้วยโค้ดล้วนๆ ไม่ผ่าน LLM เลย แล้ว apply ทันที
+    ผ่าน _apply_recommendation_add คืน {"matched": bool, "message": str} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้
+    เลย"""
+    m = _RECOMMENDATION_ADD_RE.match(query.strip())
+    if m is None:
+        return None
+    model_index_text, remainder = m.groups()
+    model_index = int(model_index_text)
+
+    if not recommendations:
+        return {"matched": False, "message": "ยังไม่มีรายการแนะนำในแชทนี้ ลองถามให้แนะนำสินค้าก่อนครับ"}
+    if model_index < 1 or model_index > len(recommendations):
+        return {
+            "matched": False,
+            "message": f"มีรุ่นแนะนำแค่ {len(recommendations)} รุ่น (รุ่นที่ 1-{len(recommendations)}) ครับ",
+        }
+    model = recommendations[model_index - 1]
+
+    qty_match = _RECOMMENDATION_QTY_CLAUSE_RE.search(remainder)
+    qty = float(qty_match.group(1)) if qty_match else 1
+    price_clause_text = _RECOMMENDATION_QTY_CLAUSE_RE.sub("", remainder).strip()
+    price_mode, price_value = _parse_recommendation_price_clause(price_clause_text)
+    if price_mode is None:
+        return None  # มีข้อความต่อท้ายแต่ parse ไม่ได้เลย กำกวมเกินจะเดา
+
+    return _apply_recommendation_add(document_id, user_id, model, qty, price_mode, price_value)
+
+
+# คำกริยาที่บ่งบอกว่าข้อความนี้ "อาจจะ" เป็นคำสั่งเชื่อมรายการแนะนำเข้าเอกสาร แต่ไม่ตรงรูปแบบ regex ของ
+# _resolve_recommendation_replace_command/_resolve_recommendation_add_command เป๊ะ (เช่น "แทน ลงในรายการเลย" หลัง
+# เพิ่งเลือกรุ่นจาก present_recommendations ในเทิร์นก่อนหน้า — เหตุการณ์จริงที่แก้: ระบบตอบ "ไม่มีข้อมูลการสนทนาที่
+# ผ่านมา" เพราะ regex รับแค่ "แทน...ด้วยรุ่นที่ N" เท่านั้น) ใช้เป็นด่านกรองก่อนเรียก LLM เสมอ (ดู
+# _resolve_recommendation_intent_with_llm) กันเรียก LLM ทุกข้อความที่มีรายการแนะนำอยู่ในแชทโดยไม่จำเป็น
+_RECOMMENDATION_INTENT_VERBS = ("แทน", "เปลี่ยน", "ใส่", "ลง", "เพิ่ม", "เอา", "ใช้", "อัปเดต", "อัพเดท")
+
+
+def _normalize_recommendation_intent_text(query: str) -> str:
+    """normalize "เเ" (สระเอ+สระเอ พิมพ์ผิดคีย์บอร์ดที่พบบ่อย) เป็น "แ" (สระแอตัวเดียวที่ถูกต้อง) ก่อนเช็คคำกริยา —
+    เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์ "เเทน" (ขึ้นต้นด้วยสระเอซ้ำ) ไม่ตรงกับคำว่า "แทน" ใน
+    _RECOMMENDATION_INTENT_VERBS เป๊ะเลย ทั้งที่เจตนาเดียวกัน"""
+    return query.replace("เเ", "แ")
+
+
+def _query_has_recommendation_intent_verb(query: str) -> bool:
+    normalized = _normalize_recommendation_intent_text(query)
+    return any(verb in normalized for verb in _RECOMMENDATION_INTENT_VERBS)
+
+
+# เครื่องมือเดียวที่ _resolve_recommendation_intent_with_llm ใช้ตีความคำสั่งเชื่อมรายการแนะนำเข้าเอกสารที่ regex
+# จับไม่ได้ — บังคับให้ LLM ส่งข้อมูลเป็น JSON โครงสร้างแน่นอนเสมอ (เหมือน PRESENT_RECOMMENDATIONS_TOOL) แล้วให้
+# โค้ดเป็นคนตรวจทุกค่า + apply จริง ไม่ให้ LLM เขียนคำตอบ/แก้ไฟล์เอง
+RESOLVE_RECOMMENDATION_ACTION_TOOL = {
+    "name": "resolve_recommendation_action",
+    "description": (
+        "ตีความว่าข้อความล่าสุดของผู้ใช้ต้องการแทนที่/เพิ่มรายการในตารางใบเสนอราคาด้วยรุ่นแนะนำรุ่นไหน จากบริบท"
+        "การสนทนาที่ผ่านมา ต้องเรียกเครื่องมือนี้เสมอ ห้ามเขียนคำตอบเป็นข้อความเองเด็ดขาด"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["replace", "add", "ask", "none"],
+                "description": (
+                    "replace = แทนรายการเดิมในตารางด้วยรุ่นแนะนำ, add = เพิ่มรายการใหม่ในตาราง, ask = กำกวมเกินจะ"
+                    "ตัดสินใจเอง (เช่นมีอุปกรณ์ประเภทเดียวกันหลายรายการในตาราง ไม่รู้ว่าหมายถึงรายการไหน) ต้องถาม"
+                    "ผู้ใช้กลับด้วยคำถามเฉพาะเจาะจงใน question, none = ข้อความนี้ไม่ใช่คำสั่งแก้ไฟล์เลย"
+                ),
+            },
+            "target_item_index": {
+                "type": ["integer", "null"],
+                "description": "ลำดับรายการในตารางปัจจุบัน (1-indexed) ที่จะถูกแทน ใช้เมื่อ action เป็น replace เท่านั้น ไม่งั้นใส่ null",
+            },
+            "recommendation_index": {
+                "type": ["integer", "null"],
+                "description": "ลำดับรุ่นแนะนำ (1-indexed) ที่ผู้ใช้เลือก ใช้เมื่อ action เป็น replace/add เท่านั้น ไม่งั้นใส่ null",
+            },
+            "quantity": {
+                "type": ["integer", "null"],
+                "description": (
+                    "จำนวนที่ผู้ใช้ต้องการ ดูจากสิ่งที่พูดไว้ในประวัติสนทนา (เช่น 'อยากได้ 16tb 2 ตัว') ถ้าไม่เคย"
+                    "พูดถึงจำนวนเลยในบทสนทนา ใส่ null (replace: คงจำนวนเดิมในตาราง, add: ใช้ 1 เป็นค่าเริ่มต้น)"
+                ),
+            },
+            "price_mode": {
+                "type": "string",
+                "enum": ["recommended", "original", "explicit", "markup"],
+                "description": (
+                    "recommended = ใช้ราคาของรุ่นแนะนำตรงๆ (ค่าเริ่มต้นถ้าไม่ได้พูดถึงราคาเลย), original = คงราคา"
+                    "เดิมในตาราง (เฉพาะ replace เท่านั้น), explicit = ใช้ explicit_price ที่ผู้ใช้ระบุเอง, "
+                    "markup = บวกกำไร markup_percent% จากราคารุ่นแนะนำ"
+                ),
+            },
+            "explicit_price": {
+                "type": ["number", "null"],
+                "description": "ราคา/หน่วยที่ผู้ใช้ระบุเอง (บาท) ใช้เมื่อ price_mode เป็น explicit เท่านั้น ไม่งั้นใส่ null",
+            },
+            "markup_percent": {
+                "type": ["number", "null"],
+                "description": "เปอร์เซ็นต์กำไรที่จะบวกจากราคารุ่นแนะนำ ใช้เมื่อ price_mode เป็น markup เท่านั้น ไม่งั้นใส่ null",
+            },
+            "question": {
+                "type": ["string", "null"],
+                "description": "คำถามเฉพาะเจาะจงที่จะถามกลับผู้ใช้ ใช้เมื่อ action เป็น ask เท่านั้น ไม่งั้นใส่ null",
+            },
+        },
+        "required": [
+            "action", "target_item_index", "recommendation_index", "quantity",
+            "price_mode", "explicit_price", "markup_percent", "question",
+        ],
+    },
+}
+
+_RECOMMENDATION_INTENT_SYSTEM_PROMPT = (
+    "คุณช่วยตีความว่าข้อความล่าสุดของผู้ใช้ต้องการแทนที่/เพิ่มรายการในตารางใบเสนอราคาด้วยรุ่นแนะนำรุ่นไหน จากตาราง"
+    "รายการปัจจุบัน, รายการแนะนำล่าสุด, และประวัติการสนทนาที่ให้มา คำว่า \"แทน\"/\"เปลี่ยน\"/\"ใส่ลงรายการ\" โดยไม่"
+    "ระบุเป้าหมายชัดเจน หมายถึงแทนรายการในตารางที่เป็นอุปกรณ์ประเภทเดียวกับรุ่นแนะนำที่เพิ่งพูดคุยกันล่าสุด "
+    "จำนวนใช้ตามที่ผู้ใช้เคยพูดไว้ในประวัติสนทนา (เช่น \"อยากได้ 2 ตัว\") ถ้าไม่เคยพูดถึงจำนวนเลยให้ใส่ quantity "
+    "เป็น null (คงจำนวนเดิม) ถ้าสถานการณ์กำกวมจริงๆ (เช่นมีอุปกรณ์ประเภทเดียวกันในตารางมากกว่า 1 รายการ ไม่รู้ว่า"
+    "ผู้ใช้หมายถึงรายการไหน) ให้ตอบ action \"ask\" พร้อมคำถามเฉพาะเจาะจงที่ช่วยให้ผู้ใช้ตอบกลับมาได้ง่าย ถ้าข้อความ"
+    "นี้ไม่ใช่คำสั่งแก้ไฟล์เลย (เช่น คำถามทั่วไป) ให้ตอบ action \"none\" เรียกเครื่องมือ resolve_recommendation_"
+    "action เสมอ ห้ามเขียนคำตอบเป็นข้อความเองเด็ดขาด"
+)
+
+
+def _resolve_recommendation_intent_price(
+    price_mode_raw, explicit_price, markup_percent,
+) -> tuple[Optional[str], Optional[float]]:
+    """แปลง price_mode ที่ LLM ตอบมา (recommended/original/explicit/markup — ดู RESOLVE_RECOMMENDATION_ACTION_TOOL)
+    เป็น (mode, value) แบบเดียวกับที่ _parse_recommendation_price_clause คืน ("none"/"original"/"explicit"/
+    "markup") เพื่อส่งต่อให้ _apply_recommendation_replace/_apply_recommendation_add ใช้ logic เดียวกับเส้นทาง
+    regex เป๊ะ คืน (None, None) ถ้าค่าที่ LLM ตอบมาไม่สมเหตุสมผล (explicit ไม่มีราคา/ราคา<=0, markup ไม่มีตัวเลข)"""
+    if price_mode_raw == "recommended":
+        return "none", None
+    if price_mode_raw == "original":
+        return "original", None
+    if price_mode_raw == "explicit":
+        if not isinstance(explicit_price, (int, float)) or isinstance(explicit_price, bool) or explicit_price <= 0:
+            return None, None
+        return "explicit", float(explicit_price)
+    if price_mode_raw == "markup":
+        if not isinstance(markup_percent, (int, float)) or isinstance(markup_percent, bool):
+            return None, None
+        return "markup", float(markup_percent)
+    return None, None
+
+
+def _resolve_recommendation_intent_with_llm(
+    query: str, document_id: int, user_id: int, recommendations: list[dict], table: dict, chat_id: int,
+) -> Optional[dict]:
+    """ตีความคำสั่งแทน/เพิ่มรุ่นแนะนำที่ไม่ตรงรูปแบบ regex ของ _resolve_recommendation_replace_command/
+    _resolve_recommendation_add_command เลย (เหตุการณ์จริงที่แก้: แนะนำ HDD -> "อยากได้ 16tb 2 ตัว" -> "เอารุ่นนี้
+    แหละ" -> "แทน ลงในรายการเลย" ตอบว่าคำสั่งไม่ชัดเจน เพราะ regex รับแค่ "แทน...ด้วยรุ่นที่ N" เท่านั้น) ด้วย LLM
+    (model=ADVISOR_MODEL, บังคับเรียก tool resolve_recommendation_action เสมอ) ส่งตารางรายการปัจจุบัน + รายการ
+    แนะนำล่าสุด + ประวัติแชทล่าสุด 6 ข้อความ (ตัดข้อความละไม่เกิน 600 ตัวอักษร) + ข้อความผู้ใช้ให้ตีความ แล้ว apply
+    จริงด้วยโค้ด (ผ่าน _apply_recommendation_replace/_apply_recommendation_add เดียวกับเส้นทาง regex เป๊ะ ไม่ให้
+    LLM เขียนคำตอบเอง) ตรวจทุกค่าที่ LLM คืนมาก่อนใช้งานจริงเสมอ (index อยู่ในช่วงจริง, replace ต้องมีทั้ง target
+    และ recommendation, quantity > 0, ราคา > 0) ไม่ผ่าน -> ไม่แก้ไฟล์ คืน None ปล่อยให้ routing เดิมทำงานต่อ
+
+    คืน {"matched": bool, "message": str} เสมอ ยกเว้น action เป็น "none"/ไม่รู้จัก, LLM call ล้ม/parse ไม่ได้,
+    หรือค่าที่ตรวจแล้วไม่ผ่าน -> คืน None"""
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+    table_lines = [
+        f"{i}. {row['values'].get('description')} — จำนวน {row['values'].get('qty')} "
+        f"{row['values'].get('unit') or ''} — ราคา/หน่วย {row['values'].get('unit_price')}"
+        for i, row in enumerate(filled_rows, start=1)
+    ]
+    recommendation_lines = [
+        f"{i}. {rec.get('name')} — {rec.get('price_thb')} บาท/{rec.get('unit') or 'ชิ้น'}"
+        for i, rec in enumerate(recommendations, start=1)
+    ]
+    recent_history = get_chat_messages(chat_id)[-6:]
+    history_lines = [f"{m['role']}: {(m['content'] or '')[:600]}" for m in recent_history]
+
+    prompt = (
+        "ตารางรายการปัจจุบันในใบเสนอราคา:\n" + "\n".join(table_lines) + "\n\n"
+        "รายการแนะนำล่าสุด:\n" + "\n".join(recommendation_lines) + "\n\n"
+        "ประวัติการสนทนาล่าสุด:\n" + "\n".join(history_lines) + "\n\n"
+        f"ข้อความล่าสุดจากผู้ใช้: {query}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=ADVISOR_MODEL,
+            max_tokens=1000,
+            system=_RECOMMENDATION_INTENT_SYSTEM_PROMPT,
+            tools=[RESOLVE_RECOMMENDATION_ACTION_TOOL],
+            tool_choice={"type": "tool", "name": "resolve_recommendation_action"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        print(f"[RecommendationResolver] llm_call_failed exception_type={type(e).__name__}")
+        return None
+
+    tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_use_block is None:
+        return None
+    parsed = tool_use_block.input
+    action = parsed.get("action")
+    target_item_index = parsed.get("target_item_index")
+    recommendation_index = parsed.get("recommendation_index")
+    quantity = parsed.get("quantity")
+    price_mode_raw = parsed.get("price_mode")
+    explicit_price = parsed.get("explicit_price")
+    markup_percent = parsed.get("markup_percent")
+    question = parsed.get("question")
+
+    print(
+        f"[Route] chat={chat_id} branch=recommendation_resolver action={action} "
+        f"target={target_item_index} rec={recommendation_index}"
+    )
+
+    if action == "ask":
+        if not isinstance(question, str) or not question.strip():
+            return None
+        safe_question = question.strip()
+        if _looks_like_fabricated_edit_claim(safe_question):
+            safe_question = "ต้องการแทน/เพิ่มรายการไหนในตารางด้วยรุ่นที่แนะนำครับ ระบุให้ชัดเจนอีกนิดได้ไหมครับ"
+        return {"matched": True, "message": safe_question}
+
+    if action not in ("replace", "add"):
+        return None  # "none" หรือค่าอื่นที่ไม่รู้จัก -> ไม่ใช่เจตนาแก้ไฟล์เลย ปล่อยให้ routing เดิมทำงานต่อ
+
+    # จากจุดนี้ไป action เป็น replace/add แน่นอนแล้ว (LLM "ตั้งใจ" จะแก้ไฟล์) — ค่าที่ตรวจไม่ผ่านด้านล่างทั้งหมดถือ
+    # เป็นแค่รายละเอียดไม่ครบ/ไม่สมเหตุสมผล ไม่ใช่กำกวมจนไม่รู้เจตนาแบบ action "ask" ตอบข้อความชี้แจงจากโค้ดเสมอ
+    # (ไม่แก้ไฟล์ แต่ไม่ปล่อยให้ตกไปทาง routing อื่นเงียบๆ จนผู้ใช้งงว่าทำไมไม่มีอะไรเกิดขึ้น)
+    if (
+        not isinstance(recommendation_index, int) or isinstance(recommendation_index, bool)
+        or recommendation_index < 1 or recommendation_index > len(recommendations)
+    ):
+        return {
+            "matched": False,
+            "message": f"ไม่พบรุ่นแนะนำที่ระบุ (มีรุ่นแนะนำทั้งหมด {len(recommendations)} รุ่น) กรุณาระบุรุ่นให้ชัดเจนขึ้นครับ",
+        }
+    model = recommendations[recommendation_index - 1]
+
+    price_mode, price_value = _resolve_recommendation_intent_price(price_mode_raw, explicit_price, markup_percent)
+    if price_mode is None:
+        return {"matched": False, "message": "ไม่เข้าใจราคาที่ต้องการระบุ กรุณาระบุราคาหรือเปอร์เซ็นต์กำไรให้ชัดเจนครับ"}
+
+    if quantity is not None and (
+        not isinstance(quantity, (int, float)) or isinstance(quantity, bool) or quantity <= 0
+    ):
+        return {"matched": False, "message": "จำนวนที่ระบุไม่ถูกต้อง กรุณาระบุจำนวนที่มากกว่า 0 ครับ"}
+
+    if action == "replace":
+        if (
+            not isinstance(target_item_index, int) or isinstance(target_item_index, bool)
+            or target_item_index < 1 or target_item_index > len(filled_rows)
+        ):
+            return {
+                "matched": False,
+                "message": f"ไม่พบรายการที่ระบุในตาราง (มีทั้งหมด {len(filled_rows)} รายการ) กรุณาระบุรายการให้ชัดเจนขึ้นครับ",
+            }
+        target = {
+            "item_no": target_item_index,
+            "description": filled_rows[target_item_index - 1]["values"].get("description"),
+        }
+        return _apply_recommendation_replace(
+            document_id, user_id, target, model, table, price_mode, price_value, quantity=quantity,
+        )
+
+    return _apply_recommendation_add(
+        document_id, user_id, model, quantity if quantity is not None else 1, price_mode, price_value,
+    )
+
+
 def _resolve_recommendation_command_dispatch(
     query: str, active_docs: list[dict], chat_id: int, user_id: int,
 ) -> Optional[dict]:
     """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบ
     เสนอราคาที่เปิดอยู่ได้ไหม ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — ดู
     _resolve_recommendation_replace_command/_resolve_recommendation_add_command) แล้ว apply ทันทีถ้าใช่ — ไม่ต้อง
-    พึ่ง LLM เลยสักครั้ง (เหมือน _resolve_direct_structural_dispatch) คืน {"document_id":, "answer":} หรือ None ถ้า
-    ข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    พึ่ง LLM เลยสักครั้ง (เหมือน _resolve_direct_structural_dispatch) ถ้า regex ทั้งสองคืน None แต่มีรายการแนะนำอยู่
+    ในแชทจริงและข้อความมีคำกริยาที่น่าจะเป็นเจตนานี้ (ดู _query_has_recommendation_intent_verb) ลองให้ LLM ตีความ
+    จากบริบทแทน (ดู _resolve_recommendation_intent_with_llm) คืน {"document_id":, "answer":} หรือ None ถ้าข้อความ
+    นี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
     focus_doc = get_chat_document_focus(chat_id, user_id)
     target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
     if target_doc is None:
@@ -8362,6 +8691,10 @@ def _resolve_recommendation_command_dispatch(
     result = _resolve_recommendation_replace_command(query, target_doc["id"], user_id, recommendations, table)
     if result is None:
         result = _resolve_recommendation_add_command(query, target_doc["id"], user_id, recommendations, table)
+    if result is None and recommendations and _query_has_recommendation_intent_verb(query):
+        result = _resolve_recommendation_intent_with_llm(
+            query, target_doc["id"], user_id, recommendations, table, chat_id,
+        )
     if result is None:
         return None
     return {"document_id": target_doc["id"], "answer": result["message"]}

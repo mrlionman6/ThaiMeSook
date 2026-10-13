@@ -1622,6 +1622,224 @@ def test_recommendation_command_dispatch_returns_none_for_unrelated_query(ns, bo
     assert ns["_resolve_recommendation_command_dispatch"]("แนะนำ Rack case server 12U", [box_doc], 1, 1) is None
 
 
+# ---------- feat/contextual-recommendation-edit: ตีความคำสั่งแทน/เพิ่มรุ่นแนะนำจากบริบทด้วย LLM เมื่อ regex
+# จับไม่ได้ (box_doc รายการที่ 6 = "Item F" จำนวน 4 ราคา 25 — ดู _BOX_ITEMS ด้านบน) ----------
+
+def test_recommendation_intent_llm_resolves_replace_with_quantity_from_chat_history(ns, box_doc):
+    """เหตุการณ์จริงที่แก้: แนะนำ HDD -> "อยากได้ 16tb 2 ตัว" -> "เอารุ่นนี้แหละ" (recs เหลือ 1 รุ่น) ->
+    "เเทน ลงในรายการเลย" (สระเอซ้ำ+เว้นวรรค) เคยตอบว่าคำสั่งไม่ชัดเจน/ไม่มีข้อมูลการสนทนาที่ผ่านมา เพราะ regex รับ
+    แค่ "แทน...ด้วยรุ่นที่ N" เท่านั้น -> ต้องตกไปให้ LLM ตีความจากบริบท (ตาราง+รายการแนะนำ+ประวัติแชท) แทน"""
+    ns["set_chat_last_recommendations"](1, [{
+        "name": "Seagate SkyHawk AI 16TB", "key_specs": "7200RPM เขียนอ่านต่อเนื่อง", "price_thb": 19500,
+        "price_note": None, "unit": "ตัว", "source_url": "https://shop.example/skyhawk", "compatible": True,
+        "compatibility_note": None,
+    }])
+    ns["_fake_db"].chat_messages[1] = [
+        {"role": "user", "content": "แนะนำฮาร์ดดิสก์กล้องวงจรปิดให้หน่อย"},
+        {"role": "assistant", "content": "ต้องการความจุเท่าไรครับ"},
+        {"role": "user", "content": "อยากได้ 16tb 2 ตัว"},
+        {"role": "assistant", "content": "แนะนำ Seagate SkyHawk AI 16TB ราคา 19,500 บาท/ตัวครับ"},
+    ]
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "replace", "target_item_index": 6, "recommendation_index": 1, "quantity": 2,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    result = ns["_resolve_recommendation_command_dispatch"]("เเทน ลงในรายการเลย", [box_doc], 1, 1)
+    assert result is not None
+    answer = result["answer"]
+    assert "✓ แทนรายการที่ 6 (Item F) ด้วย Seagate SkyHawk AI 16TB" in answer
+    assert "ราคา/หน่วย 25 → 19,500 (ราคาอ้างอิงจาก shop.example)" in answer
+    assert "จำนวน 4 → 2" in answer
+
+    row = _current(ns)["tables"][0]["rows"][5]["values"]
+    assert row["description"] == "Seagate SkyHawk AI 16TB"
+    assert row["unit_price"] == 19500
+    assert row["qty"] == 2
+
+    new_amount = 2 * 19500
+    expected_total = _BOX_TOTAL - 100 + new_amount  # 100 = amount เดิมของ Item F (4*25) ก่อนแก้
+    expected_vat = round(expected_total * 0.07, 2)
+    expected_grand = expected_total + expected_vat
+    totals_by_label = {l["label"]: l["value"] for l in _current(ns)["labels"]}
+    assert totals_by_label["รวมเงิน"] == expected_total
+    assert totals_by_label["ภาษีมูลค่าเพิ่ม 7%"] == expected_vat
+    assert totals_by_label["รวมราคาทั้งสิ้น"] == expected_grand
+
+    assert ns["_fake_client"].call_count == 1
+    assert ns["_fake_client"].last_call_kwargs["tool_choice"] == {"type": "tool", "name": "resolve_recommendation_action"}
+    assert ns["_fake_client"].last_call_kwargs["model"] == ns["ADVISOR_MODEL"]
+
+
+def test_recommendation_intent_llm_out_of_range_target_index_does_not_edit(ns, box_doc):
+    """index เกินช่วง -> ไม่แก้ไฟล์ แต่ยังต้องได้คำตอบชี้แจงจากโค้ด ไม่ใช่ปล่อยให้ตกไป routing อื่นเงียบๆ (action
+    "ask" เท่านั้นที่เป็นกรณีกำกวมจริงๆ — นี่คือ LLM ตั้งใจแก้แต่ส่งเลขมาไม่ตรงช่วง)"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "replace", "target_item_index": 99, "recommendation_index": 1, "quantity": None,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+    result = ns["_resolve_recommendation_command_dispatch"]("แทน ลงในรายการเลย", [box_doc], 1, 1)
+    assert result is not None
+    assert "ไม่พบรายการที่ระบุในตาราง" in result["answer"]
+    row = _current(ns)["tables"][0]["rows"][5]["values"]
+    assert row["description"] == "Item F"  # ไม่ถูกแก้เลย
+
+
+def test_recommendation_intent_llm_action_none_returns_none(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "none", "target_item_index": None, "recommendation_index": None, "quantity": None,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+    assert ns["_resolve_recommendation_command_dispatch"]("ใช้งานยังไงเหรอ", [box_doc], 1, 1) is None
+
+
+def test_recommendation_intent_llm_action_ask_returns_question_without_editing(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "ask", "target_item_index": None, "recommendation_index": None, "quantity": None,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None,
+                "question": "มีรายการที่อาจเป็นไปได้หลายรายการ ต้องการแทนรายการไหนครับ",
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+    result = ns["_resolve_recommendation_command_dispatch"]("เอารุ่นนี้แทนไปเลย", [box_doc], 1, 1)
+    assert result is not None
+    assert result["answer"] == "มีรายการที่อาจเป็นไปได้หลายรายการ ต้องการแทนรายการไหนครับ"
+    row = _current(ns)["tables"][0]["rows"][5]["values"]
+    assert row["description"] == "Item F"  # ไม่ถูกแก้เลย
+
+
+def test_recommendation_regex_match_does_not_call_llm(ns, box_doc):
+    """คำสั่งที่ตรงรูปแบบ regex เดิมเป๊ะ ("แทนรายการที่ N ด้วยรุ่นที่ K ...") ต้องทำงานโดยไม่เรียก LLM เลย"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"](
+        "แทนรายการที่ 5 ด้วยรุ่นที่ 1 บวกกำไร 20%", [box_doc], 1, 1,
+    )
+    assert result is not None
+    assert ns["_fake_client"].call_count == 0
+
+
+def test_recommendation_intent_llm_not_called_without_recommendations(ns, box_doc):
+    """ไม่มีรายการแนะนำในแชทนี้เลย (get_chat_last_recommendations ว่างเปล่า) ต้องไม่เรียก LLM แม้ข้อความจะมีคำกริยา
+    ที่น่าจะเป็นเจตนาเชื่อมรายการแนะนำก็ตาม"""
+    assert ns["_resolve_recommendation_command_dispatch"]("แทน ลงในรายการเลย", [box_doc], 1, 1) is None
+    assert ns["_fake_client"].call_count == 0
+
+
+def test_sanitize_recommendation_text_strips_cite_tags_quotes_and_trailing_artifacts(ns):
+    sanitize = ns["_sanitize_recommendation_text"]
+    assert sanitize('<cite index="3-4">ข้อความ</cite>') == "ข้อความ"
+    assert sanitize('ราคา 19,500 บาท"}') == "ราคา 19,500 บาท"
+    assert sanitize('สเปก 7200RPM">') == "สเปก 7200RPM"
+    assert sanitize("มี   ช่องว่าง\n\nซ้ำ") == "มี ช่องว่าง ซ้ำ"
+    assert sanitize(None) is None
+    assert sanitize(123) == 123
+
+
+def test_execute_present_recommendations_sanitizes_fields_and_reports_unverified_count(ns):
+    verified_urls = {"https://shop.example/a"}
+    tool_input = {
+        "criteria": ["ความจุ", "ราคา"],
+        "items": [
+            {
+                "name": '<cite index="1-1">SkyHawk 16TB</cite>', "key_specs": "7200RPM", "price_thb": 19500,
+                "price_note": None, "unit": "ตัว", "source_url": "https://shop.example/a", "compatible": True,
+                "compatibility_note": None,
+            },
+            {
+                "name": "รุ่นที่ยืนยันแหล่งที่มาไม่ได้", "key_specs": "สเปก", "price_thb": 1000, "price_note": None,
+                "unit": "ชิ้น", "source_url": "https://unverified.example", "compatible": True,
+                "compatibility_note": None,
+            },
+        ],
+        "impacts": [], "summary": "สรุป",
+    }
+    result = ns["execute_present_recommendations"](tool_input, chat_id=1, verified_urls=verified_urls)
+    assert len(result["items"]) == 1
+    assert result["items"][0]["name"] == "SkyHawk 16TB"
+    assert result["unverified_count"] == 1
+
+    answer = ns["_render_recommendations_answer"](result, False)
+    assert "(ตัดออก 1 รุ่นที่ยืนยันแหล่งที่มาจากผลค้นหาไม่ได้)" in answer
+
+
+def test_answer_document_reading_question_sends_chat_history(ns, doc1):
+    ns["_fake_db"].chat_messages[1] = [
+        {"role": "user", "content": "สวัสดีครับ"},
+        {"role": "assistant", "content": "สวัสดีครับ มีอะไรให้ช่วยไหมครับ"},
+    ]
+    ns["_answer_document_reading_question"]("มีรายการอะไรบ้าง", [doc1], 1, 1)
+    sent_messages = ns["_fake_client"].last_call_kwargs["messages"]
+    assert sent_messages[0] == {"role": "user", "content": "สวัสดีครับ"}
+    assert sent_messages[1] == {"role": "assistant", "content": "สวัสดีครับ มีอะไรให้ช่วยไหมครับ"}
+    assert sent_messages[-1]["role"] == "user"
+    assert "ตารางรายการ" in sent_messages[-1]["content"]
+
+
+def test_is_document_reading_question_treats_replace_command_as_edit_not_reading(ns):
+    """เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" (สระเอซ้ำ) มีคำว่า "รายการ" (_DOCUMENT_REFERENCE_KEYWORDS) แต่เดิม
+    _DOCUMENT_EDIT_COMMAND_WORDS ไม่มี "แทน" และไม่ normalize "เเ"→"แ" ก่อนเช็ค ทำให้ถูกตีความเป็นคำถามเชิงอ่านไฟล์
+    ผิดๆ ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ (ทำให้ไปไม่ถึง _resolve_recommendation_command_dispatch เลยสักครั้ง)"""
+    assert ns["_is_document_reading_question"]("เเทน ลงในรายการเลย") is False
+    assert ns["_is_document_reading_question"]("แทนลงในรายการเลย") is False
+    # ยังต้องไม่กระทบคำถามเชิงอ่านไฟล์จริงๆ เลย
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+    assert ns["_is_document_reading_question"]("ยอดรวมทั้งสิ้นเท่าไร") is True
+
+
+def test_recommendation_dispatch_checked_before_document_reading_in_routing_order(ns, box_doc):
+    """จำลองลำดับการตัดสินใจจริงใน ask_question() (ย้าย _resolve_recommendation_command_dispatch ไปเช็คก่อนบล็อก
+    reading_question/document_content_question แล้ว) ด้วยการเรียกฟังก์ชันตัดสินใจทั้งสองตัวตรงๆ ตามลำดับเดียวกัน
+    โดยไม่ต้องพึ่ง FastAPI/Request จริงเลย (เหมือนการทดสอบ _resolve_direct_structural_dispatch): "เเทน ลงในรายการ
+    เลย" ต้องถูก recommendation dispatch จัดการจบก่อนเลย (ask_question() จะ return ทันทีที่จุดนี้ ไม่มีทางไปถึง
+    _is_document_reading_question อีกต่อไป) ส่วน "มีรายการอะไรบ้าง" ต้องตกไปที่ document_reading เหมือนเดิมทุก
+    ประการ (dispatch คืน None เพราะไม่มีคำกริยาที่เกี่ยวข้องเลย)"""
+    ns["set_chat_last_recommendations"](1, [{
+        "name": "Seagate SkyHawk AI 16TB", "key_specs": "7200RPM", "price_thb": 19500, "price_note": None,
+        "unit": "ตัว", "source_url": "https://shop.example/skyhawk", "compatible": True,
+        "compatibility_note": None,
+    }])
+    ns["_fake_db"].chat_messages[1] = [{"role": "user", "content": "อยากได้ 16tb 2 ตัว"}]
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "replace", "target_item_index": 6, "recommendation_index": 1, "quantity": 2,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+
+    # ----- ลำดับที่ 1 ใน ask_question(): recommendation dispatch เช็คก่อนเสมอตอนนี้ -----
+    replace_dispatch = ns["_resolve_recommendation_command_dispatch"]("เเทน ลงในรายการเลย", [box_doc], 1, 1)
+    assert replace_dispatch is not None  # จัดการจบแล้ว — ask_question() return ตรงนี้เลย ไม่เช็ค reading_question ต่อ
+
+    # ----- คำถามอ่านข้อมูลธรรมดา ต้องยังตกไป document_reading เหมือนเดิม (dispatch คืน None ก่อนเสมอ) -----
+    reading_dispatch = ns["_resolve_recommendation_command_dispatch"]("มีรายการอะไรบ้าง", [box_doc], 1, 1)
+    assert reading_dispatch is None
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+
+
 # ---------- feat/advisor-route: ส่งตารางรายการเป็น context + เกณฑ์เปรียบเทียบ/ผลกระทบ/หน่วยขาย ----------
 # ต้องเป็นกติกาทั่วไปที่ใช้ได้กับสินค้า "ทุกประเภท" ไม่ hardcode ตามสินค้าใดสินค้าหนึ่ง — ทดสอบด้วย 3 ประเภทสินค้า
 # ที่ต่างกันมาก (กล้องวงจรปิด/ฮาร์ดดิสก์/สายสัญญาณ) ยืนยันว่า system prompt มีตารางรายการจริง + คำสั่งเรื่องเกณฑ์
