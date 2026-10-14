@@ -2863,3 +2863,95 @@ def test_build_library_search_card_recalculates_uncached_total_with_pycel(ns, ca
     assert card["total_amount"] == _BOX_GRAND_7
     captured = capsys.readouterr()
     assert "total_unreadable" not in captured.out
+
+
+# ---------- feat/llm-intent-router ต่อ: router ต้องไม่โดนด่านคำสำคัญเดิมดักไปก่อนตัวเองอีกต่อไป ----------
+# บั๊กที่แก้: reading_question/document_content_question เคยเช็คก่อน router เสมอ -> "แนะนำตู้ Rack ที่ดีกว่าใน
+# ใบเสนอราคา"/"แนะนำ HDD ที่ดีกว่ารายการที่ 6" มีคำว่า "ใบเสนอราคา"/"รายการ" ไปตอบเป็น document_reading ก่อน
+# ถึง router เลย และ _resolve_recommendation_command_dispatch เคยเรียก _resolve_recommendation_intent_with_llm
+# (ของ #36) ก่อน router เสมอ ทำให้ข้อความที่มีคำกริยา (เอา/แทน/ใส่/...) เรียก LLM 2 ครั้ง
+
+def test_is_reading_type_question_true_for_recommend_products_query_with_reading_keyword(ns, box_doc):
+    """ยืนยันสมมติฐานของบั๊ก: "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา" มีคำว่า "ใบเสนอราคา" (อยู่ใน
+    _DOCUMENT_REFERENCE_KEYWORDS) ทำให้ _is_reading_type_question ตีความเป็นคำถามเชิงอ่านได้ (ด่านนี้จึงต้องเช็ค
+    หลัง router เสมอตอน ROUTER_MODE == "llm" ไม่งั้นจะดักคำขอแนะนำสินค้าแบบนี้ไปตอบผิดทางก่อนถึง router)"""
+    assert ns["_is_reading_type_question"]("แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา", [box_doc], 1, 1) is True
+
+
+def test_router_dispatch_handles_recommend_products_despite_reading_keywords(ns, box_doc):
+    """เปิดไฟล์อยู่ + "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา" -> router ถูกเรียก (fake คืน recommend_products) ->
+    advisor_answer ถูกเรียกจริง ไม่ใช่ _answer_document_reading_question (เหตุการณ์จริงที่แก้: ask_question()
+    ในโหมด ROUTER_MODE == "llm" ต้องลองเรียก router ก่อนด่าน reading_question เสมอ)"""
+    ns["_fake_client"].response_queue = [_route_intent_response(intent="recommend_products")]
+    ns["_fake_agentic_loop"].set_response("แนะนำ Rack case 9U รุ่น X ครับ", [], False)
+
+    result = ns["_resolve_llm_router_dispatch"]("แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา", 1, 1, [box_doc])
+    assert result is not None
+    assert result["answer"] == "แนะนำ Rack case 9U รุ่น X ครับ"
+    assert ns["_fake_agentic_loop"].last_call_args["model"] == ns["ADVISOR_MODEL"]
+
+
+def test_router_mode_llm_calls_llm_once_for_natural_language_recommendation_replace(ns, router_hdd_doc):
+    """"เอา Seagate SkyHawk เเทน HDD เก่าเลย" ไม่ตรง regex ของ _resolve_recommendation_replace_command/_add_
+    command เลย (ไม่มีรูปแบบ "แทนรายการที่ N ด้วยรุ่นที่ K") — ตอน ROUTER_MODE == "llm" ask_question() เรียก
+    _resolve_recommendation_command_dispatch ด้วย allow_llm_fallback=False ก่อนเสมอ (ต้องคืน None โดยไม่เรียก
+    LLM เลยสักครั้ง) แล้ว router ตัวเดียวเป็นคนเรียก LLM ครั้งเดียวตีความและ apply จริง (ไม่ใช่เรียกซ้ำสองครั้ง
+    ทั้งของ #36 แล้วค่อยของ router)"""
+    ns["set_chat_last_recommendations"](1, [{
+        "name": "Seagate SkyHawk AI 16TB", "key_specs": "7200RPM", "price_thb": 19500, "price_note": None,
+        "unit": "ตัว", "source_url": "https://shop.example/skyhawk", "compatible": True, "compatibility_note": None,
+    }])
+    query = "เอา Seagate SkyHawk เเทน HDD เก่าเลย"
+
+    regex_only_result = ns["_resolve_recommendation_command_dispatch"](
+        query, [router_hdd_doc], 1, 1, allow_llm_fallback=False,
+    )
+    assert regex_only_result is None
+    assert ns["_fake_client"].call_count == 0
+
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="replace_with_recommendation", target_item_index=6, recommendation_index=1, quantity=2,
+        price_mode="recommended",
+    )]
+    result = ns["_resolve_llm_router_dispatch"](query, 1, 1, [router_hdd_doc])
+    assert result is not None
+    assert ns["_fake_client"].call_count == 1
+    assert "✓ แทนรายการที่ 6" in result["answer"]
+
+
+def test_router_mode_llm_falls_back_to_document_reading_when_router_fails(ns, box_doc):
+    """ROUTER_MODE == "llm" + router ล้ม (API error) + "มีรายการอะไรบ้าง" -> ต้อง fallback ไปตอบด้วย
+    _resolve_document_reading_dispatch ได้เหมือนเดิม (ตำแหน่งขยับมาอยู่หลัง router แทน แต่ยังทำงานได้ปกติทุกจุด
+    เป็นด่านสุดท้ายก่อนตกไปที่ legacy cascade ที่เหลือ)"""
+    query = "มีรายการอะไรบ้าง"
+    assert ns["_resolve_recommendation_command_dispatch"](query, [box_doc], 1, 1, allow_llm_fallback=False) is None
+    assert ns["_resolve_direct_structural_dispatch"](query, [box_doc], 1, 1) is None
+
+    ns["_fake_client"].raise_on_create = Exception("boom")
+    assert ns["_resolve_llm_router_dispatch"](query, 1, 1, [box_doc]) is None
+
+    reading_question = ns["_is_reading_type_question"](query, [box_doc], 1, 1)
+    assert reading_question is True
+    result = ns["_resolve_document_reading_dispatch"](query, [box_doc], 1, 1, reading_question)
+    assert result is not None
+    assert result["document_id"] == box_doc["id"]
+
+
+def test_router_mode_legacy_recommendation_dispatch_still_calls_llm_resolver_of_36(ns, box_doc):
+    """ROUTER_MODE == "legacy" -> _resolve_recommendation_command_dispatch เรียกแบบเดิมทุกประการ (ไม่ส่ง
+    allow_llm_fallback เลย ค่าเริ่มต้น True) -> resolver ของ #36 (_resolve_recommendation_intent_with_llm) ยัง
+    ทำงานเหมือนเดิมสำหรับคำสั่งธรรมชาติที่ regex จับไม่ได้ ไม่ถูกปิดไปทั้งที่ยังอยู่ในโหมด legacy"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [
+        _FakeAgenticResponse(
+            [_FakeAgenticToolUseBlock("call_1", "resolve_recommendation_action", {
+                "action": "replace", "target_item_index": 5, "recommendation_index": 1, "quantity": None,
+                "price_mode": "recommended", "explicit_price": None, "markup_percent": None, "question": None,
+            })],
+            stop_reason="tool_use",
+        ),
+    ]
+    result = ns["_resolve_recommendation_command_dispatch"]("แทน ลงในรายการเลย", [box_doc], 1, 1)
+    assert result is not None
+    assert ns["_fake_client"].call_count == 1
+    assert ns["_fake_client"].last_call_kwargs["tool_choice"] == {"type": "tool", "name": "resolve_recommendation_action"}

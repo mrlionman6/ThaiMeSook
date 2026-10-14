@@ -9,6 +9,7 @@ pytest) ไม่ใช่การ mock ตรรกะเอง — ถ้า 
 import ast
 import io
 import os
+import time
 import re
 import html
 import json
@@ -55,6 +56,7 @@ WANTED_MAIN_FUNCS = {
     "_apply_single_queue_item", "_document_totals_lines", "_apply_structural_commands",
     "undo_last_edit", "_is_undo_command",
     "_is_document_reading_question", "_has_legal_keyword", "_answer_document_reading_question",
+    "_is_reading_type_question", "_resolve_document_reading_dispatch",
     "_query_mentions_table_item_or_label",
     "_is_structural_edit_command",
     "_find_single_rate_label",
@@ -669,7 +671,7 @@ def build_namespace() -> dict:
         "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "html": html, "json": json, "zipfile": zipfile, "difflib": difflib,
-        "datetime": datetime, "ZoneInfo": ZoneInfo, "urllib": urllib,
+        "datetime": datetime, "ZoneInfo": ZoneInfo, "urllib": urllib, "time": time,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,

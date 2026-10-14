@@ -2890,6 +2890,49 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
         return tool_text, target_doc["id"]
 
 
+def _is_reading_type_question(query: str, active_docs: list[dict], user_id: int, chat_id: int) -> bool:
+    """True ถ้าข้อความนี้เป็นคำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _is_document_reading_question
+    — หรือเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ไม่ว่าจะมีคำเชิง
+    กฎหมายปนมาด้วยหรือไม่ก็ตาม (ดู _has_legal_keyword — เช็คแยกต่างหากใน _resolve_document_reading_dispatch) ใช้
+    ทั้งเป็นเงื่อนไขของ dispatch นั้น และเป็นเงื่อนไขข้าม single/multi-doc classifier ใน ask_question() ด้วย
+    (คำถามแบบนี้ไม่เข้าพวกไหนใน 4 หมวดของ classifier นั้นเลย ไม่ว่าจะมีคำเชิงกฎหมายปนมาหรือไม่)"""
+    if not active_docs:
+        return False
+    focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
+    reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
+        active_docs[0] if len(active_docs) == 1 else None
+    )
+    return bool(
+        _is_document_reading_question(query)
+        or (reading_target_doc is not None and _query_mentions_table_item_or_label(query, reading_target_doc))
+    )
+
+
+def _resolve_document_reading_dispatch(
+    query: str, active_docs: list[dict], user_id: int, chat_id: int, reading_question: bool,
+) -> Optional[dict]:
+    """ตอบคำถามเชิงอ่าน/ถามเนื้อหาไฟล์ "แท้ๆ" (reading_question เป็น True จาก _is_reading_type_question — รับมา
+    เป็นพารามิเตอร์แทนที่จะคำนวณเองในนี้ เพราะ ask_question() ต้องใช้ค่าเดียวกันนี้เป็นเงื่อนไขข้าม single/
+    multi-doc classifier ด้วย ไม่ต้องคำนวณซ้ำสองครั้ง) และไม่มีคำเชิงกฎหมายปนมา (ดู _has_legal_keyword) ด้วย
+    _answer_document_reading_question ทันทีถ้าใช่ — แยกออกมาจาก ask_question() เพื่อให้เรียกได้คนละตำแหน่งใน
+    ลำดับทางลัดขึ้นกับ ROUTER_MODE (ดู ask_question): legacy เช็คก่อน _resolve_direct_structural_dispatch เหมือน
+    เดิมทุกประการ ส่วน ROUTER_MODE == "llm" ใช้เป็นด่านสุดท้ายหลัง router fallback เท่านั้น (ให้ router ตัดสิน
+    intent read_document เองก่อนเสมอ — เหตุการณ์จริงที่แก้: "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา"/"แนะนำ HDD ที่
+    ดีกว่ารายการที่ 6" มีคำว่า "ใบเสนอราคา"/"รายการ" ซึ่งด่านนี้เคยดักไปตอบเป็นคำถามเชิงอ่านก่อน router เลย)
+
+    คืน {"document_id": int|None, "answer": str} ถ้าตอบแล้ว หรือ None ถ้าไม่ใช่คำถามแบบนี้เลย/มีคำเชิงกฎหมายปนมา
+    (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ — คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา เช่น "ธุรกิจบัญชีสามมีอะไร
+    บ้าง" ยังต้องไปทาง RAG ตามปกติ)"""
+    if not reading_question:
+        return None
+    if _has_legal_keyword(query):
+        print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
+        return None
+
+    answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
+    return {"document_id": used_doc_id, "answer": answer}
+
+
 # คำที่ถือเป็น "ขอไฟล์ชัดเจน" เท่านั้นที่ยอม finalize (ส่งลิงก์ดาวน์โหลด) — ดู docstring ของ
 # _has_explicit_finalize_word
 _FINALIZE_EXPLICIT_WORDS = ("ดาวน์โหลด", "ขอไฟล์", "ส่งไฟล์", "เสร็จแล้วขอไฟล์", "บันทึกไฟล์")
@@ -5536,83 +5579,102 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
-        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้แต่ตีความ
-        # จากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อกคำถามเชิงอ่าน
-        # ด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง _is_document_reading_
-        # question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคยมาถึงจุดนี้เลยสักครั้ง)
-        # dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ "none") จึงปล่อยให้ตกไปเช็ค
-        # reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
-        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
-        if recommendation_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
-            answer = recommendation_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
+        # คำนวณครั้งเดียว ใช้ร่วมกันทั้งสองโหมด — ด่าน reading_question เอง (ตำแหน่งต่างกันตาม ROUTER_MODE) และ
+        # เงื่อนไขข้าม single/multi-doc classifier ด้านล่าง (ดู _is_reading_type_question)
+        reading_question = _is_reading_type_question(query, active_docs, user_id, chat_id)
 
-        # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
-        # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่ — ส่ง
-        # ตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง ห้ามให้
-        # _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close) ตัดสินใจแทน เพราะคำถามแบบนี้ไม่
-        # เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้"
-        # แทนที่จะตอบคำถามจริงๆ
-        reading_target_doc = None
-        if active_docs:
-            focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
-            reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
-                active_docs[0] if len(active_docs) == 1 else None
-            )
-        reading_question = bool(active_docs) and (
-            _is_document_reading_question(query)
-            or (reading_target_doc is not None and _query_mentions_table_item_or_label(query, reading_target_doc))
-        )
-        # คำถามเนื้อหาไฟล์ "แท้ๆ" (ไม่มีคำเชิงกฎหมายปนมา — ดู _has_legal_keyword) ตอบตรงด้วย
-        # read_document_values เลย ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย กันพึ่ง system prompt อย่างเดียวให้ AI
-        # ตัดสินใจเรียก tool เอง (เคยพลาด) คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา (เช่น "ธุรกิจบัญชีสามมีอะไร
-        # บ้าง") ยังต้องไปทาง RAG ตามปกติ (reading_question ยังเป็น True เพื่อข้าม branch ตัดสินใจของ Excel
-        # editor ด้านล่าง แต่ไม่เข้า branch นี้)
-        document_content_question = reading_question and not _has_legal_keyword(query)
-
-        if document_content_question:
-            answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
-            print(f"[Route] chat={chat_id} branch=document_reading active_doc={used_doc_id}")
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
-
-        if reading_question:
-            print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
-
-        # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
-        # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
-        # _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น 7x7"/"เปลี่ยนจำนวน
-        # Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/"อัตรา"/"รายการที่ N"/
-        # "ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง ทั้งที่ parse ได้ชัดเจนด้วย
-        # โค้ดเฉยๆ
-        direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
-        if direct_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
-            answer = direct_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
-
-        # feat/llm-intent-router: จากจุดนี้ไปคือด่านคำสำคัญซ้อนกันหลายชั้นเดิม (reading_question/structural_route/
-        # single-multi-doc classifier) ที่ ROUTER_MODE == "llm" ควรแทนที่ทั้งหมดด้วย router ตัวเดียวที่เห็นบริบท
-        # ครบ — ลองก่อนเสมอถ้าเปิดใช้งาน (ทางลัดโค้ดล้วนๆ ด้านบนทั้งหมดยังเช็คก่อนเสมอ ไม่เปลี่ยน) router ล้มไม่ว่า
-        # สาเหตุใด (API error/parse ไม่ได้/ค่าไม่ผ่านการตรวจ) -> คืน None แล้วปล่อยตกไปใช้ด่านคำสำคัญเดิมด้านล่างนี้
-        # ทั้งหมดทุกจุดทุกประการ (ไม่ลบโค้ดเดิมเลยสักบรรทัด — ดู _resolve_llm_router_dispatch)
         if ROUTER_MODE == "llm":
+            # feat/llm-intent-router: ลำดับทางลัดด้วยโค้ดล้วนๆ ที่เหลือ (recommendation regex-only + structural
+            # direct regex) เช็คก่อนเรียก router เสมอ เหมือนโหมด legacy แต่ "ไม่เรียก LLM ของ #36
+            # (_resolve_recommendation_intent_with_llm) และไม่เช็ค reading_question ก่อน router เลย — ให้
+            # route_intent_with_llm ตัวเดียวตัดสิน intent read_document/replace_with_recommendation เองจาก
+            # บริบททั้งหมด เหตุการณ์จริงที่แก้: "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา"/"แนะนำ HDD ที่ดีกว่ารายการที่
+            # 6" มีคำว่า "ใบเสนอราคา"/"รายการ" ซึ่งด่าน reading_question เดิมเคยดักไปตอบเป็นคำถามเชิงอ่านก่อนถึง
+            # router เลย ทั้งที่เป็นคำขอแนะนำสินค้า และ "เอา X เเทน Y เก่าเลย" เคยเรียก LLM สองครั้ง (ของ #36 แล้ว
+            # ค่อยของ router) ทั้งที่ router ตัวเดียวตีความได้อยู่แล้ว
+            recommendation_dispatch = _resolve_recommendation_command_dispatch(
+                query, active_docs, chat_id, user_id, allow_llm_fallback=False,
+            )
+            if recommendation_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+                answer = recommendation_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+            if direct_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+                answer = direct_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
             try:
                 router_dispatch = _resolve_llm_router_dispatch(query, user_id, chat_id, active_docs)
             except anthropic.APIError as e:
                 return _ask_question_api_error_response(e, chat_id)
             if router_dispatch is not None:
                 answer = router_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # router ล้ม/ค่าไม่ผ่านการตรวจ -> fallback ไปใช้ด่าน reading_question เดิม (ตำแหน่งขยับมาอยู่หลัง
+            # router แทนที่จะอยู่ก่อนเหมือน legacy — ดู docstring ของ _resolve_document_reading_dispatch)
+            reading_dispatch = _resolve_document_reading_dispatch(query, active_docs, user_id, chat_id, reading_question)
+            if reading_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=document_reading active_doc={reading_dispatch['document_id']}")
+                answer = reading_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+        else:
+            # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบ
+            # เสนอราคาที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้
+            # แต่ตีความจากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อก
+            # คำถามเชิงอ่านด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง
+            # _is_document_reading_question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคย
+            # มาถึงจุดนี้เลยสักครั้ง) dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ
+            # "none") จึงปล่อยให้ตกไปเช็ค reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
+            recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
+            if recommendation_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+                answer = recommendation_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
+            # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่
+            # — ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง
+            # ห้ามให้ _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close) ตัดสินใจแทน เพราะ
+            # คำถามแบบนี้ไม่เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า "ไม่พบ label ที่
+            # ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ
+            reading_dispatch = _resolve_document_reading_dispatch(query, active_docs, user_id, chat_id, reading_question)
+            if reading_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=document_reading active_doc={reading_dispatch['document_id']}")
+                answer = reading_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ
+            # "ก่อน" เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู
+            # docstring ของ _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น
+            # 7x7"/"เปลี่ยนจำนวน Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/
+            # "อัตรา"/"รายการที่ N"/"ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง
+            # ทั้งที่ parse ได้ชัดเจนด้วยโค้ดเฉยๆ
+            direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+            if direct_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+                answer = direct_dispatch["answer"]
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -9654,15 +9716,17 @@ def _validate_and_apply_recommendation_action(
 
 
 def _resolve_recommendation_command_dispatch(
-    query: str, active_docs: list[dict], chat_id: int, user_id: int,
+    query: str, active_docs: list[dict], chat_id: int, user_id: int, allow_llm_fallback: bool = True,
 ) -> Optional[dict]:
     """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบ
     เสนอราคาที่เปิดอยู่ได้ไหม ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — ดู
     _resolve_recommendation_replace_command/_resolve_recommendation_add_command) แล้ว apply ทันทีถ้าใช่ — ไม่ต้อง
     พึ่ง LLM เลยสักครั้ง (เหมือน _resolve_direct_structural_dispatch) ถ้า regex ทั้งสองคืน None แต่มีรายการแนะนำอยู่
-    ในแชทจริงและข้อความมีคำกริยาที่น่าจะเป็นเจตนานี้ (ดู _query_has_recommendation_intent_verb) ลองให้ LLM ตีความ
-    จากบริบทแทน (ดู _resolve_recommendation_intent_with_llm) คืน {"document_id":, "answer":} หรือ None ถ้าข้อความ
-    นี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    ในแชทจริงและข้อความมีคำกริยาที่น่าจะเป็นเจตนานี้ (ดู _query_has_recommendation_intent_verb) และ
+    allow_llm_fallback เป็น True (ค่าเริ่มต้น) ลองให้ LLM ตีความจากบริบทแทน (ดู _resolve_recommendation_intent_
+    with_llm) — ask_question() ส่ง allow_llm_fallback=False เมื่อ ROUTER_MODE == "llm" เพราะ route_intent_with_llm
+    ตัวเดียวทำหน้าที่ตีความบริบทแบบนี้อยู่แล้ว (กันเรียก LLM ซ้ำสองครั้งสำหรับข้อความเดียวกัน) คืน {"document_id":,
+    "answer":} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
     focus_doc = get_chat_document_focus(chat_id, user_id)
     target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
     if target_doc is None:
@@ -9678,7 +9742,7 @@ def _resolve_recommendation_command_dispatch(
     result = _resolve_recommendation_replace_command(query, target_doc["id"], user_id, recommendations, table)
     if result is None:
         result = _resolve_recommendation_add_command(query, target_doc["id"], user_id, recommendations, table)
-    if result is None and recommendations and _query_has_recommendation_intent_verb(query):
+    if result is None and allow_llm_fallback and recommendations and _query_has_recommendation_intent_verb(query):
         result = _resolve_recommendation_intent_with_llm(
             query, target_doc["id"], user_id, recommendations, table, chat_id,
         )
@@ -10062,17 +10126,23 @@ def _resolve_llm_router_dispatch(
     fallback ไปใช้ routing เดิมแทน (ดู log fallback=True/False)
 
     anthropic.APIError จาก advisor_answer/rag_answer (เรียกหลัง route ตัดสินใจสำเร็จแล้ว) ไม่ถูกจับในนี้ ปล่อยให้
-    หลุดออกไปให้ ask_question() จัดการแบบเดียวกับเส้นทาง legacy ทุกจุด (ดู _ask_question_api_error_response)"""
+    หลุดออกไปให้ ask_question() จัดการแบบเดียวกับเส้นทาง legacy ทุกจุด (ดู _ask_question_api_error_response)
+
+    log [Router] มี latency_ms เสมอ (เวลาที่ route_intent_with_llm ใช้ทั้งหมด รวมเรียก LLM จริง — ไม่รวมเวลาที่
+    handler ปลายทาง เช่น advisor_answer/rag_answer ใช้ต่อ) ใช้ติดตามว่า router เพิ่มเวลาตอบสนองเท่าไรจริงๆ"""
+    started_at = time.monotonic()
     route = route_intent_with_llm(query, user_id, chat_id, active_docs)
+    latency_ms = round((time.monotonic() - started_at) * 1000)
     if route is None:
-        print(f"[Router] chat={chat_id} fallback=True")
+        print(f"[Router] chat={chat_id} fallback=True latency_ms={latency_ms}")
         return None
 
     intent = route.get("intent")
     confidence = route.get("confidence")
     print(
         f"[Router] chat={chat_id} intent={intent} confidence={confidence} "
-        f"target={route.get('target_item_index')} rec={route.get('recommendation_index')} fallback=False"
+        f"target={route.get('target_item_index')} rec={route.get('recommendation_index')} fallback=False "
+        f"latency_ms={latency_ms}"
     )
 
     if intent not in _ROUTER_VALID_INTENTS:
