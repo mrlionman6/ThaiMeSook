@@ -24,6 +24,8 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
         get_approved_users, update_user_role, block_user, unblock_user,
         create_chat_session, touch_chat_session, get_user_chats, get_chat_session,
         add_chat_message, get_chat_messages, delete_chat_session,
+        upsert_library_search_card, get_all_library_search_cards,
+        get_library_file_ids_without_search_card, get_library_search_vector_scores_for_all,
     )
 """
 
@@ -36,7 +38,7 @@ from typing import Optional
 
 from sqlalchemy import (
     create_engine, Column, Integer, Text, DateTime, Float, String, JSON, text, ForeignKey, func, or_,
-    LargeBinary, Boolean, inspect,
+    LargeBinary, Boolean, inspect, Numeric,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pgvector.sqlalchemy import Vector
@@ -396,6 +398,26 @@ class LibraryFileMeta(Base):
     document_no = Column(Text, nullable=True)
     is_template = Column(Boolean, nullable=False, default=False)
     source = Column(String, nullable=False, default="ai")
+    updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
+class LibrarySearchIndex(Base):
+    """บัตรค้นหา (search card) ของไฟล์ในคลังแต่ละไฟล์ — ข้อความเดียวที่รวมทุกอย่างที่ผู้ใช้อาจจำได้เกี่ยวกับ
+    เอกสารนี้ (ชื่อไฟล์/หมวดหมู่/ลูกค้า/โปรเจกต์/เลขที่เอกสาร/สรุป/วันที่/รายการในตาราง/ยอดรวม — ดู
+    build_library_search_card ใน main.py) ให้ search_library ค้นได้จากทุกมุม ไม่ใช่แค่ข้อมูลระบุตัวตนคงที่ไม่กี่
+    ฟิลด์เหมือน library_file_meta ตารางใหม่แยกต่างหากทั้งหมด ไม่ ALTER library_files/library_file_meta เลย
+    หนึ่งไฟล์มีได้แค่ 1 แถว (file_id เป็น primary key ตรงๆ) ลบไฟล์ในคลัง -> แถวนี้หายไปด้วยอัตโนมัติ
+    (ON DELETE CASCADE)
+
+    total_amount/issue_date เป็น null ได้เสมอ (ไฟล์ที่อ่านค่าไม่ได้/ไม่มีป้ายวันที่ในไฟล์) embedding เป็น null
+    ได้ชั่วคราวระหว่างรอ backfill (เหมือน knowledge_base.embedding)"""
+    __tablename__ = "library_search_index"
+
+    file_id = Column(Integer, ForeignKey("library_files.id", ondelete="CASCADE"), primary_key=True)
+    card_text = Column(Text, nullable=False)
+    embedding = Column(Vector(EMBEDDING_DIM), nullable=True)
+    total_amount = Column(Numeric, nullable=True)
+    issue_date = Column(Text, nullable=True)
     updated_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
@@ -2129,6 +2151,72 @@ def upsert_library_file_meta(
         row.updated_at = datetime.datetime.utcnow()
         session.commit()
         return True
+
+
+def upsert_library_search_card(
+    file_id: int, card_text: str, embedding: Optional[list[float]],
+    total_amount: Optional[float] = None, issue_date: Optional[str] = None,
+) -> bool:
+    """สร้างหรือแทนที่บัตรค้นหา (search card) ของไฟล์นี้ทั้งแถว — คืน False ถ้าไม่พบไฟล์นี้ในคลังเลย (กัน insert
+    ไปชน FK constraint ตรงๆ) เรียกตอนอัปโหลดไฟล์เข้าคลัง/แก้ข้อมูลระบุตัวตน/บันทึกไฟล์ทับในคลัง และตอน backfill
+    ไฟล์ที่ยังไม่มีบัตร (ดู build_library_search_card/backfill_library_search_cards ใน main.py)"""
+    with SessionLocal() as session:
+        if session.get(LibraryFile, file_id) is None:
+            return False
+        row = session.get(LibrarySearchIndex, file_id)
+        if row is None:
+            row = LibrarySearchIndex(file_id=file_id)
+            session.add(row)
+        row.card_text = card_text
+        row.embedding = embedding
+        row.total_amount = total_amount
+        row.issue_date = issue_date
+        row.updated_at = datetime.datetime.utcnow()
+        session.commit()
+        return True
+
+
+def get_all_library_search_cards() -> dict[int, dict]:
+    """คืน {file_id: {"card_text","total_amount","issue_date","has_embedding"}} ของทุกไฟล์ที่มีบัตรค้นหาอยู่แล้ว
+    (ไฟล์ที่ไม่อยู่ใน dict นี้ = ยังไม่มีบัตรเลย — ดู get_library_file_ids_without_search_card) ใช้โดย
+    search_library() (main.py) ประกอบคะแนน BM25 จาก card_text ของทุกไฟล์พร้อมกัน ไม่ส่ง embedding ดิบกลับมาเอง
+    (เสี่ยงหนักถ้าคลังใหญ่ — คะแนน vector คำนวณแยกผ่าน get_library_search_vector_scores_for_all แทน)"""
+    with SessionLocal() as session:
+        rows = session.query(LibrarySearchIndex).all()
+        return {
+            r.file_id: {
+                "card_text": r.card_text,
+                "total_amount": float(r.total_amount) if r.total_amount is not None else None,
+                "issue_date": r.issue_date,
+                "has_embedding": r.embedding is not None,
+            }
+            for r in rows
+        }
+
+
+def get_library_file_ids_without_search_card() -> list[int]:
+    """คืน file_id ของไฟล์ในคลังที่ยังไม่มีบัตรค้นหาเลย (ไม่มีแถวใน library_search_index) — ใช้โดย
+    backfill_library_search_cards ตอน startup (ดู main.py) กันสร้างซ้ำทับไฟล์ที่มีบัตรอยู่แล้ว"""
+    with SessionLocal() as session:
+        existing_ids = {row.file_id for row in session.query(LibrarySearchIndex.file_id).all()}
+        all_ids = {row.id for row in session.query(LibraryFile.id).all()}
+        return sorted(all_ids - existing_ids)
+
+
+def get_library_search_vector_scores_for_all(query_embedding: list[float]) -> dict[int, float]:
+    """เหมือน get_vector_scores_for_all ทุกประการ แต่ค้นใน library_search_index แทน knowledge_base — ให้
+    PostgreSQL คำนวณ cosine distance เองทั้งหมดผ่าน SQL คืน {file_id: similarity} ไฟล์ที่ยังไม่มี embedding
+    (เช่น backfill ยังไม่ถึงคิว) ถูกข้ามไป (ไม่รวมใน dict)"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(
+                LibrarySearchIndex.file_id,
+                LibrarySearchIndex.embedding.cosine_distance(query_embedding).label("distance"),
+            )
+            .filter(LibrarySearchIndex.embedding.isnot(None))
+            .all()
+        )
+        return {r.file_id: 1 - r.distance for r in rows}
 
 
 def _customer_to_dict(row) -> dict:

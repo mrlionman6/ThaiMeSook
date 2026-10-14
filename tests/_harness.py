@@ -29,6 +29,7 @@ from openpyxl.styles.numbers import is_date_format
 from openpyxl.workbook.properties import CalcProperties
 from pycel import ExcelCompiler
 from pythainlp.tokenize import word_tokenize
+from rank_bm25 import BM25Okapi
 
 MAIN_PY = Path(__file__).parent.parent / "main.py"
 DB_PY = Path(__file__).parent.parent / "db.py"
@@ -81,6 +82,16 @@ WANTED_MAIN_FUNCS = {
     "_classify_question_route", "_classify_legal_or_advisor_route",
     "_query_matches_existing_customer", "_looks_like_library_query", "_resolve_library_route_access",
     "_query_matches_document_code_context", "_normalize_customer_name", "_normalize_library_search_text",
+    "_categorize_anthropic_api_error", "_ask_question_api_error_response",
+    "_get_enriched_library_files", "_library_file_has_macros", "_guess_library_document_type",
+    "build_library_search_card", "save_library_search_card", "backfill_library_search_cards",
+    "_library_search_exact_match_fields", "_library_search_matches_filters", "_library_search_matched_on_text",
+    "_score_library_search_candidates", "search_library", "execute_search_library",
+    "_resolve_library_exact_match_dispatch",
+    "_order_library_documents_by_folder", "_resolve_flat_document_labels", "_format_document_line_flat",
+    "_format_library_document_list", "_record_chat_document_listing", "_escape_markdown_text",
+    "_strip_file_extension",
+    "_read_values_from_bytes", "_tokenize_library_query",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
     "_thai_group_to_text", "_thai_integer_to_text", "_bahttext", "_try_evaluate_bahttext",
@@ -129,6 +140,10 @@ WANTED_MAIN_CONSTS = {
     "_LIBRARY_ROUTE_KEYWORDS", "_LIBRARY_DOCUMENT_CODE_RE", "_LIBRARY_LOGIN_REQUIRED_MESSAGE",
     "_LIBRARY_DOCUMENT_CODE_TRAILING_WORDS", "_LIBRARY_DOCUMENT_REFERENCE_WORDS",
     "_CUSTOMER_NAME_NOISE_WORDS", "_THAI_TONE_MARKS_RE",
+    "SEARCH_LIBRARY_TOOL", "LIBRARY_ROUTE_SYSTEM_PROMPT", "LIBRARY_TOOLS", "LIBRARY_LOGGED_IN_RULES",
+    "_LIBRARY_DOCUMENT_TYPE_WORDS", "_LIBRARY_CARD_DATE_LABEL_WORDS", "_LIBRARY_CARD_TOTAL_LABEL_WORDS",
+    "_LIBRARY_SEARCH_MAX_RESULTS", "_LIBRARY_SEARCH_SCORE_THRESHOLD", "_LIBRARY_SEARCH_EXACT_MATCH_BONUS",
+    "_LIBRARY_QUERY_STOPWORDS", "_LIBRARY_QUERY_STOPWORDS_NORMALIZED",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -151,6 +166,10 @@ class _FakeDb:
         self.last_recommendations: dict[int, list] = {}
         self.closed_ids: set[int] = set()
         self.library_files: dict[int, dict] = {}
+        self.library_file_meta: dict[int, dict] = {}
+        self.file_categories: dict[int, str] = {}
+        self.library_search_cards: dict[int, dict] = {}
+        self.last_listing: dict[int, dict] = {}  # chat_id -> {"kind":, "items":} จาก set_chat_last_listing
         self.chat_messages: dict[int, list[dict]] = {}  # chat_id -> [{"role","content"}, ...] เรียงเก่า->ใหม่
         self._next_document_id = 1
         self._next_version_id = 1
@@ -253,11 +272,79 @@ class _FakeDb:
         (ดู _resolve_recommendation_intent_with_llm/_answer_document_reading_question ที่เรียกใช้ฟังก์ชันนี้)"""
         return [dict(m) for m in self.chat_messages.get(chat_id, [])]
 
-    def add_library_file(self, file_id: int, filename: str, storage_key: str) -> None:
-        self.library_files[file_id] = {"file_id": file_id, "filename": filename, "storage_key": storage_key}
+    def set_chat_last_listing(self, chat_id, kind, items):
+        self.last_listing[chat_id] = {"kind": kind, "items": items}
+
+    def get_chat_last_listing(self, chat_id):
+        listing = self.last_listing.get(chat_id)
+        return dict(listing) if listing is not None else None
+
+    def add_library_file(
+        self, file_id: int, filename: str, storage_key: str, label_map: Optional[dict] = None,
+        category_id: Optional[int] = None, summary: Optional[str] = None,
+    ) -> None:
+        """ตัวแทน library_files 1 แถว — key เป็น "id" (ไม่ใช่ "file_id") ให้ตรงกับรูปแบบจริงที่ db.py คืน (ดู
+        _library_file_to_dict) เพราะ _get_enriched_library_files/build_library_search_card อ่าน f["id"] ตรงๆ"""
+        self.library_files[file_id] = {
+            "id": file_id, "filename": filename, "category_id": category_id, "storage_key": storage_key,
+            "label_map": label_map or {}, "summary": summary,
+            "uploaded_at": datetime.datetime.utcnow(), "updated_at": datetime.datetime.utcnow(),
+        }
 
     def get_library_file(self, file_id):
         return self.library_files.get(file_id)
+
+    def get_library_files(self, category_id=None, only_uncategorized=False):
+        return [dict(f) for f in self.library_files.values()]
+
+    def add_file_category(self, category_id: int, name: str) -> None:
+        self.file_categories[category_id] = name
+
+    def get_file_categories_with_counts(self):
+        return [{"id": cid, "name": name} for cid, name in self.file_categories.items()]
+
+    def add_library_file_meta(
+        self, file_id: int, customer_code: Optional[str] = None, customer_name: Optional[str] = None,
+        project_code: Optional[str] = None, project_name: Optional[str] = None,
+        document_no: Optional[str] = None, is_template: bool = False,
+    ) -> None:
+        """ตัวแทน library_file_meta 1 แถว — ให้เทสต์ตั้งค่าข้อมูลระบุตัวตนของไฟล์ตรงๆ (ดู get_library_file_meta/
+        get_all_library_file_meta ที่ _get_enriched_library_files ใช้)"""
+        self.library_file_meta[file_id] = {
+            "customer_code": customer_code, "customer_name": customer_name, "project_code": project_code,
+            "project_name": project_name, "document_no": document_no, "is_template": is_template,
+        }
+
+    def get_library_file_meta(self, file_id):
+        meta = self.library_file_meta.get(file_id)
+        return dict(meta) if meta is not None else None
+
+    def get_all_library_file_meta(self):
+        return {fid: dict(meta) for fid, meta in self.library_file_meta.items()}
+
+    def add_library_search_card(
+        self, file_id: int, card_text: str, total_amount: Optional[float] = None,
+        issue_date: Optional[str] = None, embedding: Optional[list] = None,
+    ) -> None:
+        """ตัวแทน library_search_index 1 แถว — ให้เทสต์ seed "บัตรค้นหา" ตรงๆ โดยไม่ต้องผ่าน
+        build_library_search_card จริง (ซึ่งต้องมีไฟล์ Excel จริงให้อ่าน) ใช้ทดสอบ search_library/
+        _score_library_search_candidates แยกจากการทดสอบ build_library_search_card เอง"""
+        self.upsert_library_search_card(file_id, card_text, embedding, total_amount, issue_date)
+
+    def upsert_library_search_card(self, file_id, card_text, embedding, total_amount=None, issue_date=None):
+        if file_id not in self.library_files:
+            return False
+        self.library_search_cards[file_id] = {
+            "card_text": card_text, "total_amount": total_amount, "issue_date": issue_date,
+            "has_embedding": embedding is not None,
+        }
+        return True
+
+    def get_all_library_search_cards(self):
+        return {fid: dict(card) for fid, card in self.library_search_cards.items()}
+
+    def get_library_file_ids_without_search_card(self):
+        return sorted(set(self.library_files) - set(self.library_search_cards))
 
     def add_chat_pending_action(self, chat_id, action, preview_text):
         pending_id = self._next_pending_id
@@ -296,6 +383,40 @@ class _FakeDb:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+# ตัวแทน module "anthropic" จริง (ไม่ได้ติดตั้งในสภาพแวดล้อมทดสอบนี้ — ดู requirements.txt) เท่าที่
+# _categorize_anthropic_api_error/_ask_question_api_error_response ใน main.py ต้องใช้ (isinstance check +
+# except anthropic.APIError) จำลองลำดับชั้นจริงของ SDK เท่าที่จำเป็น: APIError เป็นฐานของทุกตัว, APIStatusError
+# (มี .status_code) เป็นฐานของ BadRequestError/RateLimitError/InternalServerError
+class _FakeAnthropicAPIError(Exception):
+    pass
+
+
+class _FakeAnthropicAPIStatusError(_FakeAnthropicAPIError):
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class _FakeAnthropicBadRequestError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicRateLimitError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicInternalServerError(_FakeAnthropicAPIStatusError):
+    pass
+
+
+class _FakeAnthropicModule:
+    APIError = _FakeAnthropicAPIError
+    APIStatusError = _FakeAnthropicAPIStatusError
+    BadRequestError = _FakeAnthropicBadRequestError
+    RateLimitError = _FakeAnthropicRateLimitError
+    InternalServerError = _FakeAnthropicInternalServerError
 
 
 class _FakeAnthropicContentBlock:
@@ -485,11 +606,41 @@ def _fake_log_if_low_confidence(query, answer, top_chunks, scores):
 def _fake_find_customers(query: str) -> list:
     """Stub เปล่าๆ แทน find_customers จริง (ดู main.py) — การทดสอบ _looks_like_library_query/
     _classify_question_route ในชุดนี้ไม่ครอบคลุมเงื่อนไข "ข้อความตรงกับชื่อลูกค้าที่มีอยู่จริง" เพราะ
-    find_customers พึ่ง dependency chain ของคลังเอกสาร (get_all_customers/_get_enriched_library_files/
-    get_file_categories_with_counts/get_all_library_file_meta/get_library_files) ที่ยังไม่มีใน fake DB นี้ —
-    ไม่คุ้มที่จะสร้าง fake ทั้งชุดสำหรับเงื่อนไขเดียวของ PR นี้ (ดู docstring ของ _looks_like_library_query ใน
-    main.py และรายละเอียดใน PR description)"""
+    find_customers ยังพึ่ง get_all_customers ที่ยังไม่มีใน fake DB นี้ (ส่วน _get_enriched_library_files/
+    get_file_categories_with_counts/get_all_library_file_meta/get_library_files มีแล้ว — ใช้โดย search_library/
+    build_library_search_card โดยตรง) ไม่คุ้มที่จะสร้าง fake ส่วนลูกค้าเพิ่มสำหรับเงื่อนไขเดียวนี้ (ดู docstring
+    ของ _looks_like_library_query ใน main.py และรายละเอียดใน PR description ของ fix/library-route)"""
     return []
+
+
+class _FakeEncodedVector:
+    """ตัวแทนผลลัพธ์ของ embed_model.encode(...) จริง (numpy array) — มีแค่ .tolist() ที่โค้ดจริงเรียกใช้
+    (embed_model.encode(text).tolist()) ใช้เฉพาะตอน build_library_search_card/search_library เรียก ไม่มีความหมาย
+    ทางคณิตศาสตร์จริง (ไม่โหลดโมเดลจริงเลยตามกติกาของงานนี้ — ดู _FakeEmbedModel)"""
+
+    def __init__(self, values: list[float]):
+        self._values = values
+
+    def tolist(self):
+        return list(self._values)
+
+
+class _FakeEmbedModel:
+    """ตัวแทน embed_model (SentenceTransformer จริง) — คืนเวกเตอร์คงที่เสมอไม่ว่า text จะเป็นอะไร (ไม่โหลดโมเดล
+    จริงเลยตามกติกาของงานนี้ — sentence_transformers ไม่มีในสภาพแวดล้อมทดสอบนี้) เพียงพอสำหรับทดสอบ
+    search_library/build_library_search_card เพราะ get_library_search_vector_scores_for_all (ด้านล่าง) คืนค่า
+    ว่างเปล่าเสมอด้วยเหตุผลเดียวกัน — คะแนนรวมใน _score_library_search_candidates จึงมาจาก BM25 (คำนวณจริงด้วย
+    rank_bm25 — มีในสภาพแวดล้อมนี้) และคะแนนตรงเป๊ะล้วนๆ ไม่ได้ทดสอบน้ำหนักฝั่ง embedding จริงจัง (เทสต์ของ
+    _score_library_search_candidates เอง ส่ง embedding_scores มาตรงๆ ได้อยู่แล้วถ้าต้องการ)"""
+
+    def encode(self, text):
+        return _FakeEncodedVector([0.0, 0.0])
+
+
+def _fake_get_library_search_vector_scores_for_all(query_embedding) -> dict:
+    """Stub คืนค่าว่างเปล่าเสมอ แทน db.get_library_search_vector_scores_for_all จริง (pgvector cosine distance
+    ผ่าน SQL จริง — ไม่มี DB จริงให้ต่อในสภาพแวดล้อมทดสอบนี้) ดู docstring ของ _FakeEmbedModel"""
+    return {}
 
 
 def build_namespace() -> dict:
@@ -509,8 +660,10 @@ def build_namespace() -> dict:
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
-        "word_tokenize": word_tokenize,
+        "word_tokenize": word_tokenize, "BM25Okapi": BM25Okapi,
         "client": fake_client,
+        "anthropic": _FakeAnthropicModule,
+        "embed_model": _FakeEmbedModel(),
         "StorageNotConfiguredError": StorageNotConfiguredError,
         "get_editable_document_raw": fake_db.get_editable_document_raw,
         "get_editable_document": fake_db.get_editable_document,
@@ -532,9 +685,19 @@ def build_namespace() -> dict:
         "list_active_editable_documents_by_chat": fake_db.list_active_editable_documents_by_chat,
         "create_editable_document": fake_db.create_editable_document,
         "get_library_file": fake_db.get_library_file,
+        "get_library_files": fake_db.get_library_files,
+        "get_file_categories_with_counts": fake_db.get_file_categories_with_counts,
+        "get_library_file_meta": fake_db.get_library_file_meta,
+        "get_all_library_file_meta": fake_db.get_all_library_file_meta,
+        "upsert_library_search_card": fake_db.upsert_library_search_card,
+        "get_all_library_search_cards": fake_db.get_all_library_search_cards,
+        "get_library_file_ids_without_search_card": fake_db.get_library_file_ids_without_search_card,
+        "get_library_search_vector_scores_for_all": _fake_get_library_search_vector_scores_for_all,
         "storage_get": fake_db.storage_get,
         "get_chat_messages": fake_db.get_chat_messages,
         "find_customers": _fake_find_customers,
+        "set_chat_last_listing": fake_db.set_chat_last_listing,
+        "get_chat_last_listing": fake_db.get_chat_last_listing,
     }
 
     main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))

@@ -273,8 +273,16 @@ async function askQuestion() {
             body: formData, // ไม่ต้องตั้ง Content-Type เอง browser จัดการ multipart boundary ให้อัตโนมัติ
         });
 
+        // เช็คก่อน parse JSON เสมอ — เหตุการณ์จริงที่แก้: error ที่ไม่ได้ถูกจัดการ (เช่น proxy/FastAPI คืน 500
+        // เป็น text/plain ตรงๆ) ทำให้ response.json() ด้านล่าง throw SyntaxError ที่งงๆ ("Unexpected token 'I',
+        // "Internal S"... is not valid JSON") แทนที่จะเป็นข้อความที่เข้าใจง่าย — ask_question() เองจัดการ
+        // anthropic.APIError คืน JSON ปกติ (สถานะ 200) ไปแล้ว จึงไม่เข้าเงื่อนไขนี้เลย เงื่อนไขนี้ดักเฉพาะ error
+        // ที่ไม่ได้ถูกจัดการจริงๆ เท่านั้น
+        const contentType = response.headers.get("content-type") || "";
+        if (!response.ok || !contentType.includes("application/json")) {
+            throw new Error(`เซิร์ฟเวอร์ขัดข้อง (HTTP ${response.status}) กรุณาลองใหม่อีกครั้ง`);
+        }
         const data = await response.json();
-        if (!response.ok) throw new Error(data.detail || ("HTTP " + response.status));
 
         markChatPending(requestChatId, false);
         updateLoadingIndicator();

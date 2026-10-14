@@ -1050,7 +1050,9 @@ def test_advisor_answer_sends_chat_history_and_has_no_legal_kb_text_in_system_pr
     )
     assert sources == []
     call_args = ns["_fake_agentic_loop"].last_call_args
-    assert call_args["tools_override"] == ns["ADVISOR_TOOLS"]
+    # ล็อกอินอยู่ (user_id/chat_id ทั้งคู่) -> ต้องมี SEARCH_LIBRARY_TOOL เพิ่มเข้ามาด้วยเสมอ (ดู
+    # test_advisor_answer_includes_search_library_tool_only_when_logged_in สำหรับเคส guest)
+    assert call_args["tools_override"] == ns["ADVISOR_TOOLS"] + [ns["SEARCH_LIBRARY_TOOL"]]
     # advisor ต้องส่ง max_tokens=ADVISOR_MAX_TOKENS (8000) เข้า run_agentic_tool_loop เสมอ — เดิมใช้ 2500 เท่า
     # เส้นทางอื่น แต่ present_recommendations เขียนรายละเอียดสินค้าหลายรุ่นยาวจนชน max_tokens กลางคันมาแล้วจริง
     assert call_args["max_tokens"] == ns["ADVISOR_MAX_TOKENS"]
@@ -2053,3 +2055,280 @@ def test_build_chat_export_text_strips_markdown_from_message_content(ns):
     assert "แนะนำ รุ่น A — ลิงก์ (https://x.com)" in text
     assert "**" not in text
     assert "[ลิงก์]" not in text
+
+
+# ---------- feat/library-search-and-api-errors ส่วน A: API error ต้องไม่เป็น 500 + "คลัง" ตอนมีไฟล์เปิดอยู่ ----------
+# เหตุการณ์จริงที่แก้ (1): เครดิต API หมด -> anthropic.BadRequestError 400 "credit balance is too low" หลุดออก
+# จาก ask_question -> FastAPI คืน 500 เป็น text/plain -> หน้าเว็บ parse JSON ไม่ได้ พัง
+# เหตุการณ์จริงที่แก้ (2): เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" -> branch=document_reading (เพราะ
+# "เอกสาร" อยู่ใน _DOCUMENT_REFERENCE_KEYWORDS) -> แสดงค่าในไฟล์แทนรายการในคลังทั้งหมด
+
+def test_categorize_anthropic_api_error_detects_credit_balance_exhausted(ns):
+    error = ns["anthropic"].BadRequestError("Your credit balance is too low to access the Anthropic API", status_code=400)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "โควตา" in message
+    assert "แจ้งผู้ดูแลระบบ" in message
+
+
+def test_categorize_anthropic_api_error_detects_rate_limit(ns):
+    error = ns["anthropic"].RateLimitError("rate limited", status_code=429)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "หนาแน่น" in message
+
+
+def test_categorize_anthropic_api_error_detects_overloaded_by_status_code(ns):
+    """Anthropic "overloaded" ไม่มี subclass เฉพาะใน SDK — มาเป็น status_code=529 บน InternalServerError
+    (SDK แมป >=500 ทั้งหมดเป็นคลาสนี้) ต้องยังได้ข้อความ "หนาแน่น" เหมือน RateLimitError"""
+    error = ns["anthropic"].InternalServerError("Overloaded", status_code=529)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "หนาแน่น" in message
+
+
+def test_categorize_anthropic_api_error_falls_back_to_generic_message(ns):
+    error = ns["anthropic"].InternalServerError("some other internal error", status_code=500)
+    message = ns["_categorize_anthropic_api_error"](error)
+    assert "ขัดข้องชั่วคราว" in message
+    assert "หนาแน่น" not in message
+    assert "โควตา" not in message
+
+
+def test_ask_question_api_error_response_returns_normal_json_shape(ns):
+    """ต้องคืน dict รูปแบบเดียวกับคำตอบปกติ ({"answer","sources","chat_id"}) ให้ ask_question() return ได้ตรงๆ —
+    sources ว่างเสมอ ไม่ raise ออกไปให้ FastAPI คืน 500 เด็ดขาด"""
+    error = ns["anthropic"].RateLimitError("rate limited", status_code=429)
+    result = ns["_ask_question_api_error_response"](error, chat_id=42)
+    assert result == {"answer": ns["_categorize_anthropic_api_error"](error), "sources": [], "chat_id": 42}
+
+
+def test_is_document_reading_question_excludes_library_keyword(ns):
+    """มีคำว่า "คลัง" ปนมา -> ไม่ใช่ reading question เด็ดขาด แม้มีคำอ้างอิงไฟล์ (เช่น "เอกสาร") ปนมาด้วยก็ตาม —
+    เหตุการณ์จริงที่แก้: เปิด SSF-02 อยู่ -> "ในคลังมีเอกสารอะไรบ้าง" เคยถูกตีความเป็นคำถามเกี่ยวกับไฟล์ที่เปิดอยู่
+    (มีคำว่า "เอกสาร") ตอบค่าในไฟล์นั้นแทนที่จะเป็นรายการในคลังทั้งหมด"""
+    assert ns["_is_document_reading_question"]("ในคลังมีเอกสารอะไรบ้าง") is False
+    assert ns["_is_document_reading_question"]("มีรายการอะไรบ้าง") is True
+
+
+def test_library_query_with_active_document_still_routes_to_library(ns, box_doc):
+    """"ในคลังมีเอกสารอะไรบ้าง" ขณะมีไฟล์เปิดอยู่ (box_doc) ต้องไปถึงเส้นทาง library ได้จริง — ไม่ใช่แค่ไม่ถูกจับ
+    เป็น reading question เฉยๆ แต่ _classify_question_route (ซึ่งเป็นตัวตัดสินสุดท้ายใน ask_question หลังข้าม
+    ตัวแยก intent ของไฟล์ที่เปิดอยู่ไปแล้ว — ดู library_route_query ใน ask_question) ก็ต้องตอบ library ด้วย"""
+    assert ns["_is_document_reading_question"]("ในคลังมีเอกสารอะไรบ้าง") is False
+    assert ns["_looks_like_library_query"]("ในคลังมีเอกสารอะไรบ้าง") is True
+
+
+# ---------- feat/library-search-and-api-errors ส่วน B: ค้นคลังเอกสารจากทุกข้อมูล (search_library) ----------
+# เหตุการณ์จริงที่แก้: "SSF-02" -> AI ตอบ "ในระบบไม่พบเอกสารที่มีรหัส SSF-02" ทั้งที่มีจริง เพราะมีเครื่องมือคลัง
+# เดิม 5 ตัวที่รู้แค่ข้อมูลระบุตัวตนคงที่ ต้องเดาว่าใช้ตัวไหน — ไฟล์จำลอง 3 ไฟล์: ใบเสนอราคาป่าไม้เขียว (document_no
+# "SSF-02", มีรายการ "Rack case server 9U", ยอดรวม 62,220.50), ใบประเมินป่าไม้เขียว (document_no "Kj-01",
+# customer_code เดียวกับไฟล์แรก "ASA-02" — ลูกค้าเดียวกันมี 2 ไฟล์), ห้างทองร่ำรวย (document_no "LA-89")
+
+@pytest.fixture
+def library_fixture(ns):
+    fake_db = ns["_fake_db"]
+    fake_db.add_file_category(1, "ใบเสนอราคา")
+    fake_db.add_file_category(2, "ใบประเมิน")
+
+    fake_db.add_library_file(1, "ใบเสนอราคาป่าไม้เขียว.xlsx", "lib/1.xlsx", category_id=1)
+    fake_db.add_library_file_meta(1, customer_code="ASA-02", customer_name="ป่าไม้เขียว", document_no="SSF-02")
+    fake_db.add_library_search_card(
+        1,
+        "ชื่อไฟล์: ใบเสนอราคาป่าไม้เขียว.xlsx\nหมวดหมู่: ใบเสนอราคา\nชื่อลูกค้า: ป่าไม้เขียว\nรหัสลูกค้า: ASA-02\n"
+        "เลขที่เอกสาร: SSF-02\nรายการ: Rack case server 9U จำนวน 1 ตู้ ราคา/หน่วย 62,220.50\n"
+        "รวมราคาทั้งสิ้น: 62,220.50",
+        total_amount=62220.50, issue_date="2560-01-15",
+    )
+
+    fake_db.add_library_file(2, "ใบประเมินป่าไม้เขียว.xlsx", "lib/2.xlsx", category_id=2)
+    fake_db.add_library_file_meta(2, customer_code="ASA-02", customer_name="ป่าไม้เขียว", document_no="Kj-01")
+    fake_db.add_library_search_card(
+        2,
+        "ชื่อไฟล์: ใบประเมินป่าไม้เขียว.xlsx\nหมวดหมู่: ใบประเมิน\nชื่อลูกค้า: ป่าไม้เขียว\nรหัสลูกค้า: ASA-02\n"
+        "เลขที่เอกสาร: Kj-01",
+    )
+
+    fake_db.add_library_file(3, "ห้างทองร่ำรวย.xlsx", "lib/3.xlsx", category_id=1)
+    fake_db.add_library_file_meta(3, customer_code="RRR-01", customer_name="ห้างทองร่ำรวย", document_no="LA-89")
+    fake_db.add_library_search_card(
+        3,
+        "ชื่อไฟล์: ห้างทองร่ำรวย.xlsx\nหมวดหมู่: ใบเสนอราคา\nชื่อลูกค้า: ห้างทองร่ำรวย\nรหัสลูกค้า: RRR-01\n"
+        "เลขที่เอกสาร: LA-89",
+    )
+    return fake_db
+
+
+@pytest.mark.parametrize("query", ["SSF-02", "ssf-02", "เลขเอกสาร SSF-02"])
+def test_search_library_exact_document_no_matches_single_file(ns, library_fixture, query):
+    results = ns["search_library"](query, user_id=1)
+    assert len(results) == 1
+    assert results[0]["file_id"] == 1
+    assert results[0]["exact"] is True
+
+
+def test_search_library_exact_customer_code_matches_both_files(ns, library_fixture):
+    """"ASA-02" เป็นรหัสลูกค้าของทั้งใบเสนอราคาและใบประเมินป่าไม้เขียว -> ต้องได้ผลตรงเป๊ะ 2 ไฟล์ (ไม่ใช่ไฟล์เดียว)
+    ให้ ask_question() แสดงรายการให้เลือกแทนการเปิดไฟล์ไหนไฟล์หนึ่งไปเลย"""
+    results = ns["search_library"]("ASA-02", user_id=1)
+    exact_file_ids = {r["file_id"] for r in results if r["exact"]}
+    assert exact_file_ids == {1, 2}
+
+
+def test_search_library_ranks_item_match_first_by_bm25(ns, library_fixture):
+    """"ใบที่มี Rack 9U" ไม่ตรงเป๊ะกับฟิลด์ระบุตัวตนไหนเลย แต่ต้องเจอใบเสนอราคาป่าไม้เขียวเป็นอันดับ 1 ผ่าน BM25
+    บน card_text (มีบรรทัด "รายการ: Rack case server 9U ...") matched_on ต้องโยงไปที่บรรทัดรายการนั้นด้วย"""
+    results = ns["search_library"]("ใบที่มี Rack 9U", user_id=1)
+    assert results
+    assert results[0]["file_id"] == 1
+    assert results[0]["exact"] is False
+    assert "Rack" in results[0]["matched_on"]
+
+
+def test_search_library_min_total_filter_excludes_lower_amount_files(ns, library_fixture):
+    """filters min_total=60000 ต้องเหลือเฉพาะไฟล์ที่ total_amount >= 60,000 (ใบเสนอราคาป่าไม้เขียว 62,220.50
+    เท่านั้น — อีก 2 ไฟล์ไม่มี total_amount เลย ถือว่าไม่ผ่านเงื่อนไขนี้)"""
+    results = ns["search_library"]("ป่าไม้เขียว", user_id=1, filters={"min_total": 60000})
+    assert {r["file_id"] for r in results} == {1}
+
+
+def test_search_library_no_match_returns_empty(ns, library_fixture):
+    """"แนะนำสาย CAT-6" ไม่มีอยู่ในคลังเลย (ไม่ตรงเป๊ะ ไม่มีคำไหนปนกับ card_text ไฟล์ไหนเลย) ต้องได้ผลว่างเปล่า —
+    ปล่อยให้ routing เดิมตัดสินเป็น advisor ต่อไป (ดู test_looks_like_library_query_does_not_match_product_model_
+    codes ที่ยืนยันแล้วว่า _looks_like_library_query เองก็คืน False สำหรับคำถามแบบนี้อยู่แล้วตั้งแต่ก่อนถึงจุดนี้)"""
+    results = ns["search_library"]("แนะนำสาย CAT-6", user_id=1)
+    assert results == []
+
+
+def test_build_library_search_card_survives_uncomputable_values(ns, doc1):
+    """ไฟล์ที่ label เป็นสูตรคำนวณไม่ได้ (เช่น BAHTTEXT ที่ pycel ไม่รองรับ — ดู fixture doc1/build_fixture_
+    workbook) ต้องยังสร้างบัตรได้สำเร็จไม่ crash (ใช้เท่าที่มี — ข้าม label ที่ value เป็น None)"""
+    fake_db = ns["_fake_db"]
+    doc = fake_db.documents[1]
+    fake_db.add_library_file(99, doc["filename"], "lib/99.xlsx", label_map=doc["label_map"])
+    fake_db.add_storage_blob("lib/99.xlsx", doc["original_bytes"])
+
+    card = ns["build_library_search_card"](99)
+    assert card is not None
+    assert "ชื่อไฟล์" in card["card_text"]
+
+
+def test_build_library_search_card_returns_none_for_missing_file(ns):
+    assert ns["build_library_search_card"](9999) is None
+
+
+def test_library_route_system_prompt_forbids_reference_data_wording(ns):
+    """system prompt เส้นทาง library ต้องไม่มีกติกาแนว "ใช้ข้อมูลอ้างอิงเป็นหลัก"/เนื้อหากฎหมาย พ.ร.บ.ต่างด้าว
+    (ของเส้นทาง legal) ปนมาเลย แต่ต้องสั่งห้ามใช้คำว่า "ข้อมูลอ้างอิง" กับผู้ใช้แทน (คำนี้ปรากฏได้แค่ในประโยคห้าม
+    เท่านั้น ไม่ใช่ใช้เป็นกติกาเชิงบวกแบบเส้นทาง legal) — เหตุการณ์จริงที่แก้: "เลขเอกสาร SSF-02" เคยได้คำตอบ
+    "ข้อมูลอ้างอิงที่ให้มาไม่มี..." เพราะ system prompt เดิมของเส้นทางกฎหมายถูกใช้ร่วมกันทุกเส้นทาง"""
+    prompt = ns["LIBRARY_ROUTE_SYSTEM_PROMPT"]
+    assert "ห้ามใช้คำว่า \"ข้อมูลอ้างอิง\"" in prompt
+    assert "พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว" not in prompt
+    assert "ใช้ข้อมูลนั้นเป็นหลัก" not in prompt
+
+
+def test_advisor_answer_includes_search_library_tool_only_when_logged_in(ns):
+    """SEARCH_LIBRARY_TOOL เข้าถึงข้อมูลส่วนตัว (เหมือน LIBRARY_TOOLS ทุกตัว) ต้องไม่ส่งให้ guest เห็นเลย"""
+    ns["_fake_agentic_loop"].set_response("คำตอบ", [], False)
+    ns["advisor_answer"]("แนะนำตู้ Rack 9U ที่ดีที่สุด", user_id=None, chat_id=None, active_docs=[])
+    call_args = ns["_fake_agentic_loop"].last_call_args
+    assert ns["SEARCH_LIBRARY_TOOL"] not in call_args["tools_override"]
+
+
+def test_looks_like_library_query_false_for_advisor_product_question(ns):
+    """"แนะนำตู้ Rack 9U ที่ดีที่สุด" ต้องไม่ถูกตัดสินเป็น library ด้วยโค้ดเลย (ไม่มีรหัสเอกสาร/คำเชิงคลังปนมา) —
+    ห้ามเปิดไฟล์อัตโนมัติจากคะแนน BM25/embedding อย่างเดียว (กัน "แนะนำตู้ Rack 9U" ไปเปิดใบป่าไม้เขียวที่มี
+    "Rack case server 9U" อยู่ในรายการ โดยไม่ได้ตั้งใจ — ดู B4 ใน ask_question เอง ที่เช็คเงื่อนไขนี้ก่อนเรียก
+    search_library เสมอ)"""
+    assert ns["_looks_like_library_query"]("แนะนำตู้ Rack 9U ที่ดีที่สุด") is False
+
+
+def test_resolve_library_exact_match_dispatch_opens_single_exact_match(ns, library_fixture):
+    result = ns["_resolve_library_exact_match_dispatch"]("SSF-02", user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is not None
+    assert "เปิดไฟล์" in result["answer"]
+    active_docs = ns["list_active_editable_documents_by_chat"](1, 1)
+    assert any(d["id"] == result["document_id"] for d in active_docs)
+
+
+def test_resolve_library_exact_match_dispatch_reports_already_open(ns, library_fixture):
+    """เรียกซ้ำสองครั้งด้วย query เดิม ("SSF-02") — รอบสองต้องไม่สร้าง EditableDocument ใหม่ซ้ำ ตอบว่าเปิดอยู่แล้ว
+    แทน (พฤติกรรมเดิมของ execute_open_library_file — ใช้ตรงๆ ไม่เขียน logic ใหม่)"""
+    first = ns["_resolve_library_exact_match_dispatch"]("SSF-02", user_id=1, chat_id=1)
+    second = ns["_resolve_library_exact_match_dispatch"]("SSF-02", user_id=1, chat_id=1)
+    assert second["document_id"] == first["document_id"]
+    assert "เปิดอยู่ในแชทนี้แล้ว" in second["answer"]
+
+
+def test_resolve_library_exact_match_dispatch_lists_multiple_exact_matches(ns, library_fixture):
+    """"ASA-02" ตรงเป๊ะ 2 ไฟล์ (รหัสลูกค้าเดียวกัน) -> ต้องได้รายการให้เลือก ไม่เปิดไฟล์ไหนไปเลย"""
+    result = ns["_resolve_library_exact_match_dispatch"]("ASA-02", user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is None
+    assert "ต้องการเปิดข้อไหนครับ" in result["answer"]
+    listing = ns["_fake_db"].get_chat_last_listing(1)
+    assert listing is not None
+    assert listing["kind"] == "documents"
+    assert len(listing["items"]) == 2
+    assert ns["list_active_editable_documents_by_chat"](1, 1) == []
+
+
+def test_resolve_library_exact_match_dispatch_none_for_advisor_product_question(ns, library_fixture):
+    """"แนะนำตู้ Rack 9U ที่ดีที่สุด" ต้องคืน None (ไม่ผ่านด่าน _looks_like_library_query เลย) ไม่เปิดไฟล์ป่าไม้
+    เขียวอัตโนมัติทั้งที่มันมี "Rack case server 9U" อยู่ในรายการ (คะแนน BM25/embedding สูงแค่ไหนก็ไม่เปิดเอง)"""
+    result = ns["_resolve_library_exact_match_dispatch"]("แนะนำตู้ Rack 9U ที่ดีที่สุด", user_id=1, chat_id=1)
+    assert result is None
+    assert ns["list_active_editable_documents_by_chat"](1, 1) == []
+
+
+def test_resolve_library_exact_match_dispatch_none_when_no_exact_match(ns, library_fixture):
+    assert ns["_resolve_library_exact_match_dispatch"]("แนะนำสาย CAT-6", user_id=1, chat_id=1) is None
+
+
+# ---------- feat/library-search-and-api-errors ส่วนต่อ: รหัสเอกสารติดอักษรไทย (ไม่เว้นวรรค) ----------
+# บั๊ก: \b ใน Python regex นับอักษรไทยเป็น \w ด้วย -> ไม่มีขอบเขต \w ระหว่างรหัสอังกฤษ/ตัวเลขกับอักษรไทยที่ติดกัน
+# "เปิดใบSSF-02"/"เลขเอกสารSSF-02"/"SSF-02ครับ" (คนไทยพิมพ์ติดกันบ่อยมาก) จึงไม่เจอทั้งที่แบบเว้นวรรคเจอปกติ —
+# แก้ด้วย lookaround ที่เช็คเฉพาะอักษรอังกฤษ/ตัวเลข (_LIBRARY_DOCUMENT_CODE_RE, _library_search_exact_match_fields)
+
+def test_query_matches_document_code_context_true_for_code_touching_polite_word(ns):
+    """"SSF-02ครับ" (รหัสติดคำลงท้ายสุภาพ ไม่มีช่องว่างคั่น) -> ตัดรหัสออกแล้วเหลือ "ครับ" ล้วนๆ -> True เหมือนกับ
+    "SSF-02 ครับ" ที่เว้นวรรค"""
+    assert ns["_query_matches_document_code_context"]("SSF-02ครับ") is True
+
+
+@pytest.mark.parametrize("query", ["เปิดใบSSF-02", "เลขเอกสารSSF-02", "SSF-02ครับ", "ssf-02"])
+def test_search_library_exact_match_works_when_code_touches_thai_text(ns, library_fixture, query):
+    results = ns["search_library"](query, user_id=1)
+    exact_file_ids = {r["file_id"] for r in results if r["exact"]}
+    assert exact_file_ids == {1}
+
+
+@pytest.mark.parametrize("query", ["เปิดใบSSF-02", "เลขเอกสารSSF-02", "SSF-02ครับ", "ssf-02"])
+def test_resolve_library_exact_match_dispatch_opens_when_code_touches_thai_text(ns, library_fixture, query):
+    result = ns["_resolve_library_exact_match_dispatch"](query, user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is not None
+
+
+def test_resolve_library_exact_match_dispatch_lists_multiple_when_code_touches_thai_text(ns, library_fixture):
+    """"ASA-02ครับ" (รหัสลูกค้าติดคำลงท้ายสุภาพ ไม่เว้นวรรค) ต้องยังตรงเป๊ะ 2 ไฟล์เหมือน "ASA-02" เดี่ยวๆ"""
+    result = ns["_resolve_library_exact_match_dispatch"]("ASA-02ครับ", user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is None
+    assert "ต้องการเปิดข้อไหนครับ" in result["answer"]
+
+
+def test_resolve_library_exact_match_dispatch_none_for_product_code_touching_thai_text(ns, library_fixture):
+    """"แนะนำสายCAT-6ที่ดีที่สุด" (รหัสรุ่นสินค้าติดอักษรไทย ไม่เว้นวรรค) ต้องยังไม่ถูกตัดสินเป็น library เลย
+    เหมือนเวอร์ชันเว้นวรรค ไม่เปิดไฟล์อัตโนมัติจากคะแนน BM25/embedding"""
+    assert ns["_looks_like_library_query"]("แนะนำสายCAT-6ที่ดีที่สุด") is False
+    result = ns["_resolve_library_exact_match_dispatch"]("แนะนำสายCAT-6ที่ดีที่สุด", user_id=1, chat_id=1)
+    assert result is None
+
+
+@pytest.mark.parametrize("query", ["RSSF-02", "SSF-021"])
+def test_search_library_exact_match_does_not_match_longer_adjacent_codes(ns, library_fixture, query):
+    """"RSSF-02"/"SSF-021" มีตัวอักษร/ตัวเลขภาษาอังกฤษติดกับ "SSF-02" จริงๆ (ไม่ใช่อักษรไทย) -> ต้องไม่ถือว่าตรงเป๊ะ
+    กับ SSF-02 (lookaround กันเฉพาะอักษรไทยที่ติดกัน ต้องไม่กันหลวมจนจับรหัสอื่นที่ยาว/สั้นกว่าผิด)"""
+    results = ns["search_library"](query, user_id=1)
+    exact_file_ids = {r["file_id"] for r in results if r["exact"]}
+    assert 1 not in exact_file_ids
