@@ -385,7 +385,25 @@ def rewrite_query_for_retrieval(query: str, history: list) -> str:
     )
     rewritten = response.content[0].text.strip()
     print(f"[QueryRewriter] original={query!r} -> rewritten={rewritten!r}")  # เช็คผลผ่าน Railway logs ได้
+    if rewritten and _query_rewrite_turned_command_into_question(query, rewritten):
+        print(f"[QueryRewriter] rejected rewrite (turned command into question): {rewritten!r}")
+        return query
     return rewritten if rewritten else query
+
+
+# คำกริยาสั่งที่ไม่ควรถูก QueryRewriter เปลี่ยนเป็นคำถาม (ดู _query_rewrite_turned_command_into_question)
+_QUERY_REWRITE_COMMAND_VERBS = ("เอา", "แทน", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "แก้")
+_QUERY_REWRITE_QUESTION_SUFFIXES = ("ไหม", "ใช่ไหม", "?")
+
+
+def _query_rewrite_turned_command_into_question(original: str, rewritten: str) -> bool:
+    """True ถ้า original เป็นคำสั่งแก้ไฟล์ (ไม่ใช่คำถาม) แต่ rewritten ลงท้ายเป็นคำถามแทน"""
+    original_stripped = original.strip()
+    if not any(word in original_stripped for word in _QUERY_REWRITE_COMMAND_VERBS):
+        return False
+    if original_stripped.endswith(_QUERY_REWRITE_QUESTION_SUFFIXES):
+        return False
+    return rewritten.strip().endswith(_QUERY_REWRITE_QUESTION_SUFFIXES)
 
 UNEXPECTED_SCRIPT_PATTERN = re.compile(
     # ช่วง Unicode ของอักษรจีน/ญี่ปุ่น/เกาหลี ที่ไม่ควรโผล่ในคำตอบภาษาไทย
@@ -5250,9 +5268,12 @@ def _ask_question_api_error_response(error: Exception, chat_id: Optional[int]) -
     error ที่ไม่ใช่คำตอบจริง ผู้ใช้พิมพ์คำถามเดิมซ้ำได้ทันทีโดยไม่มีข้อความ error ค้างอยู่ในประวัติให้สับสน/ปนกับ
     บริบทจริงของบทสนทนาที่ AI จะเห็นในเทิร์นถัดๆ ไป
 
-    log [APIError] type=<ชื่อคลาส> status=<status_code> เท่านั้น (ห้าม log ข้อความ exception หรือเนื้อหาคำถาม
-    ผู้ใช้ — อาจมีข้อมูลอ่อนไหวปนอยู่)"""
-    print(f"[APIError] type={type(error).__name__} status={getattr(error, 'status_code', None)}")
+    log [APIError] type=<ชื่อคลาส> status=<status_code> message=<ข้อความ error ของ Anthropic เอง ตัดไม่เกิน 300
+    ตัวอักษร> (ห้าม log เนื้อหาคำถามผู้ใช้/API key — ข้อความ error เป็นคำอธิบายจาก Anthropic เอง ไม่ใช่ query)"""
+    print(
+        f"[APIError] type={type(error).__name__} status={getattr(error, 'status_code', None)} "
+        f"message={str(error)[:300]!r}"
+    )
     return {"answer": _categorize_anthropic_api_error(error), "sources": [], "chat_id": chat_id}
 
 
@@ -9620,7 +9641,10 @@ def _resolve_recommendation_intent_with_llm(
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:
-        print(f"[RecommendationResolver] llm_call_failed exception_type={type(e).__name__}")
+        print(
+            f"[RecommendationResolver] llm_call_failed exception_type={type(e).__name__} "
+            f"status={getattr(e, 'status_code', None)} message={str(e)[:300]!r}"
+        )
         return None
 
     tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
@@ -9830,8 +9854,10 @@ ROUTE_INTENT_TOOL = {
                 "description": "จำนวนที่ผู้ใช้ต้องการ (ดูจากบริบทบทสนทนาทั้งหมด ไม่ใช่แค่ข้อความล่าสุด) ไม่เคยพูดถึงเลยใส่ null",
             },
             "price_mode": {
-                "type": ["string", "null"],
-                "enum": ["recommended", "original", "explicit", "markup"],
+                "anyOf": [
+                    {"type": "string", "enum": ["recommended", "original", "explicit", "markup"]},
+                    {"type": "null"},
+                ],
                 "description": "ใช้เมื่อ intent เป็น replace_with_recommendation/add_recommendation เท่านั้น ไม่งั้นใส่ null",
             },
             "explicit_price": {"type": ["number", "null"], "description": "ราคา/หน่วยที่ผู้ใช้ระบุเอง ใช้เมื่อ price_mode เป็น explicit เท่านั้น"},
@@ -9995,7 +10021,10 @@ def route_intent_with_llm(
             messages=[{"role": "user", "content": prompt}],
         )
     except Exception as e:
-        print(f"[Router] llm_call_failed exception_type={type(e).__name__}")
+        print(
+            f"[Router] llm_call_failed exception_type={type(e).__name__} "
+            f"status={getattr(e, 'status_code', None)} message={str(e)[:300]!r}"
+        )
         return None
 
     tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
