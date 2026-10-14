@@ -393,17 +393,29 @@ def rewrite_query_for_retrieval(query: str, history: list) -> str:
 
 # คำกริยาสั่งที่ไม่ควรถูก QueryRewriter เปลี่ยนเป็นคำถาม (ดู _query_rewrite_turned_command_into_question)
 _QUERY_REWRITE_COMMAND_VERBS = ("เอา", "แทน", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "แก้")
-_QUERY_REWRITE_QUESTION_SUFFIXES = ("ไหม", "ใช่ไหม", "?")
+_QUERY_REWRITE_QUESTION_SUFFIXES = ("ไหม", "ใช่ไหม", "มั้ย", "หรือไม่", "หรือเปล่า", "ไหมครับ", "?")
+_TRAILING_POLITE_PARTICLE_RE = re.compile(r"[\s.]*(?:ครับ|ค่ะ|คะ|นะ|จ้ะ|จ้า)+[\s.]*$")
+
+
+def _strip_trailing_polite_particles(text: str) -> str:
+    """ตัดคำลงท้ายสุภาพ+ช่องว่าง/จุดท้ายประโยคออกให้หมด (วนซ้ำกันคำซ้อน เช่น "...ใช่ไหมครับ")"""
+    text = text.strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = _TRAILING_POLITE_PARTICLE_RE.sub("", text).strip()
+    return text
 
 
 def _query_rewrite_turned_command_into_question(original: str, rewritten: str) -> bool:
-    """True ถ้า original เป็นคำสั่งแก้ไฟล์ (ไม่ใช่คำถาม) แต่ rewritten ลงท้ายเป็นคำถามแทน"""
-    original_stripped = original.strip()
+    """True ถ้า original เป็นคำสั่งแก้ไฟล์ (ไม่ใช่คำถาม) แต่ rewritten ลงท้ายเป็นคำถามแทน — ตัดคำลงท้ายสุภาพออกก่อน
+    เช็คเสมอ (เช่น "...จำนวน 2 ชิ้น ใช่ไหมครับ" ต้องจับได้ ไม่ใช่แค่ลงท้าย "ไหม"/"?" เป๊ะๆ)"""
+    original_stripped = _strip_trailing_polite_particles(original)
     if not any(word in original_stripped for word in _QUERY_REWRITE_COMMAND_VERBS):
         return False
     if original_stripped.endswith(_QUERY_REWRITE_QUESTION_SUFFIXES):
         return False
-    return rewritten.strip().endswith(_QUERY_REWRITE_QUESTION_SUFFIXES)
+    return _strip_trailing_polite_particles(rewritten).endswith(_QUERY_REWRITE_QUESTION_SUFFIXES)
 
 UNEXPECTED_SCRIPT_PATTERN = re.compile(
     # ช่วง Unicode ของอักษรจีน/ญี่ปุ่น/เกาหลี ที่ไม่ควรโผล่ในคำตอบภาษาไทย
