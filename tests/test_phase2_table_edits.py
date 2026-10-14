@@ -2468,3 +2468,393 @@ def test_resolve_library_full_listing_dispatch_none_for_unrelated_query(ns, libr
     """"เอกสารของป่าไม้เขียว" ไม่ใช่คำขอรายชื่อเอกสารทั้งหมดในคลัง -> ต้องคืน None ปล่อยให้ routing ทางอื่นตัดสินต่อ"""
     assert ns["_looks_like_full_library_listing_query"]("เอกสารของป่าไม้เขียว") is False
     assert ns["_resolve_library_full_listing_dispatch"]("เอกสารของป่าไม้เขียว", chat_id=1) is None
+
+
+# ---------- feat/llm-intent-router ----------
+# เหตุการณ์จริงที่แก้: เปิด SSF-02 -> แนะนำ HDD -> "อยากได้ 16tb 2 ตัว" -> ได้รายการแนะนำ Seagate SkyHawk AI
+# 16TB -> "เอา Seagate SkyHawk เเทน HDD เก่าเลย" เคยตอบ "ยังไม่ได้แก้ไขไฟล์ครับ..." เพราะด่านคำสำคัญซ้อนกันหลายชั้น
+# เดิมจับไม่ได้ — router ตัวเดียวเห็นบริบททั้งหมด ตัดสิน intent + ค่า เป็น JSON แล้วโค้ดตรวจ+ส่งให้ handler เดิม
+
+_ROUTER_HDD_ITEMS = [
+    ("Camera 4MP", 10, "ตัว", 2500),
+    ("NVR 16CH", 1, "เครื่อง", 15000),
+    ("Switch 8 port", 2, "ตัว", 1200),
+    ("Cable UTP", 100, "เมตร", 15),
+    ("Power supply", 5, "ตัว", 850),
+    ("HDD เก่า 4TB", 2, "ลูก", 2800),
+]
+
+
+def _build_router_hdd_quote_workbook():
+    """ใบเสนอราคาที่รายการที่ 6 เป็น HDD เก่าที่จะถูกแทน — รายการ 1-5 รวมกัน 48,150 บาท ตั้งใจให้หลังแทนรายการที่ 6
+    ด้วย Seagate SkyHawk AI 16TB (19,500 บาท/ตัว x 2) แล้วได้ยอดรวม 87,150 ตรงกับเหตุการณ์จริงที่ใช้ทดสอบ"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+    ws["A15"] = "ลำดับ"
+    ws["B15"] = "รายการ"
+    ws["D15"] = "จำนวน"
+    ws["E15"] = "หน่วย"
+    ws["F15"] = "ราคา/หน่วย"
+    ws["G15"] = "จำนวนเงิน"
+
+    cache_values = {}
+    for i, (desc, qty, unit, price) in enumerate(_ROUTER_HDD_ITEMS):
+        row = 16 + i
+        ws.cell(row=row, column=1, value=i + 1)
+        ws.cell(row=row, column=2, value=desc)
+        ws.cell(row=row, column=4, value=qty)
+        ws.cell(row=row, column=5, value=unit)
+        ws.cell(row=row, column=6, value=price)
+        ws.cell(row=row, column=7, value=f"=D{row}*F{row}")
+        cache_values[f"G{row}"] = qty * price
+
+    last_item_row = 16 + len(_ROUTER_HDD_ITEMS) - 1
+    total = sum(qty * price for _, qty, _, price in _ROUTER_HDD_ITEMS)
+    ws["A26"] = "รวมเงิน"
+    ws["G26"] = f"=SUM(G16:G{last_item_row})"
+    cache_values["G26"] = total
+
+    ws["A27"] = "ภาษีมูลค่าเพิ่ม 7%"
+    ws["G27"] = "=SUM(G26)*7/100"
+    cache_values["G27"] = round(total * 0.07, 2)
+
+    ws["A28"] = "รวมราคาทั้งสิ้น"
+    ws["G28"] = "=SUM(G26:G27)"
+    cache_values["G28"] = total + round(total * 0.07, 2)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return inject_formula_cache(buf.getvalue(), cache_values)
+
+
+@pytest.fixture
+def router_hdd_doc(ns):
+    raw = _build_router_hdd_quote_workbook()
+    label_map = ns["_extract_excel_labels"](raw)
+    ns["_fake_db"].add_document(1, "quote.xlsx", raw, label_map, chat_id=1, user_id=1)
+    return ns["_fake_db"].documents[1]
+
+
+def _route_intent_response(**overrides) -> "_FakeAgenticResponse":
+    """สร้าง response จำลองของ route_intent_with_llm (tool_use block เดียว, ครบทุก field ตาม ROUTE_INTENT_TOOL —
+    เทสต์ override เฉพาะ field ที่สนใจ ที่เหลือเป็นค่า null/safe default)"""
+    fields = {
+        "intent": "general_question", "target_item_index": None, "recommendation_index": None,
+        "quantity": None, "price_mode": None, "explicit_price": None, "markup_percent": None,
+        "edit_instruction": None, "library_query": None, "library_filters": None,
+        "clarification_question": None, "confidence": "high",
+    }
+    fields.update(overrides)
+    return _FakeAgenticResponse(
+        [_FakeAgenticToolUseBlock("call_1", "route_intent", fields)], stop_reason="tool_use",
+    )
+
+
+def test_resolve_llm_router_dispatch_replaces_item_with_recommendation_from_chat_history(ns, router_hdd_doc):
+    """เหตุการณ์จริงหลักที่แก้: router ตัดสิน replace_with_recommendation target=6 rec=1 quantity=2 จากบริบท
+    บทสนทนา (ไม่ใช่จากข้อความล่าสุดเพียวๆ) -> รายการ 6 ถูกแทนด้วย Seagate SkyHawk AI 16TB จำนวน 2 -> ยอดรวม
+    87,150 / VAT 6,100.50 / รวมทั้งสิ้น 93,250.50"""
+    ns["set_chat_last_recommendations"](1, [{
+        "name": "Seagate SkyHawk AI 16TB", "key_specs": "7200RPM เขียนอ่านต่อเนื่อง", "price_thb": 19500,
+        "price_note": None, "unit": "ตัว", "source_url": "https://shop.example/skyhawk", "compatible": True,
+        "compatibility_note": None,
+    }])
+    ns["_fake_db"].chat_messages[1] = [
+        {"role": "user", "content": "แนะนำฮาร์ดดิสก์กล้องวงจรปิดให้หน่อย"},
+        {"role": "assistant", "content": "ต้องการความจุเท่าไรครับ"},
+        {"role": "user", "content": "อยากได้ 16tb 2 ตัว"},
+        {"role": "assistant", "content": "แนะนำ Seagate SkyHawk AI 16TB ราคา 19,500 บาท/ตัวครับ"},
+    ]
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="replace_with_recommendation", target_item_index=6, recommendation_index=1, quantity=2,
+        price_mode="recommended",
+    )]
+
+    result = ns["_resolve_llm_router_dispatch"]("เอา Seagate SkyHawk เเทน HDD เก่าเลย", 1, 1, [router_hdd_doc])
+    assert result is not None
+    answer = result["answer"]
+    assert "✓ แทนรายการที่ 6 (HDD เก่า 4TB) ด้วย Seagate SkyHawk AI 16TB" in answer
+    assert "ราคา/หน่วย 2,800 → 19,500" in answer
+
+    totals_by_label = {l["label"]: l["value"] for l in _current(ns)["labels"]}
+    assert totals_by_label["รวมเงิน"] == 87150
+    assert totals_by_label["ภาษีมูลค่าเพิ่ม 7%"] == 6100.50
+    assert totals_by_label["รวมราคาทั้งสิ้น"] == 93250.50
+
+
+def test_resolve_llm_router_dispatch_target_out_of_range_does_not_edit(ns, box_doc):
+    """router ส่ง target_item_index เกินช่วงตาราง (มีแค่ 8 รายการ) -> ไม่แก้ไฟล์ ตอบข้อความชี้แจงจากโค้ด (ไม่ใช่
+    ปล่อยให้ตกไปทางอื่นเงียบๆ)"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="replace_with_recommendation", target_item_index=99, recommendation_index=1, price_mode="recommended",
+    )]
+
+    result = ns["_resolve_llm_router_dispatch"]("เอารุ่นนี้แทนเลย", 1, 1, [box_doc])
+    assert result is not None
+    assert "ไม่พบรายการที่ระบุในตาราง" in result["answer"]
+
+    row = _current(ns)["tables"][0]["rows"][5]["values"]  # Item F (รายการที่ 6) ต้องไม่ถูกแตะเลย
+    assert row["description"] == "Item F"
+    assert row["qty"] == 4
+
+
+def test_route_intent_with_llm_returns_none_on_api_error(ns):
+    """router ล้มด้วย API error -> คืน None (ให้ ask_question() fallback ไปใช้ routing เดิมทั้งหมดเหมือนก่อน PR นี้
+    — ไม่ใช่ error ที่ผู้ใช้เห็นตรงๆ เหมือน anthropic.APIError ที่หลุดจาก advisor_answer/rag_answer)"""
+    ns["_fake_client"].raise_on_create = Exception("boom")
+    assert ns["route_intent_with_llm"]("ขอความช่วยเหลือ", user_id=1, chat_id=1, active_docs=[]) is None
+    assert ns["_resolve_llm_router_dispatch"]("ขอความช่วยเหลือ", 1, 1, []) is None
+
+
+def test_route_intent_with_llm_skips_call_when_router_mode_is_legacy(ns):
+    """ROUTER_MODE="legacy" -> route_intent_with_llm ไม่เรียก LLM เลยสักครั้ง (เช็คจาก call_count == 0 ไม่ใช่แค่
+    ผลลัพธ์เป็น None — กันกรณีเรียกไปแล้วแต่ parse ไม่ได้ซึ่งก็ได้ None เหมือนกันแต่เสีย API call ไปแล้ว)"""
+    ns["ROUTER_MODE"] = "legacy"
+    result = ns["route_intent_with_llm"]("เปลี่ยนจำนวน Box 4x4 เป็น 30", user_id=1, chat_id=1, active_docs=[])
+    assert result is None
+    assert ns["_fake_client"].call_count == 0
+
+
+# ---------- ทางลัดด้วยโค้ดล้วนๆ (①) ต้องไม่เรียก router เลย (เช็คจาก _fake_client.call_count == 0) ----------
+
+def test_undo_command_shortcut_does_not_call_llm_client(ns):
+    assert ns["_is_undo_command"]("ย้อนการแก้") is True
+    assert ns["_fake_client"].call_count == 0
+
+
+def test_library_exact_match_shortcut_does_not_call_llm_client(ns, library_fixture):
+    result = ns["_resolve_library_exact_match_dispatch"]("SSF-02", user_id=1, chat_id=1)
+    assert result is not None
+    assert ns["_fake_client"].call_count == 0
+
+
+def test_direct_structural_shortcut_does_not_call_llm_client(ns, box_doc):
+    result = ns["_resolve_direct_structural_dispatch"]("ลบรายการที่ 3", [box_doc], 1, 1)
+    assert result is not None
+    assert ns["_fake_client"].call_count == 0
+
+
+def test_recommendation_regex_shortcut_does_not_call_llm_client(ns, box_doc):
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1", [box_doc], 1, 1)
+    assert result is not None
+    assert ns["_fake_client"].call_count == 0
+
+
+# ---------- intent แต่ละตัว dispatch ไป handler ถูกตัว (อย่างน้อย 1 test ต่อ intent) ----------
+
+def test_router_dispatch_edit_document_uses_direct_structural_dispatch(ns, box_doc):
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="edit_document", edit_instruction="เปลี่ยนจำนวน Box 4x4 เป็น 30",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("เปลี่ยนจำนวนอันแรกเป็น 30 หน่อย", 1, 1, [box_doc])
+    assert result is not None
+    row = _current(ns)["tables"][0]["rows"][0]["values"]
+    assert row["description"] == "Box 4x4"
+    assert row["qty"] == 30
+
+
+def test_router_dispatch_add_recommendation_appends_new_row(ns, doc1):
+    """ใช้ doc1 (ไม่ใช่ box_doc) เพราะ box_doc ตารางเต็มพอดี 8 แถว (ไม่มีที่ว่างให้เพิ่มรายการใหม่เลย) — doc1 มีแถว
+    ว่างเหลืออีก 2 แถวในความจุตาราง (ดู FIXTURE_LAST_ITEM_ROW)"""
+    ns["set_chat_last_recommendations"](1, _SAMPLE_RECOMMENDATIONS)
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="add_recommendation", recommendation_index=1, quantity=3, price_mode="recommended",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("เพิ่มรุ่นนี้อีก 3 ตู้", 1, 1, [doc1])
+    assert result is not None
+    assert "✓" in result["answer"]
+    rows = _current(ns)["tables"][0]["rows"]
+    assert rows[-1]["values"]["description"] == "Rack case 9U รุ่นประหยัด"
+    assert rows[-1]["values"]["qty"] == 3
+
+
+def test_router_dispatch_read_document_answers_from_table(ns, box_doc):
+    ns["_fake_client"].response_queue = [_route_intent_response(intent="read_document")]
+    result = ns["_resolve_llm_router_dispatch"]("ยอดรวมเท่าไร", 1, 1, [box_doc])
+    assert result is not None
+    assert result["document_id"] == box_doc["id"]
+    assert result["answer"]
+
+
+def test_router_dispatch_recommend_products_calls_advisor(ns):
+    ns["_fake_client"].response_queue = [_route_intent_response(intent="recommend_products")]
+    ns["_fake_agentic_loop"].set_response("แนะนำสาย CAT-6 ยี่ห้อ X ครับ", [], False)
+    result = ns["_resolve_llm_router_dispatch"]("แนะนำสาย CAT-6", 1, 1, [])
+    assert result is not None
+    assert result["answer"].startswith("แนะนำสาย CAT-6 ยี่ห้อ X ครับ")
+    assert ns["_fake_agentic_loop"].last_call_args["model"] == ns["ADVISOR_MODEL"]
+
+
+def test_router_dispatch_general_question_calls_advisor(ns):
+    ns["_fake_client"].response_queue = [_route_intent_response(intent="general_question")]
+    ns["_fake_agentic_loop"].set_response("สวัสดีครับ มีอะไรให้ช่วยไหมครับ", [], False)
+    result = ns["_resolve_llm_router_dispatch"]("สวัสดีครับ", 1, 1, [])
+    assert result is not None
+    assert result["answer"] == "สวัสดีครับ มีอะไรให้ช่วยไหมครับ"
+    assert ns["_fake_agentic_loop"].last_call_args["model"] == ns["ADVISOR_MODEL"]
+
+
+def test_router_dispatch_legal_question_calls_rag_answer(ns):
+    ns["_fake_client"].response_queue = [_route_intent_response(intent="legal_question")]
+    ns["_fake_agentic_loop"].set_response("ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ", [], False)
+    result = ns["_resolve_llm_router_dispatch"]("ธุรกิจบัญชีสามมีอะไรบ้าง", 1, 1, [])
+    assert result is not None
+    assert result["answer"] == "ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ"
+
+
+def test_router_dispatch_library_search_lists_matching_documents(ns, library_fixture):
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="library_search", library_query="SSF-02",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("หาเอกสาร SSF-02 หน่อย", 1, 1, [])
+    assert result is not None
+    assert "ใบเสนอราคาป่าไม้เขียว" in result["answer"]
+    assert "ต้องการเปิดข้อไหนครับ" in result["answer"]
+    listing = ns["_fake_db"].get_chat_last_listing(1)
+    assert listing["kind"] == "documents"
+
+
+def test_router_dispatch_library_search_falls_back_to_agent_when_no_results(ns, library_fixture):
+    """ไม่เจอผลจาก search_library เลย -> ส่งต่อให้ rag_answer(skip_legal_context=True) ให้ agent คลังเดิมลองทางอื่น
+    ต่อ แทนที่จะตอบ "ไม่พบ" ทันที"""
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="library_search", library_query="ไม่มีทางเจออะไรเลย xyz123",
+    )]
+    ns["_fake_agentic_loop"].set_response("ลองค้นด้วย find_customers แล้วไม่พบครับ", [], False)
+    result = ns["_resolve_llm_router_dispatch"]("หาเอกสารที่ไม่มีในคลัง", 1, 1, [])
+    assert result is not None
+    assert result["answer"] == "ลองค้นด้วย find_customers แล้วไม่พบครับ"
+
+
+def test_router_dispatch_ask_clarification_returns_question(ns):
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="ask_clarification", clarification_question="หมายถึงรายการไหนครับ ระบุชื่อสินค้าด้วยได้ไหมครับ",
+        confidence="low",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("เอาอันนั้นแทน", 1, 1, [])
+    assert result is not None
+    assert result["answer"] == "หมายถึงรายการไหนครับ ระบุชื่อสินค้าด้วยได้ไหมครับ"
+
+
+def test_router_dispatch_requires_login_for_file_intents(ns):
+    """guest (user_id=None) ขอแก้ไฟล์ -> ข้อความจากโค้ดตรงๆ ไม่เรียก handler จริงเลย"""
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="edit_document", edit_instruction="ลบรายการที่ 1",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("ลบรายการที่ 1", None, None, [])
+    assert result is not None
+    assert "เข้าสู่ระบบ" in result["answer"]
+
+
+def test_router_dispatch_requires_login_for_library_search(ns):
+    ns["_fake_client"].response_queue = [_route_intent_response(
+        intent="library_search", library_query="SSF-02",
+    )]
+    result = ns["_resolve_llm_router_dispatch"]("หาเอกสาร SSF-02", None, None, [])
+    assert result is not None
+    assert result["answer"] == ns["_LIBRARY_LOGIN_REQUIRED_MESSAGE"]
+
+
+# ---------- แก้คู่กัน: document_type เดาจากโฟลเดอร์/สรุปด้วย ไม่ใช่แค่ชื่อไฟล์ ----------
+
+def test_search_library_min_total_and_document_type_filter_matches_folder_not_just_filename(ns, library_fixture):
+    """"ใบเสนอราคาที่ยอดเกิน 60,000" เคยได้ "ไม่พบ" ทั้งที่มีไฟล์ตรงเงื่อนไขจริง เพราะ _guess_library_document_type
+    เดิมเดาจากชื่อไฟล์อย่างเดียว — ไฟล์ใหม่นี้ชื่อ "ติดตั้งกล้อง cctv สำหรับป่าไม้แดง.xlsx" ไม่มีคำว่า "ใบเสนอราคา"
+    เลยสักคำ แต่อยู่ในโฟลเดอร์/หมวดหมู่ "ใบเสนอราคา" ของคลังจริง (category_id=1 เหมือนไฟล์ SSF-02) ต้องยังกรอง
+    document_type="ใบเสนอราคา" + min_total=60000 เจอได้ทั้งสองไฟล์"""
+    fake_db = ns["_fake_db"]
+    fake_db.add_library_file(4, "ติดตั้งกล้อง cctv สำหรับป่าไม้แดง.xlsx", "lib/4.xlsx", category_id=1)
+    fake_db.add_library_file_meta(4, customer_code="PMD-01", customer_name="ป่าไม้แดง", document_no="PMD-01")
+    fake_db.add_library_search_card(
+        4,
+        "ชื่อไฟล์: ติดตั้งกล้อง cctv สำหรับป่าไม้แดง.xlsx\nหมวดหมู่: ใบเสนอราคา\nประเภทเอกสาร: ใบเสนอราคา\n"
+        "ชื่อลูกค้า: ป่าไม้แดง\nรหัสลูกค้า: PMD-01\nเลขที่เอกสาร: PMD-01\nรวมราคาทั้งสิ้น: 65,000.00",
+        total_amount=65000.00,
+    )
+
+    results = ns["search_library"](
+        "ป่าไม้แดง", user_id=1, filters={"min_total": 60000, "document_type": "ใบเสนอราคา"},
+    )
+    assert {r["file_id"] for r in results} == {4}
+
+
+def test_guess_library_document_type_falls_back_to_folder_when_filename_lacks_keyword(ns):
+    assert ns["_guess_library_document_type"]("ติดตั้งกล้อง cctv.xlsx", "ใบเสนอราคา", None) == "ใบเสนอราคา"
+    assert ns["_guess_library_document_type"]("ติดตั้งกล้อง cctv.xlsx", None, None) is None
+
+
+def test_search_library_document_type_filter_mismatch_retries_without_it(ns, library_fixture):
+    """document_type ที่ระบุมาไม่ตรงกับไฟล์ไหนในคลังเลยสักไฟล์ (ทุกไฟล์เป็นใบเสนอราคา/ใบประเมิน ไม่มีไฟล์ไหนเป็น
+    "ใบกำกับภาษี") -> ต้องไม่คืนศูนย์ผลทันที ลองใหม่โดยตัด document_type ออก (filter อื่น เช่น min_total ยังกรอง
+    ตามปกติ)"""
+    results = ns["search_library"](
+        "ป่าไม้เขียว", user_id=1, filters={"min_total": 60000, "document_type": "ใบกำกับภาษี"},
+    )
+    assert {r["file_id"] for r in results} == {1}
+
+
+def _build_box_quote_workbook_without_total_cache():
+    """เหมือน _build_box_quote_workbook เป๊ะ (โครงสร้างเดียวกัน — ผ่านการตรวจแล้วว่า _extract_excel_labels จับ
+    label ได้ถูกต้อง เพราะ box_doc fixture ใช้โครงสร้างนี้อยู่แล้วในหลายเทสต์) แต่ไม่ใส่ cached value ให้ "รวมราคา
+    ทั้งสิ้น" (G28) เลย — จำลองไฟล์ในคลังที่สร้าง/แก้ด้วยสคริปต์ ไม่เคยถูกเปิด+บันทึกด้วย Excel จริงมาก่อน (data_
+    only=True อ่านได้ None) ต่างจาก _build_box_quote_workbook ตรงนี้จุดเดียว"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+    ws["A15"] = "ลำดับ"
+    ws["B15"] = "รายการ"
+    ws["D15"] = "จำนวน"
+    ws["E15"] = "หน่วย"
+    ws["F15"] = "ราคา/หน่วย"
+    ws["G15"] = "จำนวนเงิน"
+
+    cache_values = {}
+    for i, (desc, qty, unit, price) in enumerate(_BOX_ITEMS):
+        row = 16 + i
+        ws.cell(row=row, column=1, value=i + 1)
+        ws.cell(row=row, column=2, value=desc)
+        ws.cell(row=row, column=4, value=qty)
+        ws.cell(row=row, column=5, value=unit)
+        ws.cell(row=row, column=6, value=price)
+        ws.cell(row=row, column=7, value=f"=D{row}*F{row}")
+        cache_values[f"G{row}"] = qty * price
+
+    last_item_row = 16 + len(_BOX_ITEMS) - 1
+    ws["A26"] = "รวมเงิน"
+    ws["G26"] = f"=SUM(G16:G{last_item_row})"
+    cache_values["G26"] = _BOX_TOTAL
+
+    ws["A27"] = "ภาษีมูลค่าเพิ่ม 7%"
+    ws["G27"] = "=SUM(G26)*7/100"
+    cache_values["G27"] = _BOX_VAT_7
+
+    ws["A28"] = "รวมราคาทั้งสิ้น"
+    ws["G28"] = "=SUM(G26:G27)"
+    # ไม่ใส่ cache_values["G28"] เลย — นี่คือจุดที่ต่างจาก _build_box_quote_workbook
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return inject_formula_cache(buf.getvalue(), cache_values)
+
+
+def test_build_library_search_card_recalculates_uncached_total_with_pycel(ns, capsys):
+    """ไฟล์ในคลังมักไม่เคยผ่าน EditableDocument/_recalculate_formula_values เลย — label_map ถูก extract ไว้ตอน
+    import ครั้งแรก (ตอนนั้น "รวมราคาทั้งสิ้น" ยังมี cached value ปกติ จึงถูกจับเป็น label ได้) แต่ไฟล์จริงที่เก็บไว้
+    ใน storage (เช่น ถูกแก้ด้วยสคริปต์ภายหลังโดยไม่ผ่าน Excel) ไม่มี cached value ของสูตรนี้แล้ว (data_only=True
+    อ่านได้ None ตอนนี้) — pycel ยังคำนวณได้จริงจากสูตรในไฟล์ปัจจุบันตรงๆ ต้องได้ total_amount ที่ถูกต้อง ไม่ใช่ None
+    (และไม่ log total_unreadable เพราะคำนวณสำเร็จ)"""
+    label_map = ns["_extract_excel_labels"](_build_box_quote_workbook())
+    stored_raw = _build_box_quote_workbook_without_total_cache()
+
+    fake_db = ns["_fake_db"]
+    fake_db.add_library_file(30, "ใบเสนอราคาไม่มี cache.xlsx", "lib/30.xlsx", label_map=label_map)
+    fake_db.add_storage_blob("lib/30.xlsx", stored_raw)
+
+    card = ns["build_library_search_card"](30)
+    assert card is not None
+    assert card["total_amount"] == _BOX_GRAND_7
+    captured = capsys.readouterr()
+    assert "total_unreadable" not in captured.out
