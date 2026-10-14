@@ -209,6 +209,16 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "1234")
 # ทั้งหมด (legal RAG/classifier ต่างๆ) ยังใช้ Haiku เหมือนเดิมทุกจุด ไม่เปลี่ยน
 ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-5-5")
 
+# feat/llm-intent-router: "llm" (ค่าเริ่มต้น) = ask_question() เรียก route_intent_with_llm ตัวเดียวตัดสิน intent
+# ทั้งหมดแทนด่านคำสำคัญซ้อนกันหลายชั้นเดิม (_is_document_reading_question/_looks_like_library_query/
+# _query_has_recommendation_intent_verb/_is_structural_edit_command/single-doc classifier/_classify_question_
+# route ฯลฯ) — ตั้งเป็น "legacy" (เช่นใน Railway env) เพื่อปิดระบบใหม่ทั้งหมด กลับไปใช้ด่านคำสำคัญเดิมทุกจุดทุก
+# ประการ (อ่านค่าตอน import โมดูลครั้งเดียว — เปลี่ยน env var แล้วต้อง restart service ให้โปรเซสใหม่อ่านค่าใหม่
+# แต่ไม่ต้องแก้/deploy โค้ดเลย) — ดู _resolve_llm_router_dispatch/route_intent_with_llm
+ROUTER_MODE = os.environ.get("ROUTER_MODE", "llm")
+# Haiku พอสำหรับงานนี้ (แค่ตัดสิน intent + ดึงค่าจากบริบทเป็น JSON โครงสร้างแน่นอน ไม่ต้องเขียนคำตอบยาวๆ)
+ROUTER_MODEL = os.environ.get("ROUTER_MODEL", "claude-haiku-4-5-20251001")
+
 def require_login(request: Request):
     if not request.session.get("logged_in"):
         raise HTTPException(status_code=401, detail="Not logged in")
@@ -921,12 +931,20 @@ _LIBRARY_CARD_DATE_LABEL_WORDS = ("วันที่", "ครบกำหน�
 _LIBRARY_CARD_TOTAL_LABEL_WORDS = ("รวมเงิน", "ภาษีมูลค่าเพิ่ม", "vat", "รวมราคาทั้งสิ้น", "รวมทั้งสิ้น")
 
 
-def _guess_library_document_type(filename: str) -> Optional[str]:
-    """เดาประเภทเอกสารจากคำสำคัญที่พบบ่อยในชื่อไฟล์ (ไม่ใช้ AI) — ใช้แค่ประกอบบัตรค้นหา (ดู
-    build_library_search_card) ไม่พบคำที่รู้จักเลย -> คืน None"""
-    for word in _LIBRARY_DOCUMENT_TYPE_WORDS:
-        if word in filename:
-            return word
+def _guess_library_document_type(
+    filename: str, folder: Optional[str] = None, summary: Optional[str] = None,
+) -> Optional[str]:
+    """เดาประเภทเอกสารจากคำสำคัญที่พบบ่อยในชื่อไฟล์/ชื่อโฟลเดอร์(หมวดหมู่)ในคลัง/สรุปไฟล์ (ไม่ใช้ AI) — ใช้แค่
+    ประกอบบัตรค้นหา (ดู build_library_search_card) เช็คชื่อไฟล์ก่อนเสมอ (เจาะจงที่สุด) แล้วค่อยโฟลเดอร์ แล้วค่อย
+    สรุป — เหตุการณ์จริงที่แก้: ไฟล์ "ติดตั้งกล้อง cctv สำหรับป่าไม้เขียว.xlsx" อยู่ในโฟลเดอร์ (หมวดหมู่) "ใบเสนอราคา"
+    ของคลังจริงๆ (filter document_type="ใบเสนอราคา" ของ search_library ควรจับไฟล์นี้ได้) แต่ชื่อไฟล์เองไม่มีคำว่า
+    "ใบเสนอราคา" เลยสักคำ (เดิมเดาจากชื่อไฟล์อย่างเดียว คืน None ไปเฉยๆ) ไม่พบคำที่รู้จักเลยสักแหล่ง -> คืน None"""
+    for text in (filename, folder, summary):
+        if not text:
+            continue
+        for word in _LIBRARY_DOCUMENT_TYPE_WORDS:
+            if word in text:
+                return word
     return None
 
 
@@ -951,7 +969,7 @@ def build_library_search_card(file_id: int) -> Optional[dict]:
     folder = categories.get(file_row["category_id"]) or "ไม่มีหมวดหมู่"
 
     lines = [f"ชื่อไฟล์: {file_row['filename']}", f"หมวดหมู่: {folder}"]
-    document_type = _guess_library_document_type(file_row["filename"])
+    document_type = _guess_library_document_type(file_row["filename"], folder, file_row.get("summary"))
     if document_type:
         lines.append(f"ประเภทเอกสาร: {document_type}")
     if meta.get("customer_name"):
@@ -971,7 +989,17 @@ def build_library_search_card(file_id: int) -> Optional[dict]:
     issue_date = None
     try:
         raw_bytes = storage_get(file_row["storage_key"])
-        data = _read_values_from_bytes(raw_bytes, file_row["label_map"])
+        label_map = file_row["label_map"]
+        data = _read_values_from_bytes(raw_bytes, label_map)
+
+        # ไฟล์ในคลังมักไม่เคยผ่าน EditableDocument/_recalculate_formula_values เลยสักครั้ง (import ตรงๆ ด้วย
+        # label_map ที่ _extract_excel_labels อ่าน cache สูตรแบบ data_only=True มา — เป็น None ถ้าไฟล์สร้าง/แก้
+        # ด้วย openpyxl ที่ไม่เคยคำนวณสูตรเอง) ทำให้ label สำคัญอย่าง "รวมราคาทั้งสิ้น" ได้ value เป็น None ทั้งที่
+        # pycel คำนวณได้จริง — ลองคำนวณใหม่ด้วย pycel (เหมือนที่ preview ใช้ — ดู _recalculate_formula_values)
+        # เฉพาะตอนมี label คำนวณไม่ได้อย่างน้อย 1 ตัวเท่านั้น (ไม่เสียเวลาคำนวณซ้ำถ้าไม่จำเป็น)
+        if any(l["not_computable"] for l in data["labels"]):
+            recalculated_map = _recalculate_formula_values(raw_bytes, label_map, None)
+            data = _read_values_from_bytes(raw_bytes, recalculated_map)
 
         for label_info in data["labels"]:
             if label_info["value"] is None:
@@ -986,6 +1014,11 @@ def build_library_search_card(file_id: int) -> Optional[dict]:
                 lines.append(f"{label_text}: {_format_money_value(value)}")
                 if total_amount is None and "ทั้งสิ้น" in label_text and isinstance(value, (int, float)):
                     total_amount = float(value)
+
+        if total_amount is None and any(
+            "ทั้งสิ้น" in l["label"] and l["not_computable"] for l in data["labels"]
+        ):
+            print(f"[LibrarySearchCard] file_id={file_id} total_unreadable")
 
         for table in data["tables"]:
             for row in table["rows"]:
@@ -1244,6 +1277,24 @@ def _score_library_search_candidates(
     return scored[:_LIBRARY_SEARCH_MAX_RESULTS]
 
 
+def _library_search_build_candidates(enriched: list[dict], cards: dict, filters: Optional[dict]) -> list[dict]:
+    """รวม _get_enriched_library_files() (enriched) กับบัตรค้นหาต่อไฟล์ (cards จาก get_all_library_search_cards —
+    ไฟล์ที่ยังไม่มีบัตรเลยถูกข้ามไป) แล้วกรองด้วย filters (ดู _library_search_matches_filters) แยกออกมาให้
+    search_library เรียกซ้ำได้ (ลองใหม่โดยตัด document_type ออกถ้ากรองแล้วไม่เจอไฟล์ไหนเลย)"""
+    candidates = []
+    for item in enriched:
+        card = cards.get(item["file_id"])
+        if card is None:
+            continue
+        merged = {
+            **item, "card_text": card["card_text"], "total_amount": card["total_amount"],
+            "issue_date": card["issue_date"],
+        }
+        if _library_search_matches_filters(merged, filters):
+            candidates.append(merged)
+    return candidates
+
+
 def search_library(query: str, user_id: Optional[int], filters: Optional[dict] = None) -> list[dict]:
     """เครื่องมือค้นหาคลังเอกสารจากทุกข้อมูลที่ผู้ใช้อาจจำได้ (เลขที่เอกสาร/รหัส-ชื่อลูกค้า/รหัส-ชื่อโปรเจกต์/
     ชื่อไฟล์/รายการสินค้าในไฟล์/วันที่/ยอดเงิน/ความหมายใกล้เคียง) ด้วยเครื่องมือเดียว (ดู build_library_search_
@@ -1259,17 +1310,15 @@ def search_library(query: str, user_id: Optional[int], filters: Optional[dict] =
     enriched = _get_enriched_library_files()
     cards = get_all_library_search_cards()
 
-    candidates = []
-    for item in enriched:
-        card = cards.get(item["file_id"])
-        if card is None:
-            continue
-        merged = {
-            **item, "card_text": card["card_text"], "total_amount": card["total_amount"],
-            "issue_date": card["issue_date"],
-        }
-        if _library_search_matches_filters(merged, filters):
-            candidates.append(merged)
+    candidates = _library_search_build_candidates(enriched, cards, filters)
+    if not candidates and filters and filters.get("document_type"):
+        # document_type ที่ผู้ใช้/AI ระบุมาอาจไม่ตรงกับคำที่เดาไว้ในบัตรเป๊ะ (ดู _guess_library_document_type —
+        # เดาจากชื่อไฟล์/โฟลเดอร์/สรุปแบบ keyword คงที่ ไม่ใช่ AI) — เหตุการณ์จริงที่แก้: "ใบเสนอราคาที่ยอดเกิน
+        # 60,000" ได้ "ไม่พบ" เพราะกรอง document_type ไม่เจอไฟล์ไหนเลย ทั้งที่จริงๆ มีไฟล์ตรงเงื่อนไขยอดเงิน แค่
+        # คำอธิบายประเภทไม่ตรงกันเป๊ะ — ลองใหม่โดยตัด document_type ออก (เงื่อนไขอื่นที่เหลือยังกรองตามปกติ) แทน
+        # การคืนศูนย์ผลทันที
+        retry_filters = {k: v for k, v in filters.items() if k != "document_type"}
+        candidates = _library_search_build_candidates(enriched, cards, retry_filters or None)
 
     if not candidates:
         print("[LibrarySearch] hits=0 top_score=0.000 exact=False")
@@ -2839,6 +2888,49 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
     except Exception as e:
         print(f"[DocumentReadingQuestion] format_failed exception_type={type(e).__name__}")
         return tool_text, target_doc["id"]
+
+
+def _is_reading_type_question(query: str, active_docs: list[dict], user_id: int, chat_id: int) -> bool:
+    """True ถ้าข้อความนี้เป็นคำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _is_document_reading_question
+    — หรือเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ไม่ว่าจะมีคำเชิง
+    กฎหมายปนมาด้วยหรือไม่ก็ตาม (ดู _has_legal_keyword — เช็คแยกต่างหากใน _resolve_document_reading_dispatch) ใช้
+    ทั้งเป็นเงื่อนไขของ dispatch นั้น และเป็นเงื่อนไขข้าม single/multi-doc classifier ใน ask_question() ด้วย
+    (คำถามแบบนี้ไม่เข้าพวกไหนใน 4 หมวดของ classifier นั้นเลย ไม่ว่าจะมีคำเชิงกฎหมายปนมาหรือไม่)"""
+    if not active_docs:
+        return False
+    focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
+    reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
+        active_docs[0] if len(active_docs) == 1 else None
+    )
+    return bool(
+        _is_document_reading_question(query)
+        or (reading_target_doc is not None and _query_mentions_table_item_or_label(query, reading_target_doc))
+    )
+
+
+def _resolve_document_reading_dispatch(
+    query: str, active_docs: list[dict], user_id: int, chat_id: int, reading_question: bool,
+) -> Optional[dict]:
+    """ตอบคำถามเชิงอ่าน/ถามเนื้อหาไฟล์ "แท้ๆ" (reading_question เป็น True จาก _is_reading_type_question — รับมา
+    เป็นพารามิเตอร์แทนที่จะคำนวณเองในนี้ เพราะ ask_question() ต้องใช้ค่าเดียวกันนี้เป็นเงื่อนไขข้าม single/
+    multi-doc classifier ด้วย ไม่ต้องคำนวณซ้ำสองครั้ง) และไม่มีคำเชิงกฎหมายปนมา (ดู _has_legal_keyword) ด้วย
+    _answer_document_reading_question ทันทีถ้าใช่ — แยกออกมาจาก ask_question() เพื่อให้เรียกได้คนละตำแหน่งใน
+    ลำดับทางลัดขึ้นกับ ROUTER_MODE (ดู ask_question): legacy เช็คก่อน _resolve_direct_structural_dispatch เหมือน
+    เดิมทุกประการ ส่วน ROUTER_MODE == "llm" ใช้เป็นด่านสุดท้ายหลัง router fallback เท่านั้น (ให้ router ตัดสิน
+    intent read_document เองก่อนเสมอ — เหตุการณ์จริงที่แก้: "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา"/"แนะนำ HDD ที่
+    ดีกว่ารายการที่ 6" มีคำว่า "ใบเสนอราคา"/"รายการ" ซึ่งด่านนี้เคยดักไปตอบเป็นคำถามเชิงอ่านก่อน router เลย)
+
+    คืน {"document_id": int|None, "answer": str} ถ้าตอบแล้ว หรือ None ถ้าไม่ใช่คำถามแบบนี้เลย/มีคำเชิงกฎหมายปนมา
+    (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ — คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา เช่น "ธุรกิจบัญชีสามมีอะไร
+    บ้าง" ยังต้องไปทาง RAG ตามปกติ)"""
+    if not reading_question:
+        return None
+    if _has_legal_keyword(query):
+        print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
+        return None
+
+    answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
+    return {"document_id": used_doc_id, "answer": answer}
 
 
 # คำที่ถือเป็น "ขอไฟล์ชัดเจน" เท่านั้นที่ยอม finalize (ส่งลิงก์ดาวน์โหลด) — ดู docstring ของ
@@ -5487,70 +5579,106 @@ async def ask_question(
             touch_chat_session(chat_id)
             return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบเสนอราคา
-        # ที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้แต่ตีความ
-        # จากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อกคำถามเชิงอ่าน
-        # ด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง _is_document_reading_
-        # question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคยมาถึงจุดนี้เลยสักครั้ง)
-        # dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ "none") จึงปล่อยให้ตกไปเช็ค
-        # reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
-        recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
-        if recommendation_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
-            answer = recommendation_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
+        # คำนวณครั้งเดียว ใช้ร่วมกันทั้งสองโหมด — ด่าน reading_question เอง (ตำแหน่งต่างกันตาม ROUTER_MODE) และ
+        # เงื่อนไขข้าม single/multi-doc classifier ด้านล่าง (ดู _is_reading_type_question)
+        reading_question = _is_reading_type_question(query, active_docs, user_id, chat_id)
 
-        # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
-        # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่ — ส่ง
-        # ตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง ห้ามให้
-        # _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close) ตัดสินใจแทน เพราะคำถามแบบนี้ไม่
-        # เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า "ไม่พบ label ที่ตรงกับคำสั่งนี้"
-        # แทนที่จะตอบคำถามจริงๆ
-        reading_target_doc = None
-        if active_docs:
-            focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
-            reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
-                active_docs[0] if len(active_docs) == 1 else None
+        if ROUTER_MODE == "llm":
+            # feat/llm-intent-router: ลำดับทางลัดด้วยโค้ดล้วนๆ ที่เหลือ (recommendation regex-only + structural
+            # direct regex) เช็คก่อนเรียก router เสมอ เหมือนโหมด legacy แต่ "ไม่เรียก LLM ของ #36
+            # (_resolve_recommendation_intent_with_llm) และไม่เช็ค reading_question ก่อน router เลย — ให้
+            # route_intent_with_llm ตัวเดียวตัดสิน intent read_document/replace_with_recommendation เองจาก
+            # บริบททั้งหมด เหตุการณ์จริงที่แก้: "แนะนำตู้ Rack ที่ดีกว่าในใบเสนอราคา"/"แนะนำ HDD ที่ดีกว่ารายการที่
+            # 6" มีคำว่า "ใบเสนอราคา"/"รายการ" ซึ่งด่าน reading_question เดิมเคยดักไปตอบเป็นคำถามเชิงอ่านก่อนถึง
+            # router เลย ทั้งที่เป็นคำขอแนะนำสินค้า และ "เอา X เเทน Y เก่าเลย" เคยเรียก LLM สองครั้ง (ของ #36 แล้ว
+            # ค่อยของ router) ทั้งที่ router ตัวเดียวตีความได้อยู่แล้ว
+            recommendation_dispatch = _resolve_recommendation_command_dispatch(
+                query, active_docs, chat_id, user_id, allow_llm_fallback=False,
             )
-        reading_question = bool(active_docs) and (
-            _is_document_reading_question(query)
-            or (reading_target_doc is not None and _query_mentions_table_item_or_label(query, reading_target_doc))
-        )
-        # คำถามเนื้อหาไฟล์ "แท้ๆ" (ไม่มีคำเชิงกฎหมายปนมา — ดู _has_legal_keyword) ตอบตรงด้วย
-        # read_document_values เลย ไม่ผ่าน RAG/ฐานความรู้กฎหมายเลย กันพึ่ง system prompt อย่างเดียวให้ AI
-        # ตัดสินใจเรียก tool เอง (เคยพลาด) คำถามกฎหมายที่บังเอิญมีคำเชิงคำถามปนมา (เช่น "ธุรกิจบัญชีสามมีอะไร
-        # บ้าง") ยังต้องไปทาง RAG ตามปกติ (reading_question ยังเป็น True เพื่อข้าม branch ตัดสินใจของ Excel
-        # editor ด้านล่าง แต่ไม่เข้า branch นี้)
-        document_content_question = reading_question and not _has_legal_keyword(query)
+            if recommendation_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+                answer = recommendation_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        if document_content_question:
-            answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
-            print(f"[Route] chat={chat_id} branch=document_reading active_doc={used_doc_id}")
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
+            direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+            if direct_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+                answer = direct_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        if reading_question:
-            print(f"[Route] chat={chat_id} branch=rag_fallback_legal_keyword active_doc=None")
+            try:
+                router_dispatch = _resolve_llm_router_dispatch(query, user_id, chat_id, active_docs)
+            except anthropic.APIError as e:
+                return _ask_question_api_error_response(e, chat_id)
+            if router_dispatch is not None:
+                answer = router_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
-        # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ "ก่อน"
-        # เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู docstring ของ
-        # _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น 7x7"/"เปลี่ยนจำนวน
-        # Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/"อัตรา"/"รายการที่ N"/
-        # "ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง ทั้งที่ parse ได้ชัดเจนด้วย
-        # โค้ดเฉยๆ
-        direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
-        if direct_dispatch is not None:
-            print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
-            answer = direct_dispatch["answer"]
-            add_chat_message(chat_id, "user", query)
-            add_chat_message(chat_id, "assistant", answer)
-            touch_chat_session(chat_id)
-            return {"answer": answer, "sources": [], "chat_id": chat_id}
+            # router ล้ม/ค่าไม่ผ่านการตรวจ -> fallback ไปใช้ด่าน reading_question เดิม (ตำแหน่งขยับมาอยู่หลัง
+            # router แทนที่จะอยู่ก่อนเหมือน legacy — ดู docstring ของ _resolve_document_reading_dispatch)
+            reading_dispatch = _resolve_document_reading_dispatch(query, active_docs, user_id, chat_id, reading_question)
+            if reading_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=document_reading active_doc={reading_dispatch['document_id']}")
+                answer = reading_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+        else:
+            # คำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations ของเส้นทาง advisor) เข้ากับใบ
+            # เสนอราคาที่เปิดอยู่ ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — รวมคำสั่งที่ regex จับไม่ได้
+            # แต่ตีความจากบริบทได้ด้วย LLM ด้วย ดู _resolve_recommendation_intent_with_llm) ต้องเช็คก่อนบล็อก
+            # คำถามเชิงอ่านด้านล่างเสมอ (เหตุการณ์จริงที่แก้: "เเทน ลงในรายการเลย" มีคำว่า "รายการ" ซึ่ง
+            # _is_document_reading_question เคยตีความเป็นคำถามเชิงอ่านไปก่อน ทั้งที่เป็นคำสั่งแก้ไฟล์จริงๆ ไม่เคย
+            # มาถึงจุดนี้เลยสักครั้ง) dispatch คืน None เองถ้าไม่ตรงเจตนานี้เลย (ทั้ง regex และ LLM resolver ตอบ
+            # "none") จึงปล่อยให้ตกไปเช็ค reading_question/structural ตามปกติต่อได้ ไม่กระทบเส้นทางเดิมเลย
+            recommendation_dispatch = _resolve_recommendation_command_dispatch(query, active_docs, chat_id, user_id)
+            if recommendation_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=recommendation_direct active_doc={recommendation_dispatch['document_id']}")
+                answer = recommendation_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # คำถามเชิงอ่าน/ถามเนื้อหาไฟล์ (มีคำอ้างอิงไฟล์จริงๆ — ดู _DOCUMENT_REFERENCE_KEYWORDS — หรือเอ่ยชื่อ
+            # รายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ขณะมีเอกสารเปิดอยู่
+            # — ส่งตรงเข้า flow ปกติ (rag_answer -> run_agentic_tool_loop) ให้ AI เรียก read_document_values เอง
+            # ห้ามให้ _classify_excel_editor_intent (LLM ตัวแยก edit/finalize/compare/close) ตัดสินใจแทน เพราะ
+            # คำถามแบบนี้ไม่เข้าพวกไหนเลยใน 4 หมวดนั้น เคยถูกตีความผิดเป็น "edit" แล้วตอบกลับว่า "ไม่พบ label ที่
+            # ตรงกับคำสั่งนี้" แทนที่จะตอบคำถามจริงๆ
+            reading_dispatch = _resolve_document_reading_dispatch(query, active_docs, user_id, chat_id, reading_question)
+            if reading_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=document_reading active_doc={reading_dispatch['document_id']}")
+                answer = reading_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # คำสั่งรูปแบบชัดเจนมาก (ลบ/เปลี่ยนอัตรา/แก้ฟิลด์เดียว/แก้รายละเอียด) ลอง parse+apply ด้วยโค้ดเสมอ
+            # "ก่อน" เช็ค _is_structural_edit_command/เรียก classifier เลย ไม่ต้องรอผ่าน gate นั้นก่อน (ดู
+            # docstring ของ _resolve_direct_structural_dispatch) — เหตุการณ์จริงที่แก้: "เปลี่ยน Box 4x4 เป็น
+            # 7x7"/"เปลี่ยนจำนวน Box 4x4 เป็น 30" ไม่มีคำไหนที่ _is_structural_edit_command รู้จักเลย (ไม่มี "%"/
+            # "อัตรา"/"รายการที่ N"/"ลบ"+"รายการ") เลยไม่เคยไปถึง _parse_direct_structural_commands เลยสักครั้ง
+            # ทั้งที่ parse ได้ชัดเจนด้วยโค้ดเฉยๆ
+            direct_dispatch = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+            if direct_dispatch is not None:
+                print(f"[Route] chat={chat_id} branch=structural_direct active_doc={direct_dispatch['document_id']}")
+                answer = direct_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
 
         # ด่านกันด้วยโค้ดก่อนเรียก classifier เลย (ไม่พึ่ง LLM อย่างเดียว) — เหตุการณ์จริงที่แก้: "เปลี่ยน VAT
         # เป็น 10%"/"ลบรายการที่ 3"/"เพิ่มรายการ Box 2x2 5 ชิ้น 30 บาท" ขณะมีไฟล์เดียวเปิดอยู่ ถูก
@@ -5765,6 +5893,18 @@ async def ask_question(
     # advisor_answer — ดู _classify_question_route) ไม่ตัดสินเลยถ้าเป็นคำสั่งแก้โครงสร้าง หรือมีภาพแนบมา หรือ
     # ข้อความว่างเปล่า (ไปทาง legal เหมือนพฤติกรรมเดิมก่อน PR นี้ทุกประการ — คำถามเกี่ยวกับไฟล์แท้ๆ ถูกดักไป
     # ตั้งแต่ reading_question/document_content_question ก่อนถึงจุดนี้แล้วเสมอ ไม่มีทางหลุดมาถึง branch นี้)
+    # feat/llm-intent-router: guest (ไม่ได้ล็อกอิน) ไม่เคยเข้า block ด้านบนเลย (เช็ค "if user_id and chat_id..."
+    # ทุกจุด — chat_id เป็น None เสมอสำหรับ guest) จึงต้องลอง router ที่นี่แทน จุดเดียวที่ครอบคลุม guest ทั้งหมด —
+    # logged-in user ถูก router จัดการไปแล้วที่ block ด้านบน (ไม่ว่าจะ dispatch สำเร็จ+return หรือ fallback ตกลง
+    # มาที่นี่พร้อมผลของด่านคำสำคัญเดิมที่ทำงานจบไปแล้ว — ไม่ลอง router ซ้ำอีกรอบ)
+    if ROUTER_MODE == "llm" and not user_id and not structural_route and not image_data and query.strip():
+        try:
+            router_dispatch = _resolve_llm_router_dispatch(query, user_id, chat_id, active_docs)
+        except anthropic.APIError as e:
+            return _ask_question_api_error_response(e, chat_id)
+        if router_dispatch is not None:
+            return {"answer": router_dispatch["answer"], "sources": [], "chat_id": chat_id}
+
     if structural_route or image_data or not query.strip():
         question_route = "legal"
     else:
@@ -9499,6 +9639,27 @@ def _resolve_recommendation_intent_with_llm(
         f"target={target_item_index} rec={recommendation_index}"
     )
 
+    return _validate_and_apply_recommendation_action(
+        action, target_item_index, recommendation_index, quantity, price_mode_raw, explicit_price,
+        markup_percent, question, document_id, user_id, recommendations, table,
+    )
+
+
+def _validate_and_apply_recommendation_action(
+    action, target_item_index, recommendation_index, quantity, price_mode_raw, explicit_price,
+    markup_percent, question, document_id: int, user_id: int, recommendations: list[dict], table: dict,
+) -> Optional[dict]:
+    """ตรวจค่า + apply จริงของ action replace/add/ask/none ที่ตีความเจตนาแก้ไฟล์มาแล้ว (ไม่ว่าจะมาจาก LLM ตัวไหน
+    — ใช้ร่วมกันทั้ง _resolve_recommendation_intent_with_llm (resolve_recommendation_action) และ
+    _resolve_llm_router_dispatch (route_intent_with_llm) แยกออกมาจากโค้ดเรียก LLM เอง เพื่อให้ทั้งสองทางเรียกตรรกะ
+    ตรวจ+apply เดียวกันเป๊ะ ไม่เขียนซ้ำ — ดู docstring เดิมของ _resolve_recommendation_intent_with_llm สำหรับ
+    รายละเอียดการตรวจค่าทั้งหมด (index อยู่ในช่วงจริง, replace ต้องมีทั้ง target และ recommendation, quantity > 0,
+    ราคา > 0)
+
+    คืน {"matched": bool, "message": str} เสมอ ยกเว้น action เป็น "none"/ไม่รู้จัก หรือ action "ask" ที่คำถามว่าง
+    เปล่า/ไม่ใช่ string -> คืน None (ปล่อยให้ caller ตัดสินใจเองว่าจะ fallback ไปทางไหนต่อ)"""
+    filled_rows = [r for r in table["rows"] if not r["is_empty"]]
+
     if action == "ask":
         if not isinstance(question, str) or not question.strip():
             return None
@@ -9555,15 +9716,17 @@ def _resolve_recommendation_intent_with_llm(
 
 
 def _resolve_recommendation_command_dispatch(
-    query: str, active_docs: list[dict], chat_id: int, user_id: int,
+    query: str, active_docs: list[dict], chat_id: int, user_id: int, allow_llm_fallback: bool = True,
 ) -> Optional[dict]:
     """ตัดสินใจว่าข้อความนี้ parse เป็นคำสั่งเชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบ
     เสนอราคาที่เปิดอยู่ได้ไหม ("แทนรายการที่ N ด้วยรุ่นที่ K"/"เพิ่มรุ่นที่ K" ฯลฯ — ดู
     _resolve_recommendation_replace_command/_resolve_recommendation_add_command) แล้ว apply ทันทีถ้าใช่ — ไม่ต้อง
     พึ่ง LLM เลยสักครั้ง (เหมือน _resolve_direct_structural_dispatch) ถ้า regex ทั้งสองคืน None แต่มีรายการแนะนำอยู่
-    ในแชทจริงและข้อความมีคำกริยาที่น่าจะเป็นเจตนานี้ (ดู _query_has_recommendation_intent_verb) ลองให้ LLM ตีความ
-    จากบริบทแทน (ดู _resolve_recommendation_intent_with_llm) คืน {"document_id":, "answer":} หรือ None ถ้าข้อความ
-    นี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    ในแชทจริงและข้อความมีคำกริยาที่น่าจะเป็นเจตนานี้ (ดู _query_has_recommendation_intent_verb) และ
+    allow_llm_fallback เป็น True (ค่าเริ่มต้น) ลองให้ LLM ตีความจากบริบทแทน (ดู _resolve_recommendation_intent_
+    with_llm) — ask_question() ส่ง allow_llm_fallback=False เมื่อ ROUTER_MODE == "llm" เพราะ route_intent_with_llm
+    ตัวเดียวทำหน้าที่ตีความบริบทแบบนี้อยู่แล้ว (กันเรียก LLM ซ้ำสองครั้งสำหรับข้อความเดียวกัน) คืน {"document_id":,
+    "answer":} หรือ None ถ้าข้อความนี้ไม่ตรงรูปแบบคำสั่งนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
     focus_doc = get_chat_document_focus(chat_id, user_id)
     target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
     if target_doc is None:
@@ -9579,7 +9742,7 @@ def _resolve_recommendation_command_dispatch(
     result = _resolve_recommendation_replace_command(query, target_doc["id"], user_id, recommendations, table)
     if result is None:
         result = _resolve_recommendation_add_command(query, target_doc["id"], user_id, recommendations, table)
-    if result is None and recommendations and _query_has_recommendation_intent_verb(query):
+    if result is None and allow_llm_fallback and recommendations and _query_has_recommendation_intent_verb(query):
         result = _resolve_recommendation_intent_with_llm(
             query, target_doc["id"], user_id, recommendations, table, chat_id,
         )
@@ -9616,6 +9779,411 @@ def _resolve_direct_structural_dispatch(
 
     answer = _apply_structural_commands(direct_target_doc["id"], user_id, commands)
     return {"document_id": direct_target_doc["id"], "answer": answer}
+
+
+# ---------- feat/llm-intent-router ----------
+# ปัญหาเชิงโครงสร้างที่แก้: ask_question() ตัดสินเส้นทางด้วยด่านคำสำคัญซ้อนกันหลายชั้น
+# (_is_document_reading_question, _looks_like_library_query, _query_has_recommendation_intent_verb,
+# _is_structural_edit_command, single/multi-doc classifier, _classify_question_route ฯลฯ) — ด่านแรกที่จับได้ชนะ
+# ไม่เห็นบริบททั้งหมด แก้ทีละชั้นแล้วกระทบชั้นอื่นมาหลาย PR เหตุการณ์จริงล่าสุด: เปิด SSF-02 -> แนะนำ HDD ->
+# "อยากได้ 16tb 2 ตัว" -> ได้รายการแนะนำ -> "เอา Seagate SkyHawk เเทน HDD เก่าเลย" -> ตอบ "ยังไม่ได้แก้ไขไฟล์ครับ
+# ลองพิมพ์เช่น 'ลบรายการที่ 3'..." ทั้งที่คนอ่านรู้ทันทีว่าหมายถึงแทนรายการที่มี HDD อยู่ด้วยรุ่นที่แนะนำ จำนวน 2
+#
+# route_intent_with_llm ตัวเดียวเห็นบริบททั้งหมด (ประวัติแชท/ไฟล์ที่เปิดอยู่/รายการแนะนำล่าสุด/ล็อกอินอยู่ไหม)
+# ตัดสิน intent + ค่า (slots) เป็น JSON — โค้ดตรวจค่าแล้วส่งให้ handler เฉพาะทางที่มีอยู่แล้วเท่านั้น (หลักเดิมของ
+# โปรเจกต์: AI ตัดสิน intent, โค้ดลงมือทำและจัดรูปผลลัพธ์ ไม่ให้ AI เขียนคำตอบ/แก้ไฟล์เอง) ควบคุมด้วย ROUTER_MODE
+# (env — ดู docstring ของค่าคงที่): "legacy" หรือ router ล้มไม่ว่าสาเหตุใด (API error/parse ไม่ได้/ค่าไม่ผ่านการ
+# ตรวจ) -> _resolve_llm_router_dispatch คืน None แล้ว ask_question() ปล่อยตกไปใช้ด่านคำสำคัญเดิมทั้งหมดทุกจุด
+# เหมือนก่อน PR นี้ทุกประการ (ไม่ลบโค้ดเดิมเลยสักบรรทัด)
+
+# เครื่องมือเดียวที่ route_intent_with_llm บังคับให้ Claude เรียกเสมอ (tool_choice บังคับ) — ตัดสิน intent +
+# ดึงค่าที่ handler แต่ละตัวต้องใช้ออกมาเป็น JSON โครงสร้างแน่นอน ไม่ให้ Claude เขียนคำตอบเป็นข้อความเองเลย
+ROUTE_INTENT_TOOL = {
+    "name": "route_intent",
+    "description": (
+        "ตัดสินใจว่าข้อความล่าสุดของผู้ใช้ต้องการอะไร (intent) จากบริบททั้งหมดที่ให้มา แล้วดึงค่าที่เกี่ยวข้องออกมา "
+        "ต้องเรียกเครื่องมือนี้เสมอ ห้ามเขียนคำตอบเป็นข้อความเองเด็ดขาด"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": [
+                    "edit_document", "replace_with_recommendation", "add_recommendation", "read_document",
+                    "recommend_products", "library_search", "legal_question", "general_question",
+                    "ask_clarification",
+                ],
+            },
+            "target_item_index": {
+                "type": ["integer", "null"],
+                "description": "ลำดับรายการในตารางปัจจุบัน (1-indexed) ที่ replace_with_recommendation หมายถึง ไม่งั้นใส่ null",
+            },
+            "recommendation_index": {
+                "type": ["integer", "null"],
+                "description": "ลำดับรุ่นแนะนำ (1-indexed) ที่ replace_with_recommendation/add_recommendation หมายถึง ไม่งั้นใส่ null",
+            },
+            "quantity": {
+                "type": ["number", "null"],
+                "description": "จำนวนที่ผู้ใช้ต้องการ (ดูจากบริบทบทสนทนาทั้งหมด ไม่ใช่แค่ข้อความล่าสุด) ไม่เคยพูดถึงเลยใส่ null",
+            },
+            "price_mode": {
+                "type": ["string", "null"],
+                "enum": ["recommended", "original", "explicit", "markup"],
+                "description": "ใช้เมื่อ intent เป็น replace_with_recommendation/add_recommendation เท่านั้น ไม่งั้นใส่ null",
+            },
+            "explicit_price": {"type": ["number", "null"], "description": "ราคา/หน่วยที่ผู้ใช้ระบุเอง ใช้เมื่อ price_mode เป็น explicit เท่านั้น"},
+            "markup_percent": {"type": ["number", "null"], "description": "เปอร์เซ็นต์กำไรที่จะบวก ใช้เมื่อ price_mode เป็น markup เท่านั้น"},
+            "edit_instruction": {
+                "type": ["string", "null"],
+                "description": (
+                    "ใช้เมื่อ intent เป็น edit_document เท่านั้น — เขียนประโยคคำสั่งที่ชัดเจนขึ้นแทนข้อความดิบของ"
+                    "ผู้ใช้ (เช่น \"เปลี่ยนจำนวนรายการที่ 1 เป็น 30\") ไม่งั้นใส่ null"
+                ),
+            },
+            "library_query": {
+                "type": ["string", "null"],
+                "description": "ใช้เมื่อ intent เป็น library_search เท่านั้น — คำค้นหาเอกสารในคลัง ไม่งั้นใส่ null",
+            },
+            "library_filters": {
+                "type": ["object", "null"],
+                "description": "ใช้เมื่อ intent เป็น library_search เท่านั้น — ใส่เฉพาะฟิลด์ที่ผู้ใช้ระบุจริง ไม่งั้นใส่ null",
+                "properties": {
+                    "customer": {"type": ["string", "null"]},
+                    "document_type": {"type": ["string", "null"]},
+                    "min_total": {"type": ["number", "null"]},
+                    "max_total": {"type": ["number", "null"]},
+                    "date_from": {"type": ["string", "null"]},
+                    "date_to": {"type": ["string", "null"]},
+                    "contains_item": {"type": ["string", "null"]},
+                },
+            },
+            "clarification_question": {
+                "type": ["string", "null"],
+                "description": "ใช้เมื่อ intent เป็น ask_clarification เท่านั้น — คำถามเฉพาะเจาะจงที่จะถามกลับผู้ใช้ ไม่งั้นใส่ null",
+            },
+            "confidence": {
+                "type": "string", "enum": ["high", "low"],
+                "description": "low เมื่อกำกวมจริง (ควรใช้คู่กับ intent ask_clarification)",
+            },
+        },
+        "required": [
+            "intent", "target_item_index", "recommendation_index", "quantity", "price_mode", "explicit_price",
+            "markup_percent", "edit_instruction", "library_query", "library_filters",
+            "clarification_question", "confidence",
+        ],
+    },
+}
+
+ROUTER_SYSTEM_PROMPT = (
+    "คุณคือ router ตัวเดียวที่ตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในแชทผู้ช่วยด้านเอกสารธุรกิจ/กฎหมาย/การลงทุนต้องการ"
+    "อะไร จากบริบททั้งหมดที่ให้มา (ประวัติการสนทนา, ไฟล์ที่เปิดอยู่พร้อมตารางรายการ, รายการแนะนำสินค้าล่าสุด, "
+    "สถานะล็อกอิน) เรียกเครื่องมือ route_intent เสมอ ห้ามเขียนคำตอบเป็นข้อความเองเด็ดขาด\n\n"
+    "ความหมายของแต่ละ intent พร้อมตัวอย่างจริงจากโปรเจกต์นี้:\n"
+    "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ (เปลี่ยนอัตรา/ลบ-เพิ่ม-แก้รายการในตาราง) เช่น \"เปลี่ยน VAT เป็น "
+    "10%\", \"ลบรายการที่ 3\", \"เปลี่ยนจำนวน Box 4x4 เป็น 30\" — เขียน edit_instruction เป็นประโยคคำสั่งที่ชัดเจน"
+    "ขึ้น (แก้คำสรรพนาม/อ้างอิงให้เป็นชื่อ-เลขที่ชัดเจน) เสมอ\n"
+    "- replace_with_recommendation: ขอให้เอารุ่นสินค้าที่เพิ่งแนะนำไปแทนรายการเดิมในตาราง (ไม่ใช่แค่พูดถึงรุ่น"
+    "เฉยๆ) เช่น แนะนำ HDD -> \"อยากได้ 16tb 2 ตัว\" -> ได้รายการแนะนำ -> \"เอา Seagate SkyHawk เเทน HDD เก่าเลย\" "
+    "-> เจตนานี้ ต้องดูบริบทบทสนทนาทั้งหมดเพื่อหา target_item_index (แถวในตารางที่เป็นอุปกรณ์ประเภทเดียวกับที่จะ"
+    "ถูกแทน — ในตัวอย่างนี้คือแถว HDD เดิม), recommendation_index (รุ่นแนะนำที่พูดถึง — ในตัวอย่างนี้คือ Seagate "
+    "SkyHawk), และ quantity (จากที่เคยพูดไว้ก่อนหน้า เช่น \"2 ตัว\" แม้ข้อความล่าสุดจะไม่ได้พูดถึงจำนวนอีกแล้วก็ตาม)\n"
+    "- add_recommendation: ขอให้เพิ่มรุ่นแนะนำเป็นรายการใหม่ในตาราง (ไม่ใช่แทนของเดิม) เช่น \"เพิ่มรุ่นที่ 1 อีก 1 "
+    "ชิ้น\"\n"
+    "- read_document: ถามค่า/เนื้อหาในไฟล์ที่เปิดอยู่ ไม่ได้ขอให้แก้อะไร เช่น \"ยอดรวมเท่าไร\", \"มีรายการอะไรบ้าง\"\n"
+    "- recommend_products: ขอคำแนะนำสินค้า/เปรียบเทียบรุ่น/ราคา เช่น \"แนะนำสาย CAT-6\", \"ตู้ Rack 9U รุ่นไหนดี\"\n"
+    "- library_search: ถามหาเอกสารในคลัง (ไม่ใช่ไฟล์ที่เปิดอยู่ตอนนี้) ด้วยข้อมูลอะไรก็ได้ (เลขที่เอกสาร/ชื่อลูกค้า/"
+    "รายการสินค้า/วันที่/ยอดเงิน) เช่น \"ในคลังมีเอกสารอะไรบ้าง\", \"ใบเสนอราคาที่ยอดเกิน 60,000\" — แตก "
+    "library_query + library_filters ให้เจาะจงที่สุดจากสิ่งที่ผู้ใช้พูด\n"
+    "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
+    "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
+    "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
+    "- ask_clarification: สถานการณ์กำกวมจริงๆ จนตัดสิน intent อื่นไม่ได้อย่างมั่นใจ (เช่นมีอุปกรณ์ประเภทเดียวกัน"
+    "หลายรายการในตารางไม่รู้ว่าหมายถึงอันไหน หรือข้อความสั้นเกินไปจนตีความได้หลายทาง) — ใส่ confidence เป็น low "
+    "และเขียน clarification_question เป็นคำถามเฉพาะเจาะจงที่ช่วยให้ผู้ใช้ตอบกลับมาได้ง่าย\n\n"
+    "confidence เป็น low ทุกครั้งที่กำกวมจริง (ไม่ใช่แค่ไม่มั่นใจ 100% — เดาตามบริบทที่สมเหตุสมผลที่สุดได้ถ้ามีเบาะแส"
+    "พอ) high เมื่อมั่นใจจากบริบทที่ให้มา"
+)
+
+
+def _build_router_document_context(target_doc: Optional[dict]) -> str:
+    """สร้างข้อความบริบท "ไฟล์ที่เปิดอยู่" ให้ route_intent_with_llm — ชื่อไฟล์ + ตารางรายการ (ลำดับ/รายละเอียด/
+    จำนวน/หน่วย/ราคา) + ป้ายสำคัญทั้งหมด (เช่น VAT) reuse read_document_values/_format_document_values_text ตรงๆ
+    (เครื่องมือ read_document_values ของ AI ใช้สองฟังก์ชันนี้คู่กันอยู่แล้ว) ไม่มีไฟล์เป้าหมายชัดเจน (ไม่มีไฟล์เปิด
+    อยู่เลย หรือเปิดหลายไฟล์พร้อมกันไม่มีโฟกัส) -> คืนข้อความคงที่ "ไม่มีไฟล์เปิดอยู่" ตรงๆ"""
+    if target_doc is None:
+        return "ไม่มีไฟล์เปิดอยู่"
+    data = read_document_values(target_doc)
+    return f"ชื่อไฟล์: {target_doc['filename']}\n\n" + _format_document_values_text(data)
+
+
+def _build_router_recommendations_context(recommendations: list[dict]) -> str:
+    """สร้างข้อความบริบท "รายการแนะนำล่าสุด" (เลขรุ่น/ชื่อ/ราคา/หน่วย) ให้ route_intent_with_llm — ไม่มีรายการ
+    แนะนำเลย -> คืนข้อความคงที่ตรงๆ"""
+    if not recommendations:
+        return "ไม่มีรายการแนะนำล่าสุด"
+    return "\n".join(
+        f"{i}. {rec.get('name')} — {rec.get('price_thb')} บาท/{rec.get('unit') or 'ชิ้น'}"
+        for i, rec in enumerate(recommendations, start=1)
+    )
+
+
+def _build_router_history_context(chat_id: Optional[int]) -> str:
+    """สร้างข้อความบริบท "ประวัติการสนทนาล่าสุด" 6 ข้อความ (ตัดข้อความละไม่เกิน 500 ตัวอักษร — เหมือนรูปแบบของ
+    _resolve_recommendation_intent_with_llm แต่สั้นกว่าเล็กน้อยเพราะ context อื่นของ router นี้มีเยอะกว่า) ไม่มี
+    chat_id (guest ที่ยังไม่มีแชทจริง) หรือยังไม่มีประวัติเลย -> คืนข้อความคงที่ตรงๆ"""
+    if not chat_id:
+        return "ไม่มีประวัติการสนทนา"
+    recent_history = get_chat_messages(chat_id)[-6:]
+    if not recent_history:
+        return "ไม่มีประวัติการสนทนา"
+    return "\n".join(f"{m['role']}: {(m['content'] or '')[:500]}" for m in recent_history)
+
+
+def _resolve_router_target_document(active_docs: list[dict], user_id: Optional[int], chat_id: Optional[int]) -> Optional[dict]:
+    """หาไฟล์เป้าหมายให้ router ใช้ทั้งสร้างบริบทและ dispatch จริง — ไฟล์ที่โฟกัสอยู่ในแชทนี้ หรือเปิดอยู่ไฟล์เดียว
+    พอดี (เหมือนกับที่ _resolve_direct_structural_dispatch/_resolve_recommendation_command_dispatch ใช้ทุกจุด)
+    ไม่มีทั้งสองอย่าง (ไม่มีไฟล์เปิดอยู่เลย หรือเปิดหลายไฟล์พร้อมกันไม่มีโฟกัส) -> คืน None"""
+    if not active_docs:
+        return None
+    focus_doc = get_chat_document_focus(chat_id, user_id) if (user_id and chat_id) else None
+    return focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+
+
+def route_intent_with_llm(
+    query: str, user_id: Optional[int], chat_id: Optional[int], active_docs: list[dict],
+) -> Optional[dict]:
+    """เรียก Claude (model=ROUTER_MODEL, max_tokens=800, tool_choice บังคับ tool route_intent) ให้ตัดสิน intent +
+    ดึงค่าที่เกี่ยวข้องออกมาเป็น JSON จากบริบททั้งหมด (ประวัติแชทล่าสุด 6 ข้อความ, ไฟล์ที่เปิดอยู่ + ตารางรายการ,
+    รายการแนะนำล่าสุด, สถานะล็อกอิน — ดู _build_router_*_context) ไม่ตรวจค่าอะไรเลยในนี้ (หน้าที่ของ
+    _resolve_llm_router_dispatch) คืน dict ดิบจาก tool_use_block.input ตรงๆ หรือ None ถ้า LLM call ล้ม (API error/
+    อื่นๆ)/ไม่เรียก tool เลย/parse ไม่ได้ (ปล่อยให้ caller fallback ไปใช้ routing เดิมทั้งหมด) ROUTER_MODE != "llm"
+    (เช่นตั้งเป็น "legacy" ใน Railway) -> คืน None ทันทีโดยไม่เรียก LLM เลยสักครั้ง (เช็คซ้ำในนี้ด้วยนอกจาก
+    ask_question() เองก็เช็คอยู่แล้ว — กันเรียกผิดที่ เช่นจากจุดอื่นในอนาคตที่ลืมเช็ค ROUTER_MODE ก่อน)"""
+    if ROUTER_MODE != "llm":
+        return None
+    target_doc = _resolve_router_target_document(active_docs, user_id, chat_id)
+    recommendations = (get_chat_last_recommendations(chat_id) or []) if chat_id else []
+
+    prompt = (
+        f"ประวัติการสนทนาล่าสุด:\n{_build_router_history_context(chat_id)}\n\n"
+        f"ไฟล์ที่เปิดอยู่:\n{_build_router_document_context(target_doc)}\n\n"
+        f"รายการแนะนำล่าสุด:\n{_build_router_recommendations_context(recommendations)}\n\n"
+        f"สถานะผู้ใช้: {'ล็อกอินอยู่' if user_id else 'ยังไม่ได้ล็อกอิน (guest)'}\n\n"
+        f"ข้อความล่าสุดจากผู้ใช้: {query}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=ROUTER_MODEL,
+            max_tokens=800,
+            system=ROUTER_SYSTEM_PROMPT,
+            tools=[ROUTE_INTENT_TOOL],
+            tool_choice={"type": "tool", "name": "route_intent"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except Exception as e:
+        print(f"[Router] llm_call_failed exception_type={type(e).__name__}")
+        return None
+
+    tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
+    if tool_use_block is None:
+        return None
+    parsed = tool_use_block.input
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("intent"), str):
+        return None
+    return parsed
+
+
+# เส้นทางที่ต้องล็อกอิน + มีไฟล์เปิดอยู่ (ผูกกับ EditableDocument ของ user คนนั้นจริงๆ) — guest ไม่มีทางมี
+# active_docs อยู่แล้ว (ไม่เคยสร้าง EditableDocument ได้เลยถ้าไม่ล็อกอิน) แต่กันไว้ชัดเจนตรงนี้เผื่อ router ตัดสิน
+# intent เหล่านี้มาทั้งที่ context จริงไม่รองรับ (เช่น parse ผิดพลาด)
+_ROUTER_FILE_INTENTS = {"edit_document", "replace_with_recommendation", "add_recommendation", "read_document"}
+_ROUTER_VALID_INTENTS = _ROUTER_FILE_INTENTS | {
+    "recommend_products", "library_search", "legal_question", "general_question", "ask_clarification",
+}
+_ROUTER_FILE_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระบบและเปิดไฟล์ในคลังเอกสารก่อนถึงจะแก้ไข/อ่านค่าในเอกสารได้ครับ"
+
+
+def _dispatch_router_edit_document(route: dict, target_doc: dict, query: str, user_id: int, chat_id: int) -> dict:
+    """ลอง _resolve_direct_structural_dispatch กับ edit_instruction (ประโยคคำสั่งที่ router เขียนให้ชัดเจนขึ้นแล้ว
+    — ไม่ใช่ query ดิบของผู้ใช้) ก่อนเสมอ — parse ได้และ apply จริงไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน
+    regex ตรงนี้จะ parse ได้ เช่นต้องอ้างอิงป้ายที่เป็นข้อความอิสระ) -> ส่งเส้นทาง structural/agent เดิมต่อ (reuse
+    rag_answer(structural_route=True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน query
+    เดิม (ให้ agent เห็นคำสั่งที่ชัดเจนกว่า)"""
+    edit_instruction = route.get("edit_instruction")
+    if not isinstance(edit_instruction, str) or not edit_instruction.strip():
+        edit_instruction = query
+    direct = _resolve_direct_structural_dispatch(edit_instruction, [target_doc], chat_id, user_id)
+    if direct is not None:
+        return direct
+    history = get_chat_messages(chat_id) if chat_id else []
+    answer, _sources = rag_answer(
+        edit_instruction, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
+        structural_route=True, skip_legal_context=False,
+    )
+    return {"document_id": target_doc["id"], "answer": answer}
+
+
+def _dispatch_router_recommendation_action(
+    route: dict, intent: str, target_doc: Optional[dict], chat_id: int, user_id: int,
+) -> Optional[dict]:
+    """ตรวจค่าแบบเดียวกับ _resolve_recommendation_intent_with_llm (ผ่าน _validate_and_apply_recommendation_action
+    ตัวเดียวกันเป๊ะ ไม่เขียนตรรกะตรวจ/apply ซ้ำ) แล้วเรียก _apply_recommendation_replace/_apply_recommendation_add
+    ไม่มีไฟล์เป้าหมายชัดเจน หรือไฟล์นั้นไม่มีตารางรายการเลย -> คืน None (ปล่อยให้ caller fallback ไปใช้ routing
+    เดิมทั้งหมด — เหมือน _resolve_recommendation_command_dispatch ทำตอน table เป็น None)"""
+    if target_doc is None:
+        return None
+    base_bytes, _ = get_working_copy(target_doc)
+    table = _get_single_item_table(base_bytes)
+    if table is None:
+        return None
+    recommendations = get_chat_last_recommendations(chat_id) or []
+    action = "replace" if intent == "replace_with_recommendation" else "add"
+    result = _validate_and_apply_recommendation_action(
+        action, route.get("target_item_index"), route.get("recommendation_index"), route.get("quantity"),
+        route.get("price_mode"), route.get("explicit_price"), route.get("markup_percent"), None,
+        target_doc["id"], user_id, recommendations, table,
+    )
+    if result is None:
+        return None
+    return {"document_id": target_doc["id"], "answer": result["message"]}
+
+
+def _dispatch_router_advisor(query: str, user_id: Optional[int], chat_id: Optional[int], active_docs: list[dict]) -> dict:
+    """ใช้สำหรับ intent recommend_products และ general_question เหมือนกัน (ทั้งคู่ไปทาง advisor_answer ตัวเดียวกัน
+    — ตรงกับที่เส้นทาง "advisor" เดิมของ _classify_question_route ครอบคลุมทั้งสองแบบอยู่แล้วเช่นกัน)"""
+    history = get_chat_messages(chat_id) if chat_id else []
+    answer, _sources = advisor_answer(query, history=history, user_id=user_id, chat_id=chat_id, active_docs=active_docs)
+    return {"document_id": None, "answer": answer}
+
+
+def _dispatch_router_legal(query: str, user_id: Optional[int], chat_id: Optional[int]) -> dict:
+    """เส้นทางกฎหมายเดิม (rag_answer ฐานความรู้กฎหมาย) — เหมือนเส้นทาง "legal" เดิมของ _classify_question_route"""
+    history = get_chat_messages(chat_id) if chat_id else []
+    answer, _sources = rag_answer(
+        query, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
+        structural_route=False, skip_legal_context=False,
+    )
+    return {"document_id": None, "answer": answer}
+
+
+def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[int], chat_id: Optional[int]) -> dict:
+    """ลอง _resolve_library_full_listing_dispatch ก่อนเสมอ (ของเดิมจาก fix/library-search-precision — จับคำถามขอ
+    รายชื่อเอกสารทั้งหมดในคลัง เช่น "ในคลังมีเอกสารอะไรบ้าง" จัดกลุ่มตามลูกค้า+แม่แบบแยกท้าย คลังใหญ่เกิน 30 ไฟล์
+    แสดงจำนวนต่อบริษัทแทน — คืน None เองถ้าไม่ใช่คำถามแบบนี้) ไม่ใช่ค่อยค้นแบบมีคะแนนด้วย search_library(library_
+    query, library_filters) แล้วจัดรายการด้วยโค้ด (_format_library_document_list + บันทึก listing ให้ตอบเลขข้อ
+    เปิดได้ต่อ — เหมือนทางลัด _resolve_library_exact_match_dispatch เดิม) ไม่มีผลเลยสักไฟล์ -> ส่งต่อให้
+    rag_answer(skip_legal_context=True) ให้ agent คลังเดิม (find_customers/list_customer_documents/ฯลฯ) ลองทางอื่น
+    ต่อ แทนที่จะตอบ "ไม่พบ" ทันที"""
+    full_listing = _resolve_library_full_listing_dispatch(query, chat_id)
+    if full_listing is not None:
+        return full_listing
+
+    library_query = route.get("library_query")
+    if not isinstance(library_query, str) or not library_query.strip():
+        library_query = query
+    raw_filters = route.get("library_filters")
+    filters = raw_filters if isinstance(raw_filters, dict) and raw_filters else None
+
+    results = search_library(library_query, user_id, filters=filters)
+    enriched_by_id = {f["file_id"]: f for f in _get_enriched_library_files()} if results else {}
+    listing_files = [enriched_by_id[r["file_id"]] for r in results if r["file_id"] in enriched_by_id]
+
+    if not listing_files:
+        history = get_chat_messages(chat_id) if chat_id else []
+        answer, _sources = rag_answer(
+            query, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
+            structural_route=False, skip_legal_context=True,
+        )
+        return {"document_id": None, "answer": answer}
+
+    _record_chat_document_listing(chat_id, listing_files)
+    listing_text = _format_library_document_list("พบเอกสารที่ตรงกับคำค้นนี้:", listing_files)
+    return {"document_id": None, "answer": listing_text + "\n\nต้องการเปิดข้อไหนครับ"}
+
+
+def _dispatch_router_clarification(route: dict) -> Optional[dict]:
+    """ตอบ clarification_question ที่ router เขียนมา (ผ่าน _looks_like_fabricated_edit_claim กันเหมือนทุกจุดที่
+    ให้ LLM เขียนคำถามกลับ — ดู _resolve_recommendation_intent_with_llm) ว่างเปล่า/ไม่ใช่ string -> คืน None
+    (ค่าไม่ผ่านการตรวจ ปล่อยให้ fallback ไปใช้ routing เดิม)"""
+    question = route.get("clarification_question")
+    if not isinstance(question, str) or not question.strip():
+        return None
+    safe_question = question.strip()
+    if _looks_like_fabricated_edit_claim(safe_question):
+        safe_question = "ขอรายละเอียดเพิ่มเติมอีกนิดได้ไหมครับ ยังไม่แน่ใจว่าหมายถึงอะไรครับ"
+    return {"document_id": None, "answer": safe_question}
+
+
+def _resolve_llm_router_dispatch(
+    query: str, user_id: Optional[int], chat_id: Optional[int], active_docs: list[dict],
+) -> Optional[dict]:
+    """จุดเดียวที่ ask_question() เรียกเมื่อ ROUTER_MODE == "llm" — เรียก route_intent_with_llm แล้วตรวจ+dispatch
+    ไปยัง handler ที่มีอยู่แล้วเท่านั้น (reuse ทั้งหมด ไม่เขียนซ้ำ) คืน {"document_id": int|None, "answer": str}
+    เสมอถ้า dispatch สำเร็จ (ไม่ว่า intent ไหนก็ตาม รวมถึง recommend_products/general_question/legal_question ที่
+    เรียก advisor_answer/rag_answer ด้วย query เดิมตรงๆ) หรือ None ถ้า router ล้ม/ค่าไม่ผ่านการตรวจ/เป็นจุดที่ควร
+    fallback ไปใช้ routing เดิมแทน (ดู log fallback=True/False)
+
+    anthropic.APIError จาก advisor_answer/rag_answer (เรียกหลัง route ตัดสินใจสำเร็จแล้ว) ไม่ถูกจับในนี้ ปล่อยให้
+    หลุดออกไปให้ ask_question() จัดการแบบเดียวกับเส้นทาง legacy ทุกจุด (ดู _ask_question_api_error_response)
+
+    log [Router] มี latency_ms เสมอ (เวลาที่ route_intent_with_llm ใช้ทั้งหมด รวมเรียก LLM จริง — ไม่รวมเวลาที่
+    handler ปลายทาง เช่น advisor_answer/rag_answer ใช้ต่อ) ใช้ติดตามว่า router เพิ่มเวลาตอบสนองเท่าไรจริงๆ"""
+    started_at = time.monotonic()
+    route = route_intent_with_llm(query, user_id, chat_id, active_docs)
+    latency_ms = round((time.monotonic() - started_at) * 1000)
+    if route is None:
+        print(f"[Router] chat={chat_id} fallback=True latency_ms={latency_ms}")
+        return None
+
+    intent = route.get("intent")
+    confidence = route.get("confidence")
+    print(
+        f"[Router] chat={chat_id} intent={intent} confidence={confidence} "
+        f"target={route.get('target_item_index')} rec={route.get('recommendation_index')} fallback=False "
+        f"latency_ms={latency_ms}"
+    )
+
+    if intent not in _ROUTER_VALID_INTENTS:
+        return None  # ค่าไม่ผ่านการตรวจ (intent ที่ไม่รู้จัก) -> fallback routing เดิม
+
+    if intent in _ROUTER_FILE_INTENTS and not (user_id and chat_id):
+        return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
+    if intent == "library_search" and not user_id:
+        return {"document_id": None, "answer": _LIBRARY_LOGIN_REQUIRED_MESSAGE}
+
+    target_doc = _resolve_router_target_document(active_docs, user_id, chat_id)
+    if intent in _ROUTER_FILE_INTENTS and target_doc is None:
+        if not active_docs:
+            answer = "ยังไม่มีไฟล์เปิดอยู่ในแชทนี้เลย กรุณาเปิดไฟล์จากคลังเอกสารก่อนครับ"
+        else:
+            names = ", ".join(f"'{d['filename']}'" for d in active_docs)
+            answer = f"มีไฟล์เปิดอยู่หลายไฟล์ในแชทนี้ ({names}) และไม่มีไฟล์ไหนกำลังโฟกัสอยู่ กรุณาระบุชื่อไฟล์ที่ต้องการก่อนครับ"
+        return {"document_id": None, "answer": answer}
+
+    if intent == "edit_document":
+        return _dispatch_router_edit_document(route, target_doc, query, user_id, chat_id)
+    if intent in ("replace_with_recommendation", "add_recommendation"):
+        result = _dispatch_router_recommendation_action(route, intent, target_doc, chat_id, user_id)
+        if result is None:
+            return None  # ไฟล์ไม่มีตารางรายการ -> fallback routing เดิม (เหมือน _resolve_recommendation_command_dispatch)
+        return result
+    if intent == "read_document":
+        answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
+        return {"document_id": used_doc_id, "answer": answer}
+    if intent in ("recommend_products", "general_question"):
+        return _dispatch_router_advisor(query, user_id, chat_id, active_docs)
+    if intent == "library_search":
+        return _dispatch_router_library_search(route, query, user_id, chat_id)
+    if intent == "legal_question":
+        return _dispatch_router_legal(query, user_id, chat_id)
+
+    # intent == "ask_clarification"
+    result = _dispatch_router_clarification(route)
+    if result is None:
+        return None  # clarification_question ว่างเปล่า/ไม่ผ่านการตรวจ -> fallback routing เดิม
+    return result
 
 
 def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str) -> dict:

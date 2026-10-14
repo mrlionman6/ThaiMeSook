@@ -9,6 +9,7 @@ pytest) ไม่ใช่การ mock ตรรกะเอง — ถ้า 
 import ast
 import io
 import os
+import time
 import re
 import html
 import json
@@ -53,8 +54,9 @@ WANTED_MAIN_FUNCS = {
     "_resolve_and_build_mutate_fn", "_replay_pending_queue",
     "apply_change_rate", "apply_update_table_item", "apply_delete_table_item", "apply_add_table_item",
     "_apply_single_queue_item", "_document_totals_lines", "_apply_structural_commands",
-    "undo_last_edit",
+    "undo_last_edit", "_is_undo_command",
     "_is_document_reading_question", "_has_legal_keyword", "_answer_document_reading_question",
+    "_is_reading_type_question", "_resolve_document_reading_dispatch",
     "_query_mentions_table_item_or_label",
     "_is_structural_edit_command",
     "_find_single_rate_label",
@@ -77,6 +79,7 @@ WANTED_MAIN_FUNCS = {
     "_resolve_recommendation_add_command", "_parse_recommendation_price_clause",
     "_apply_recommendation_replace", "_apply_recommendation_add",
     "_resolve_recommendation_intent_with_llm", "_resolve_recommendation_intent_price",
+    "_validate_and_apply_recommendation_action",
     "_normalize_recommendation_intent_text", "_query_has_recommendation_intent_verb",
     "_sanitize_recommendation_text",
     "_classify_question_route", "_classify_legal_or_advisor_route",
@@ -87,7 +90,7 @@ WANTED_MAIN_FUNCS = {
     "build_library_search_card", "save_library_search_card", "backfill_library_search_cards",
     "_library_search_exact_match_fields", "_library_search_matches_filters", "_library_search_matched_on_text",
     "_library_search_matches_contains_item",
-    "_score_library_search_candidates", "search_library", "execute_search_library",
+    "_score_library_search_candidates", "_library_search_build_candidates", "search_library", "execute_search_library",
     "_resolve_library_exact_match_dispatch",
     "_order_library_documents_by_folder", "_order_library_documents_by_key", "_order_library_documents_by_customer",
     "_resolve_flat_document_labels", "_format_document_line_flat",
@@ -101,6 +104,11 @@ WANTED_MAIN_FUNCS = {
     "_format_cell_display_text", "_cell_style_info", "_evaluate_preview_formula_cells",
     "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
     "_resolve_preview_mode_bytes", "_preview_cache_get", "_preview_cache_set",
+    "_build_router_document_context", "_build_router_recommendations_context", "_build_router_history_context",
+    "_resolve_router_target_document", "route_intent_with_llm",
+    "_dispatch_router_edit_document", "_dispatch_router_recommendation_action", "_dispatch_router_advisor",
+    "_dispatch_router_legal", "_dispatch_router_library_search", "_dispatch_router_clarification",
+    "_resolve_llm_router_dispatch",
 }
 
 WANTED_MAIN_CONSTS = {
@@ -114,7 +122,7 @@ WANTED_MAIN_CONSTS = {
     "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS",
     "_PENDING_QUEUE_COMMAND_TRAILING_WORDS", "_PENDING_QUEUE_NEGATION_RE",
     "_OPEN_COMMAND_QUESTION_WORDS",
-    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE",
+    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE", "_UNDO_COMMAND_TEXTS",
     "_STRUCTURAL_DIRECT_DELETE_RE", "_STRUCTURAL_DIRECT_RATE_RE",
     "_STRUCTURAL_CLAUSE_SPLIT_RE", "_STRUCTURAL_ITEM_NO_TARGET_RE",
     "_STRUCTURAL_DIRECT_FIELD_RE", "_STRUCTURAL_FIELD_NAME_MAP", "_STRUCTURAL_DIRECT_DESCRIPTION_RE",
@@ -149,6 +157,8 @@ WANTED_MAIN_CONSTS = {
     "_LIBRARY_SEARCH_RELATIVE_CUTOFF",
     "_LIBRARY_QUERY_STOPWORDS", "_LIBRARY_QUERY_STOPWORDS_NORMALIZED",
     "_LIBRARY_FULL_LISTING_KEYWORDS", "_LIBRARY_FULL_LISTING_SIZE_CUTOFF",
+    "ROUTER_MODE", "ROUTER_MODEL", "ROUTE_INTENT_TOOL", "ROUTER_SYSTEM_PROMPT",
+    "_ROUTER_FILE_INTENTS", "_ROUTER_VALID_INTENTS", "_ROUTER_FILE_LOGIN_REQUIRED_MESSAGE",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -661,7 +671,7 @@ def build_namespace() -> dict:
         "_prepare_rag_context": fake_rag_context,
         "_log_if_low_confidence": _fake_log_if_low_confidence,
         "io": io, "os": os, "re": re, "html": html, "json": json, "zipfile": zipfile, "difflib": difflib,
-        "datetime": datetime, "ZoneInfo": ZoneInfo, "urllib": urllib,
+        "datetime": datetime, "ZoneInfo": ZoneInfo, "urllib": urllib, "time": time,
         "tempfile": tempfile, "concurrent": concurrent.futures and __import__("concurrent"),
         "openpyxl": openpyxl, "MergedCell": MergedCell, "is_date_format": is_date_format,
         "CalcProperties": CalcProperties, "ExcelCompiler": ExcelCompiler, "Optional": Optional,
