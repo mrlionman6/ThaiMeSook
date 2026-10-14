@@ -20,7 +20,12 @@ from _harness import (
 
 @pytest.fixture
 def ns():
-    return build_namespace()
+    namespace = build_namespace()
+    # ตรึง ROUTER_MODE ให้เป็น "llm" เสมอไม่ว่า env var จริงของเครื่องที่รัน pytest จะตั้งเป็นอะไรไว้ก็ตาม (ดู
+    # feat/llm-intent-router) — เทสต์ต้องไม่พึ่งค่าแวดล้อมภายนอกที่ควบคุมไม่ได้ เทสต์ที่ต้องการทดสอบโหมด "legacy"
+    # โดยเฉพาะยังตั้งค่าทับเองได้ตรงๆ ใน test (ดู test_route_intent_with_llm_skips_call_when_router_mode_is_legacy)
+    namespace["ROUTER_MODE"] = "llm"
+    return namespace
 
 
 @pytest.fixture
