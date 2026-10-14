@@ -34,6 +34,7 @@ from rank_bm25 import BM25Okapi
 
 MAIN_PY = Path(__file__).parent.parent / "main.py"
 DB_PY = Path(__file__).parent.parent / "db.py"
+DOCUMENT_FIELDS_PY = Path(__file__).parent.parent / "document_fields.py"
 
 WANTED_MAIN_FUNCS = {
     "_json_safe_cell_value", "_parse_iso_datetime_like",
@@ -131,6 +132,7 @@ WANTED_MAIN_CONSTS = {
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
     "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
+    "_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS", "_RECEIPT_LINE_RE",
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES", "MAX_TOOL_ITERATIONS",
     "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
@@ -166,8 +168,14 @@ WANTED_MAIN_CONSTS = {
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
 # โดยตรง (ทดสอบผ่าน rag_answer ซึ่งหนักเกินจะ extract ทั้งฟังก์ชัน) แต่ยังปล่อยให้ดึงได้ถ้าจำเป็นภายหลัง
 WANTED_MAIN_FUNCS.add("_looks_like_fabricated_edit_claim")
+WANTED_MAIN_FUNCS.add("_strip_fabricated_receipt_lines")
 
 WANTED_DB_FUNCS = {"_is_macro_workbook"}
+
+# feat/edit-any-field: build_editable_fields/apply_field_edits อยู่ในไฟล์แยก document_fields.py (ตามสเปก) — ดึง
+# ด้วยกลไกเดียวกับ db.py (ast ไม่ import จริง) exec ลง ns เดียวกับ main.py เพราะฟังก์ชันพวกนี้ bare-reference ชื่อ
+# จาก main.py (get_working_copy/create_new_version/ฯลฯ) ตรงๆ โดยไม่มี "document_fields." นำหน้า
+WANTED_DOCUMENT_FIELDS_FUNCS = {"build_editable_fields", "apply_field_edits"}
 
 
 class _FakeDb:
@@ -729,8 +737,10 @@ def build_namespace() -> dict:
 
     main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
     db_tree = ast.parse(DB_PY.read_text(encoding="utf-8"))
+    document_fields_tree = ast.parse(DOCUMENT_FIELDS_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
+    _extract(document_fields_tree, WANTED_DOCUMENT_FIELDS_FUNCS, set(), ns, "document_fields.py")
 
     # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
     # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง
