@@ -2856,20 +2856,38 @@ _FABRICATED_EDIT_CLAIM_RE = re.compile(
 # แล้วว่าข้อความนี้ถูกจัดเป็นคำสั่งแก้โครงสร้างเท่านั้น กันเหมาเข่งผิดในเส้นทางทั่วไป)
 _FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS = ("ยืนยัน", "preview", "✓")
 
+# คำอ้างว่า "แก้/บันทึกสำเร็จแล้ว" แบบลอยๆ ไม่มีคำนามของสิ่งที่ถูกแก้ติดกัน (ไม่เข้า _FABRICATED_EDIT_CLAIM_RE ข้างบน
+# ซึ่งต้องมีคำนามประกบ) — เช็คทุกเส้นทางเสมอ ไม่ต้องรอ structural_route (feat/edit-any-field: Claude เลียนแบบใบ
+# ยืนยัน ✓ ของโค้ดแล้วแต่งเอง เช่น "...เปลี่ยนจาก X เป็น Y ... ไฟล์อัปเดตแล้วครับ" ทั้งที่ไม่มี tool ไหนถูกเรียกเลย)
+_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS = ("เปลี่ยนจาก", "แก้แล้ว", "อัปเดตแล้ว", "บันทึกแล้ว")
+
 
 def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = False) -> bool:
     """เช็คว่าคำตอบดิบของ Claude (ก่อนต่อใบยืนยันจากโค้ด) ดูเหมือนอ้างว่าได้เสนอ/แก้ไฟล์ไปแล้วไหม (ดู
-    _FABRICATED_EDIT_CLAIM_RE) ใช้ร่วมกับเช็คว่า "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer) เพื่อจับ
-    เคส Claude เขียน preview/คำยืนยันปลอมขึ้นเองโดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่ม
-    เงื่อนไข "ยืนยัน"/"preview"/"✓" เข้ามาด้วย (ใช้ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำ
-    พวกนี้ที่เป็นคำปกติในคำตอบกฎหมายทั่วไปโดนบล็อกผิด — ดู rag_answer สำหรับการข้าม guard นี้ไปเลยตอนเป็นคำถาม
-    เชิงกฎหมาย/คำตอบมาจาก RAG จริง ซึ่งเป็นอีกชั้นที่ไม่ได้อยู่ในฟังก์ชันนี้)"""
+    _FABRICATED_EDIT_CLAIM_RE/_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS — เช็คทุกเส้นทางเสมอ) ใช้ร่วมกับเช็คว่า
+    "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer/run_agentic_tool_loop) เพื่อจับเคส Claude เขียน preview/
+    คำยืนยันปลอมขึ้นเองโดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่มเงื่อนไข "ยืนยัน"/"preview"/
+    "✓" เข้ามาด้วย (ใช้ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำพวกนี้ที่เป็นคำปกติในคำตอบ
+    กฎหมายทั่วไปโดนบล็อกผิด — ดู rag_answer สำหรับการข้าม guard นี้ไปเลยตอนเป็นคำถามเชิงกฎหมาย/คำตอบมาจาก RAG จริง
+    ซึ่งเป็นอีกชั้นที่ไม่ได้อยู่ในฟังก์ชันนี้)"""
     if _FABRICATED_EDIT_CLAIM_RE.search(raw_answer):
         return True
+    lowered = raw_answer.lower()
+    if any(p.lower() in lowered for p in _FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS):
+        return True
     if structural_route:
-        lowered = raw_answer.lower()
         return any(p.lower() in lowered for p in _FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS)
     return False
+
+
+_RECEIPT_LINE_RE = re.compile(r"(?m)^[✓✗][^\n]*\n?")
+
+
+def _strip_fabricated_receipt_lines(text: str) -> str:
+    """ตัดบรรทัดที่ขึ้นต้น "✓"/"✗" ออกจาก text — ใบยืนยันจริงของระบบนี้มาจากโค้ดเสมอ ต่อท้ายแยกต่างหากหลัง Claude
+    ตอบจบแล้ว ไม่เคยปนอยู่ในข้อความที่ Claude เขียนเอง (ดู run_agentic_tool_loop/_dispatch_router_clarification/
+    _answer_document_reading_question) เจอแปลว่า Claude เลียนแบบ/แต่งใบยืนยันขึ้นเอง"""
+    return _RECEIPT_LINE_RE.sub("", text).strip()
 
 
 def _answer_document_reading_question(query: str, active_docs: list, user_id: int, chat_id: int) -> tuple[str, Optional[int]]:
@@ -2916,7 +2934,8 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
             ),
             messages=messages,
         )
-        return response.content[0].text.strip(), target_doc["id"]
+        formatted = _strip_fabricated_receipt_lines(response.content[0].text.strip())
+        return (formatted or tool_text), target_doc["id"]
     except Exception as e:
         print(f"[DocumentReadingQuestion] format_failed exception_type={type(e).__name__}")
         return tool_text, target_doc["id"]
@@ -3375,6 +3394,8 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
     ทุก tool ล้มเหลวแบบ exception/error ตรงๆ ดูจาก key "error" เสมอ"""
     if tool_name in ("open_library_file", "select_list_item"):
         if result.get("opened") is True:
+            if result.get("already_open"):
+                return None  # no-op (ไฟล์เปิดอยู่แล้ว) ไม่ต้องออกใบยืนยัน — กันปนกับคำตอบของการกระทำหลักในเทิร์นนี้ (เช่น แก้ไฟล์)
             message = result.get("message") or ""
             return f"✓ {message.splitlines()[0]}" if message else None
         if "error" in result:
@@ -3930,6 +3951,16 @@ def run_agentic_tool_loop(
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
         return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
+
+    # ไม่มี tool แก้โครงสร้างไฟล์สำเร็จเลยในเทิร์นนี้ (applied_messages ว่างเปล่า — เช็คด้านบนไปแล้ว) แต่ final_text
+    # อาจมีบรรทัด "✓"/"✗" ที่ Claude เลียนแบบใบยืนยันของโค้ดแล้วแต่งขึ้นเอง (ดู _strip_fabricated_receipt_lines) —
+    # ตัดทิ้งก่อนเสมอ เหลือแต่ข้อความที่ยังอ้างว่าแก้ไฟล์สำเร็จ/ว่างเปล่า -> ไม่ใช่คำตอบจริง ใช้ fallback แทน
+    stripped_text = _strip_fabricated_receipt_lines(final_text)
+    if stripped_text != final_text.strip():
+        if not stripped_text or _looks_like_fabricated_edit_claim(stripped_text):
+            print(f"[Guard] ai_receipt_line_stripped chat={chat_id}")
+            return _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE, action_receipts, structural_tool_called
+        final_text = stripped_text
     return final_text, action_receipts, structural_tool_called
 
 
@@ -9256,6 +9287,12 @@ def _document_totals_lines(document_id: int, exclude_labels: Optional[set] = Non
 
 _UNDO_HINT_LINE = "พิมพ์ 'ย้อนการแก้' ถ้าต้องการยกเลิก"
 
+# feat/edit-any-field: build_editable_fields/apply_field_edits อยู่ในไฟล์แยก document_fields.py (ตามสเปก) แต่ต้อง
+# import ที่นี่ (ไม่ใช่หัวไฟล์) เพราะ document_fields.py เอง import ชื่อจากไฟล์นี้กลับไปด้วย (get_working_copy/
+# create_new_version/_get_single_item_table/ฯลฯ ที่นิยามไว้ข้างบนทั้งหมดแล้ว ณ จุดนี้) — import ไว้ก่อนชื่อเหล่านั้น
+# จะวน circular import (document_fields import ชื่อที่ main.py ยังไม่ทันนิยามเลย)
+from document_fields import build_editable_fields, apply_field_edits
+
 
 def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: list[dict]) -> str:
     """apply คำสั่งแก้โครงสร้างที่ parse ได้จากข้อความเดียว (ดู _parse_direct_structural_commands — อาจมีมากกว่า
@@ -9881,6 +9918,33 @@ ROUTE_INTENT_TOOL = {
                     "ผู้ใช้ (เช่น \"เปลี่ยนจำนวนรายการที่ 1 เป็น 30\") ไม่งั้นใส่ null"
                 ),
             },
+            "field_edits": {
+                "type": ["array", "null"],
+                "description": (
+                    "ใช้เมื่อ intent เป็น edit_document และแก้ช่องที่ไม่ใช่อัตรา/รายการในตาราง (ดูรายการ \"ช่อง"
+                    "ทั้งหมดที่แก้ได้\" ในบริบทไฟล์ที่เปิดอยู่) เลือก field_id จากรายการนั้นเท่านั้น ไม่งั้นใส่ "
+                    "null หรือ [] (เช่นตอนแก้อัตรา/ตารางที่ใช้ edit_instruction แทน)"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "field_id": {"type": "string", "description": "field_id ที่ตรงกับรายการช่องที่แก้ได้เป๊ะ"},
+                        "operation": {
+                            "type": "string", "enum": ["set", "replace_text", "clear"],
+                            "description": "set=ตั้งค่าใหม่ทั้งหมด, replace_text=แทนที่บางส่วน (ต้องมี find_text), clear=ล้างเป็นค่าว่าง",
+                        },
+                        "new_value": {
+                            "type": ["string", "number", "null"],
+                            "description": "ค่าใหม่ (set) หรือข้อความแทนที่ (replace_text) ไม่ใช้กับ clear ก็ใส่ null",
+                        },
+                        "find_text": {
+                            "type": ["string", "null"],
+                            "description": "ข้อความที่จะหาในค่าปัจจุบัน ใช้เมื่อ operation เป็น replace_text เท่านั้น ไม่งั้นใส่ null",
+                        },
+                    },
+                    "required": ["field_id", "operation", "new_value", "find_text"],
+                },
+            },
             "library_query": {
                 "type": ["string", "null"],
                 "description": "ใช้เมื่อ intent เป็น library_search เท่านั้น — คำค้นหาเอกสารในคลัง ไม่งั้นใส่ null",
@@ -9909,7 +9973,7 @@ ROUTE_INTENT_TOOL = {
         },
         "required": [
             "intent", "target_item_index", "recommendation_index", "quantity", "price_mode", "explicit_price",
-            "markup_percent", "edit_instruction", "library_query", "library_filters",
+            "markup_percent", "edit_instruction", "field_edits", "library_query", "library_filters",
             "clarification_question", "confidence",
         ],
     },
@@ -9925,9 +9989,17 @@ ROUTER_SYSTEM_PROMPT = (
     "recommend_products เสมอ (ไปค้นหาใหม่ ห้ามถามกลับ) เช่น แนะนำ HDD -> ได้รายการแนะนำแค่รุ่น 4TB กับ 8TB -> ผู้ใช้"
     "พิมพ์ \"อยากได้ 16tb 2 ตัว\" (ไม่มีรุ่น 16TB ในรายการที่แนะนำไปเลย) -> recommend_products ไม่ใช่ ask_clarification\n\n"
     "ความหมายของแต่ละ intent พร้อมตัวอย่างจริงจากโปรเจกต์นี้:\n"
-    "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ (เปลี่ยนอัตรา/ลบ-เพิ่ม-แก้รายการในตาราง) เช่น \"เปลี่ยน VAT เป็น "
-    "10%\", \"ลบรายการที่ 3\", \"เปลี่ยนจำนวน Box 4x4 เป็น 30\" — เขียน edit_instruction เป็นประโยคคำสั่งที่ชัดเจน"
-    "ขึ้น (แก้คำสรรพนาม/อ้างอิงให้เป็นชื่อ-เลขที่ชัดเจน) เสมอ\n"
+    "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ แบ่งเป็นสองแบบ: (ก) เปลี่ยนอัตรา (VAT/เปอร์เซ็นต์ในสูตร)/ลบ-เพิ่ม-"
+    "แก้รายการในตาราง เช่น \"เปลี่ยน VAT เป็น 10%\", \"ลบรายการที่ 3\", \"เปลี่ยนจำนวน Box 4x4 เป็น 30\" — เขียน "
+    "edit_instruction เป็นประโยคคำสั่งที่ชัดเจนขึ้น (แก้คำสรรพนาม/อ้างอิงให้เป็นชื่อ-เลขที่ชัดเจน) ปล่อย field_edits "
+    "เป็น null เสมอ (ข) แก้ช่องอื่นในเอกสาร (label ใดๆ ที่ไม่ใช่สูตร/ข้อความที่ไม่มีป้าย เช่น ที่อยู่บริษัทเรา/ชื่อ"
+    "ผู้เซ็น/หมายเหตุ — ดูรายการ \"ช่องทั้งหมดที่แก้ได้\" ในบริบทไฟล์ที่เปิดอยู่) ให้ใส่ field_edits แทน เลือก "
+    "field_id จากรายการนั้นเท่านั้น (ห้ามเดา field_id เอง) operation: \"set\" (ตั้งค่าใหม่ทั้งหมด) ใช้เมื่อผู้ใช้ "
+    "บอกค่าใหม่ทั้งหมด, \"replace_text\" (แทนที่บางส่วน) ใช้เมื่อผู้ใช้แก้แค่บางส่วนของข้อความเดิม เช่น \"ตรงที่อยู่"
+    " แก้เลขที่เป็น 32/14\" (ที่อยู่เดิมมี \"เลขที่ 61\" อยู่) -> field_edits=[{\"field_id\": <field_id ของที่อยู่>, "
+    "\"operation\": \"replace_text\", \"find_text\": \"61\", \"new_value\": \"32/14\"}], \"clear\" (ล้างเป็นค่าว่าง) "
+    "หลายช่องในข้อความเดียวได้ ช่องที่ \"แก้ตรงไม่ได้\" ในรายการ (เช่นอัตรา VAT/ยอดรวม) ห้ามใส่ใน field_edits "
+    "เด็ดขาด ให้ใช้ edit_instruction แทน\n"
     "- replace_with_recommendation: ขอให้เอารุ่นสินค้าที่เพิ่งแนะนำไปแทนรายการเดิมในตาราง (ไม่ใช่แค่พูดถึงรุ่น"
     "เฉยๆ) เช่น แนะนำ HDD -> \"อยากได้ 16tb 2 ตัว\" -> ได้รายการแนะนำ -> \"เอา Seagate SkyHawk เเทน HDD เก่าเลย\" "
     "-> เจตนานี้ ต้องดูบริบทบทสนทนาทั้งหมดเพื่อหา target_item_index (แถวในตารางที่เป็นอุปกรณ์ประเภทเดียวกับที่จะ"
@@ -9956,15 +10028,45 @@ ROUTER_SYSTEM_PROMPT = (
 )
 
 
+_ROUTER_EDITABLE_FIELDS_MAX = 150
+_ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS = 120
+
+
+def _format_router_editable_fields_text(fields: list[dict]) -> str:
+    """จัดรูปรายการช่องที่แก้ได้ทั้งเอกสาร (จาก build_editable_fields) ให้ router เห็น: "field_id: label = ค่า
+    ปัจจุบัน" ต่อบรรทัด จำกัดไม่เกิน _ROUTER_EDITABLE_FIELDS_MAX ช่อง (คิดเผื่อเอกสารใหญ่) ตัดค่าแต่ละช่องไม่เกิน
+    _ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS ตัวอักษร ช่องแก้ไม่ได้ (editable=False — สูตร/อัตรา) ติด "[แก้ตรงไม่ได้:
+    เหตุผล]" กำกับไว้ด้วย กันถูกเลือกเป็น field_edits ผิดๆ"""
+    if not fields:
+        return "ไม่มีช่องให้แก้"
+    lines = []
+    for field in fields[:_ROUTER_EDITABLE_FIELDS_MAX]:
+        value_text = "" if field["current_value"] is None else str(field["current_value"])
+        if len(value_text) > _ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS:
+            value_text = value_text[:_ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS] + "..."
+        suffix = "" if field["editable"] else f" [แก้ตรงไม่ได้: {field['reason']}]"
+        lines.append(f"{field['field_id']}: {field['label']} = {value_text}{suffix}")
+    if len(fields) > _ROUTER_EDITABLE_FIELDS_MAX:
+        lines.append(f"... (และอีก {len(fields) - _ROUTER_EDITABLE_FIELDS_MAX} ช่อง ไม่แสดงเพิ่ม)")
+    return "\n".join(lines)
+
+
 def _build_router_document_context(target_doc: Optional[dict]) -> str:
     """สร้างข้อความบริบท "ไฟล์ที่เปิดอยู่" ให้ route_intent_with_llm — ชื่อไฟล์ + ตารางรายการ (ลำดับ/รายละเอียด/
     จำนวน/หน่วย/ราคา) + ป้ายสำคัญทั้งหมด (เช่น VAT) reuse read_document_values/_format_document_values_text ตรงๆ
-    (เครื่องมือ read_document_values ของ AI ใช้สองฟังก์ชันนี้คู่กันอยู่แล้ว) ไม่มีไฟล์เป้าหมายชัดเจน (ไม่มีไฟล์เปิด
-    อยู่เลย หรือเปิดหลายไฟล์พร้อมกันไม่มีโฟกัส) -> คืนข้อความคงที่ "ไม่มีไฟล์เปิดอยู่" ตรงๆ"""
+    (เครื่องมือ read_document_values ของ AI ใช้สองฟังก์ชันนี้คู่กันอยู่แล้ว) + รายการ "ช่องทั้งหมดที่แก้ได้" (ดู
+    build_editable_fields — feat/edit-any-field) ให้ router เลือก field_id ตอนแก้ช่องที่ไม่ใช่อัตรา/ตาราง ไม่มี
+    ไฟล์เป้าหมายชัดเจน (ไม่มีไฟล์เปิดอยู่เลย หรือเปิดหลายไฟล์พร้อมกันไม่มีโฟกัส) -> คืนข้อความคงที่ "ไม่มีไฟล์เปิด
+    อยู่" ตรงๆ"""
     if target_doc is None:
         return "ไม่มีไฟล์เปิดอยู่"
     data = read_document_values(target_doc)
-    return f"ชื่อไฟล์: {target_doc['filename']}\n\n" + _format_document_values_text(data)
+    fields = build_editable_fields(target_doc)
+    return (
+        f"ชื่อไฟล์: {target_doc['filename']}\n\n" + _format_document_values_text(data)
+        + "\n\nช่องทั้งหมดที่แก้ได้ (field_id: label = ค่าปัจจุบัน):\n"
+        + _format_router_editable_fields_text(fields)
+    )
 
 
 def _build_router_recommendations_context(recommendations: list[dict]) -> str:
@@ -10059,11 +10161,18 @@ _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระ�
 
 
 def _dispatch_router_edit_document(route: dict, target_doc: dict, query: str, user_id: int, chat_id: int) -> dict:
-    """ลอง _resolve_direct_structural_dispatch กับ edit_instruction (ประโยคคำสั่งที่ router เขียนให้ชัดเจนขึ้นแล้ว
-    — ไม่ใช่ query ดิบของผู้ใช้) ก่อนเสมอ — parse ได้และ apply จริงไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน
-    regex ตรงนี้จะ parse ได้ เช่นต้องอ้างอิงป้ายที่เป็นข้อความอิสระ) -> ส่งเส้นทาง structural/agent เดิมต่อ (reuse
-    rag_answer(structural_route=True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน query
-    เดิม (ให้ agent เห็นคำสั่งที่ชัดเจนกว่า)"""
+    """มี field_edits (feat/edit-any-field — แก้ช่องใดก็ได้ในเอกสาร ไม่ใช่แค่รายการ/อัตรา) -> apply_field_edits
+    ก่อนเสมอ คืนผลนั้นตรงๆ ไม่ลองทางอื่นต่อ (router เลือก field_id จากรายการช่องที่แก้ได้มาแล้ว ไม่ใช่ข้อความดิบที่
+    ต้อง parse เดาอีกที) ไม่มี field_edits -> ทางเดิม: ลอง _resolve_direct_structural_dispatch กับ edit_instruction
+    (ประโยคคำสั่งที่ router เขียนให้ชัดเจนขึ้นแล้ว — ไม่ใช่ query ดิบของผู้ใช้) ก่อนเสมอ — parse ได้และ apply จริง
+    ไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน regex ตรงนี้จะ parse ได้) -> ส่งเส้นทาง structural/agent เดิมต่อ
+    (reuse rag_answer(structural_route=True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน
+    query เดิม (ให้ agent เห็นคำสั่งที่ชัดเจนกว่า)"""
+    field_edits = route.get("field_edits")
+    if isinstance(field_edits, list) and field_edits:
+        result = apply_field_edits(target_doc["id"], user_id, field_edits)
+        return {"document_id": target_doc["id"], "answer": result["message"]}
+
     edit_instruction = route.get("edit_instruction")
     if not isinstance(edit_instruction, str) or not edit_instruction.strip():
         edit_instruction = query
@@ -10178,7 +10287,7 @@ def _dispatch_router_clarification(route: dict, chat_id: int) -> Optional[dict]:
         print(f"[Router] chat={chat_id} branch=clarification_repeat_blocked")
         return None
 
-    safe_question = question.strip()
+    safe_question = _strip_fabricated_receipt_lines(question.strip()) or question.strip()
     if "ผู้ใช้" in safe_question:
         safe_question = _ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK
     elif _looks_like_fabricated_edit_claim(safe_question):
