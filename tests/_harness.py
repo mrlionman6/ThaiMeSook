@@ -105,7 +105,8 @@ WANTED_MAIN_FUNCS = {
     "_format_cell_display_text", "_cell_style_info", "_evaluate_preview_formula_cells",
     "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
     "_resolve_preview_mode_bytes", "_preview_cache_get", "_preview_cache_set",
-    "_build_router_document_context", "_build_router_recommendations_context", "_build_router_history_context",
+    "_build_router_document_context", "_format_router_editable_fields_text",
+    "_build_router_recommendations_context", "_build_router_history_context",
     "_resolve_router_target_document", "route_intent_with_llm",
     "_dispatch_router_edit_document", "_dispatch_router_recommendation_action", "_dispatch_router_advisor",
     "_dispatch_router_legal", "_dispatch_router_library_search", "_dispatch_router_clarification",
@@ -163,6 +164,7 @@ WANTED_MAIN_CONSTS = {
     "ROUTER_MODE", "ROUTER_MODEL", "ROUTE_INTENT_TOOL", "ROUTER_SYSTEM_PROMPT",
     "_ROUTER_FILE_INTENTS", "_ROUTER_VALID_INTENTS", "_ROUTER_FILE_LOGIN_REQUIRED_MESSAGE",
     "_ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK",
+    "_ROUTER_EDITABLE_FIELDS_MAX", "_ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -172,10 +174,9 @@ WANTED_MAIN_FUNCS.add("_strip_fabricated_receipt_lines")
 
 WANTED_DB_FUNCS = {"_is_macro_workbook"}
 
-# feat/edit-any-field: build_editable_fields/apply_field_edits อยู่ในไฟล์แยก document_fields.py (ตามสเปก) — ดึง
-# ด้วยกลไกเดียวกับ db.py (ast ไม่ import จริง) exec ลง ns เดียวกับ main.py เพราะฟังก์ชันพวกนี้ bare-reference ชื่อ
-# จาก main.py (get_working_copy/create_new_version/ฯลฯ) ตรงๆ โดยไม่มี "document_fields." นำหน้า
-WANTED_DOCUMENT_FIELDS_FUNCS = {"build_editable_fields", "apply_field_edits"}
+# feat/edit-any-field: document_fields.py ดึงทั้งไฟล์อัตโนมัติด้วย _extract_all แทนไล่ชื่อทีละตัว (ดูเหตุผลใน
+# docstring ของ _extract_all) exec ลง ns เดียวกับ main.py เพราะฟังก์ชันในไฟล์นั้น bare-reference ชื่อจาก main.py
+# (get_working_copy/create_new_version/ฯลฯ) ตรงๆ โดยไม่มี "document_fields."/"main." นำหน้า
 
 
 class _FakeDb:
@@ -589,6 +590,24 @@ def _extract(tree: ast.Module, wanted_funcs: set, wanted_consts: set, ns: dict, 
         raise RuntimeError(f"ดึงฟังก์ชัน/ค่าคงที่จาก {label} ไม่ครบ: {sorted(missing)}")
 
 
+def _extract_all(tree: ast.Module, ns: dict, label: str) -> None:
+    """เหมือน _extract แต่ดึงฟังก์ชัน/ค่าคงที่ระดับบนสุด "ทุกตัว" ของไฟล์อัตโนมัติ แทนการไล่ระบุชื่อทีละตัว — ใช้กับ
+    ไฟล์เล็กที่ทุกอย่างในนั้นเกี่ยวข้องกันหมด (เช่น document_fields.py) กันบั๊กที่เคยเกิด: ดึงแค่ฟังก์ชัน public
+    (build_editable_fields/apply_field_edits) แต่ลืมฟังก์ชันช่วยภายใน (_is_rate_formula_text ฯลฯ) ที่สองตัวนั้น
+    เรียกใช้ ทำให้ NameError ตอนเทสต์เรียกจริง — เขียนแยกจาก _extract เอง (ไม่เรียกต่อ) เพราะ _extract เช็ค "missing"
+    แยกชุดฟังก์ชัน/ค่าคงที่ ถ้าส่งชื่อเดียวกันเข้าไปเป็นทั้งสองชุดจะเข้าใจผิดว่าฟังก์ชันหายไปจากชุดค่าคงที่เสมอ"""
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{label}>", "exec"), ns)
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), f"<{label}>", "exec"), ns)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+            plain_assign = ast.Assign(targets=[node.target], value=node.value)
+            ast.copy_location(plain_assign, node)
+            ast.fix_missing_locations(plain_assign)
+            exec(compile(ast.Module(body=[plain_assign], type_ignores=[]), f"<{label}>", "exec"), ns)
+
+
 class _FakeAgenticLoop:
     """ตัวแทน run_agentic_tool_loop ที่ควบคุมผลลัพธ์ได้ตรงๆ จากเทสต์ (ตั้งค่าผ่าน set_response ก่อนเรียก
     rag_answer) — ใช้ทดสอบ guard logic ของ rag_answer เอง (structural_no_tool/fabricated_edit_claim_blocked)
@@ -740,7 +759,7 @@ def build_namespace() -> dict:
     document_fields_tree = ast.parse(DOCUMENT_FIELDS_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
-    _extract(document_fields_tree, WANTED_DOCUMENT_FIELDS_FUNCS, set(), ns, "document_fields.py")
+    _extract_all(document_fields_tree, ns, "document_fields.py")
 
     # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
     # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง
