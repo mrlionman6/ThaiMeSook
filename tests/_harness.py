@@ -86,11 +86,14 @@ WANTED_MAIN_FUNCS = {
     "_get_enriched_library_files", "_library_file_has_macros", "_guess_library_document_type",
     "build_library_search_card", "save_library_search_card", "backfill_library_search_cards",
     "_library_search_exact_match_fields", "_library_search_matches_filters", "_library_search_matched_on_text",
+    "_library_search_matches_contains_item",
     "_score_library_search_candidates", "search_library", "execute_search_library",
     "_resolve_library_exact_match_dispatch",
-    "_order_library_documents_by_folder", "_resolve_flat_document_labels", "_format_document_line_flat",
+    "_order_library_documents_by_folder", "_order_library_documents_by_key", "_order_library_documents_by_customer",
+    "_resolve_flat_document_labels", "_format_document_line_flat",
     "_format_library_document_list", "_record_chat_document_listing", "_escape_markdown_text",
-    "_strip_file_extension",
+    "_strip_file_extension", "_format_customer_list", "_record_chat_customer_listing",
+    "_looks_like_full_library_listing_query", "_resolve_library_full_listing_dispatch",
     "_read_values_from_bytes", "_tokenize_library_query",
     "_is_chat_export_command", "_build_chat_export_answer",
     "_format_chat_export_timestamp", "_build_chat_export_text", "_strip_markdown_for_export",
@@ -143,7 +146,9 @@ WANTED_MAIN_CONSTS = {
     "SEARCH_LIBRARY_TOOL", "LIBRARY_ROUTE_SYSTEM_PROMPT", "LIBRARY_TOOLS", "LIBRARY_LOGGED_IN_RULES",
     "_LIBRARY_DOCUMENT_TYPE_WORDS", "_LIBRARY_CARD_DATE_LABEL_WORDS", "_LIBRARY_CARD_TOTAL_LABEL_WORDS",
     "_LIBRARY_SEARCH_MAX_RESULTS", "_LIBRARY_SEARCH_SCORE_THRESHOLD", "_LIBRARY_SEARCH_EXACT_MATCH_BONUS",
+    "_LIBRARY_SEARCH_RELATIVE_CUTOFF",
     "_LIBRARY_QUERY_STOPWORDS", "_LIBRARY_QUERY_STOPWORDS_NORMALIZED",
+    "_LIBRARY_FULL_LISTING_KEYWORDS", "_LIBRARY_FULL_LISTING_SIZE_CUTOFF",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
