@@ -108,6 +108,7 @@ WANTED_MAIN_FUNCS = {
     "_resolve_router_target_document", "route_intent_with_llm",
     "_dispatch_router_edit_document", "_dispatch_router_recommendation_action", "_dispatch_router_advisor",
     "_dispatch_router_legal", "_dispatch_router_library_search", "_dispatch_router_clarification",
+    "_is_router_clarification_fresh",
     "_resolve_llm_router_dispatch",
 }
 
@@ -159,6 +160,7 @@ WANTED_MAIN_CONSTS = {
     "_LIBRARY_FULL_LISTING_KEYWORDS", "_LIBRARY_FULL_LISTING_SIZE_CUTOFF",
     "ROUTER_MODE", "ROUTER_MODEL", "ROUTE_INTENT_TOOL", "ROUTER_SYSTEM_PROMPT",
     "_ROUTER_FILE_INTENTS", "_ROUTER_VALID_INTENTS", "_ROUTER_FILE_LOGIN_REQUIRED_MESSAGE",
+    "_ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -185,6 +187,7 @@ class _FakeDb:
         self.file_categories: dict[int, str] = {}
         self.library_search_cards: dict[int, dict] = {}
         self.last_listing: dict[int, dict] = {}  # chat_id -> {"kind":, "items":} จาก set_chat_last_listing
+        self.router_clarifications: dict[int, dict] = {}  # chat_id -> {"message_count_at_creation": int}
         self.chat_messages: dict[int, list[dict]] = {}  # chat_id -> [{"role","content"}, ...] เรียงเก่า->ใหม่
         self._next_document_id = 1
         self._next_version_id = 1
@@ -272,6 +275,13 @@ class _FakeDb:
 
     def get_chat_last_recommendations(self, chat_id):
         return self.last_recommendations.get(chat_id)
+
+    def set_chat_router_clarification_flag(self, chat_id):
+        count = len(self.chat_messages.get(chat_id, []))
+        self.router_clarifications[chat_id] = {"message_count_at_creation": count}
+
+    def get_chat_router_clarification_flag(self, chat_id):
+        return self.router_clarifications.get(chat_id)
 
     def get_chat_document_focus(self, chat_id, user_id):
         document_id = self.focus.get(chat_id)
@@ -691,6 +701,8 @@ def build_namespace() -> dict:
         "set_chat_document_focus": fake_db.set_chat_document_focus,
         "set_chat_last_recommendations": fake_db.set_chat_last_recommendations,
         "get_chat_last_recommendations": fake_db.get_chat_last_recommendations,
+        "set_chat_router_clarification_flag": fake_db.set_chat_router_clarification_flag,
+        "get_chat_router_clarification_flag": fake_db.get_chat_router_clarification_flag,
         "get_chat_document_focus": fake_db.get_chat_document_focus,
         "add_chat_pending_action": fake_db.add_chat_pending_action,
         "get_chat_pending_actions": fake_db.get_chat_pending_actions,

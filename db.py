@@ -337,6 +337,19 @@ class ChatLastRecommendations(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
+class ChatRouterClarification(Base):
+    """True เมื่อคำตอบล่าสุดของ assistant ในแชทนี้เป็นคำถามย้อนถามจาก route_intent_with_llm (ask_clarification —
+    main.py) ใช้กัน router ถามซ้ำเรื่องเดิมสองรอบติดกันไม่จบ (ดู _dispatch_router_clarification/_is_router_
+    clarification_fresh ใน main.py) 1 แชทมีสถานะนี้ได้แค่ค่าเดียว ณ เวลาหนึ่ง (chat_id เป็น primary key ตรงๆ
+    แทนที่แถวเดิมเสมอ — รูปแบบเดียวกับ ChatLastListing/ChatLastRecommendations) ไม่ต้อง ALTER ตารางเดิมเลย เป็น
+    ตารางใหม่ล้วนๆ"""
+    __tablename__ = "chat_router_clarifications"
+
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), primary_key=True)
+    message_count_at_creation = Column(Integer, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
 class FileCategory(Base):
     """หมวดหมู่ (โฟลเดอร์) ของคลังไฟล์ Excel ที่แอดมินจัดการ — "None" ไม่ใช่แถวในตารางนี้
     (แทนด้วย library_files.category_id = NULL) ชื่อ "none" (ไม่สนตัวพิมพ์เล็กใหญ่) ถูกสงวนไว้
@@ -1696,6 +1709,28 @@ def get_chat_last_listing(chat_id: int) -> Optional[dict]:
             "message_count_at_creation": stored.get("message_count_at_creation"),
             "created_at": row.created_at,
         }
+
+
+def set_chat_router_clarification_flag(chat_id: int) -> None:
+    """Upsert — เก็บจำนวนข้อความในแชทตอนนี้ (ก่อนเทิร์นนี้ถูกบันทึก) ให้เทียบ +2 แบบเดียวกับ is_listing_fresh()."""
+    now = datetime.datetime.utcnow()
+    with SessionLocal() as session:
+        message_count = session.query(ChatMessage).filter(ChatMessage.session_id == chat_id).count()
+        row = session.get(ChatRouterClarification, chat_id)
+        if row is None:
+            row = ChatRouterClarification(chat_id=chat_id, message_count_at_creation=message_count, created_at=now)
+            session.add(row)
+        else:
+            row.message_count_at_creation = message_count
+            row.created_at = now
+        session.commit()
+
+
+def get_chat_router_clarification_flag(chat_id: int) -> Optional[dict]:
+    """คืน {"message_count_at_creation": int} หรือ None ถ้ายังไม่เคยมี"""
+    with SessionLocal() as session:
+        row = session.get(ChatRouterClarification, chat_id)
+        return {"message_count_at_creation": row.message_count_at_creation} if row is not None else None
 
 
 def add_chat_pending_action(chat_id: int, action: dict, preview_text: str) -> int:

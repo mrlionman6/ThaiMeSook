@@ -103,6 +103,8 @@ from db import (
     get_chat_last_listing,
     set_chat_last_recommendations,
     get_chat_last_recommendations,
+    set_chat_router_clarification_flag,
+    get_chat_router_clarification_flag,
     clear_chat_document_focus,
     close_editable_document,
     log_document_edit,
@@ -9879,6 +9881,11 @@ ROUTER_SYSTEM_PROMPT = (
     "คุณคือ router ตัวเดียวที่ตัดสินใจว่าข้อความล่าสุดของผู้ใช้ในแชทผู้ช่วยด้านเอกสารธุรกิจ/กฎหมาย/การลงทุนต้องการ"
     "อะไร จากบริบททั้งหมดที่ให้มา (ประวัติการสนทนา, ไฟล์ที่เปิดอยู่พร้อมตารางรายการ, รายการแนะนำสินค้าล่าสุด, "
     "สถานะล็อกอิน) เรียกเครื่องมือ route_intent เสมอ ห้ามเขียนคำตอบเป็นข้อความเองเด็ดขาด\n\n"
+    "หลักตัดสิน: เลือก intent ที่ลงมือได้ก่อนเสมอ ใช้ ask_clarification เฉพาะเมื่อมีอย่างน้อย 2 ทางที่ทำให้ไฟล์ออกมา"
+    "ต่างกันจริง และเลือกทางที่สมเหตุสมผลที่สุดไม่ได้เลย (การแก้ไฟล์ผิดยังย้อนกลับได้ ส่วนการค้น/แนะนำไม่มีผลเสียถ้า"
+    "เดาผิด — ไม่ใช่เหตุผลให้ถามกลับ) ถ้าผู้ใช้ระบุสเปก/ความจุ/จำนวน/ยี่ห้อที่ไม่มีอยู่ในรายการแนะนำล่าสุดเลย ให้ "
+    "recommend_products เสมอ (ไปค้นหาใหม่ ห้ามถามกลับ) เช่น แนะนำ HDD -> ได้รายการแนะนำแค่รุ่น 4TB กับ 8TB -> ผู้ใช้"
+    "พิมพ์ \"อยากได้ 16tb 2 ตัว\" (ไม่มีรุ่น 16TB ในรายการที่แนะนำไปเลย) -> recommend_products ไม่ใช่ ask_clarification\n\n"
     "ความหมายของแต่ละ intent พร้อมตัวอย่างจริงจากโปรเจกต์นี้:\n"
     "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ (เปลี่ยนอัตรา/ลบ-เพิ่ม-แก้รายการในตาราง) เช่น \"เปลี่ยน VAT เป็น "
     "10%\", \"ลบรายการที่ 3\", \"เปลี่ยนจำนวน Box 4x4 เป็น 30\" — เขียน edit_instruction เป็นประโยคคำสั่งที่ชัดเจน"
@@ -9898,9 +9905,14 @@ ROUTER_SYSTEM_PROMPT = (
     "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
     "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
     "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
-    "- ask_clarification: สถานการณ์กำกวมจริงๆ จนตัดสิน intent อื่นไม่ได้อย่างมั่นใจ (เช่นมีอุปกรณ์ประเภทเดียวกัน"
-    "หลายรายการในตารางไม่รู้ว่าหมายถึงอันไหน หรือข้อความสั้นเกินไปจนตีความได้หลายทาง) — ใส่ confidence เป็น low "
-    "และเขียน clarification_question เป็นคำถามเฉพาะเจาะจงที่ช่วยให้ผู้ใช้ตอบกลับมาได้ง่าย\n\n"
+    "- ask_clarification: สถานการณ์กำกวมจริงๆ (ดูหลักตัดสินด้านบน) จนตัดสิน intent อื่นไม่ได้อย่างมั่นใจ (เช่นมี"
+    "อุปกรณ์ประเภทเดียวกันหลายรายการในตารางไม่รู้ว่าหมายถึงอันไหน) — ใส่ confidence เป็น low และเขียน clarification_"
+    "question พูดกับผู้ใช้โดยตรงเหมือนคุยกันเอง ห้ามใช้คำว่า \"ผู้ใช้\"/\"ท่าน\" เรียกผู้ใช้ ห้ามเล่าว่าผู้ใช้พิมพ์"
+    "อะไรมา ภาษาไทยสุภาพเรียบง่าย ลงท้าย \"ครับ\" ไม่เกิน 2 ประโยค ถ้ามีตัวเลือกให้ทำเป็นข้อ 1/2 ที่ตอบด้วยตัวเลขได้ "
+    "ห้ามถามแบบ \"ต้องการ A หรือ B\" ที่ตอบ \"ใช่\" ไม่ได้\n"
+    "- ถ้าข้อความ assistant ล่าสุดในประวัติเป็นคำถามมีตัวเลือก (จาก ask_clarification เทิร์นก่อน) และผู้ใช้ตอบสั้นๆ "
+    "(\"1\", \"ข้อแรก\", \"อันที่สอง\", \"ใช่\", \"เอาอันนั้น\") ให้ตีความเป็นตัวเลือกนั้นแล้วลงมือตาม intent เดิมที่"
+    "ถามไปทันที (\"ใช่\"/\"ได้\"/\"โอเค\" กับคำถามที่มีตัวเลือก = เลือกข้อ 1) ห้ามถามซ้ำเรื่องเดิมอีกเป็นครั้งที่ 2\n\n"
     "confidence เป็น low ทุกครั้งที่กำกวมจริง (ไม่ใช่แค่ไม่มั่นใจ 100% — เดาตามบริบทที่สมเหตุสมผลที่สุดได้ถ้ามีเบาะแส"
     "พอ) high เมื่อมั่นใจจากบริบทที่ให้มา"
 )
@@ -10103,16 +10115,35 @@ def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[i
     return {"document_id": None, "answer": listing_text + "\n\nต้องการเปิดข้อไหนครับ"}
 
 
-def _dispatch_router_clarification(route: dict) -> Optional[dict]:
-    """ตอบ clarification_question ที่ router เขียนมา (ผ่าน _looks_like_fabricated_edit_claim กันเหมือนทุกจุดที่
-    ให้ LLM เขียนคำถามกลับ — ดู _resolve_recommendation_intent_with_llm) ว่างเปล่า/ไม่ใช่ string -> คืน None
-    (ค่าไม่ผ่านการตรวจ ปล่อยให้ fallback ไปใช้ routing เดิม)"""
+_ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK = "ขอรายละเอียดเพิ่มอีกนิดได้ไหมครับ ว่าต้องการให้ทำอะไรต่อ"
+
+
+def _is_router_clarification_fresh(chat_id: int) -> bool:
+    """True ถ้าเทิร์นผู้ช่วยล่าสุดในแชทนี้คือ router clarification จริงๆ (ไม่มีเทิร์นอื่นคั่น) — รูปแบบเดียวกับ
+    is_listing_fresh()"""
+    flag = get_chat_router_clarification_flag(chat_id)
+    if flag is None:
+        return False
+    return len(get_chat_messages(chat_id)) == flag["message_count_at_creation"] + 2
+
+
+def _dispatch_router_clarification(route: dict, chat_id: int) -> Optional[dict]:
+    """ตอบ clarification_question ที่ router เขียนมา ว่างเปล่า/ไม่ใช่ string -> None เพิ่งถาม clarification ไป
+    เทิร์นก่อนหน้าทันทีแล้ว router จะถามซ้ำอีก -> None (fallback) แทนการถามซ้ำสองรอบติด"""
     question = route.get("clarification_question")
     if not isinstance(question, str) or not question.strip():
         return None
+    if _is_router_clarification_fresh(chat_id):
+        print(f"[Router] chat={chat_id} branch=clarification_repeat_blocked")
+        return None
+
     safe_question = question.strip()
-    if _looks_like_fabricated_edit_claim(safe_question):
+    if "ผู้ใช้" in safe_question:
+        safe_question = _ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK
+    elif _looks_like_fabricated_edit_claim(safe_question):
         safe_question = "ขอรายละเอียดเพิ่มเติมอีกนิดได้ไหมครับ ยังไม่แน่ใจว่าหมายถึงอะไรครับ"
+
+    set_chat_router_clarification_flag(chat_id)
     return {"document_id": None, "answer": safe_question}
 
 
@@ -10180,7 +10211,7 @@ def _resolve_llm_router_dispatch(
         return _dispatch_router_legal(query, user_id, chat_id)
 
     # intent == "ask_clarification"
-    result = _dispatch_router_clarification(route)
+    result = _dispatch_router_clarification(route, chat_id)
     if result is None:
         return None  # clarification_question ว่างเปล่า/ไม่ผ่านการตรวจ -> fallback routing เดิม
     return result
