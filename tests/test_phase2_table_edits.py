@@ -2282,3 +2282,53 @@ def test_resolve_library_exact_match_dispatch_none_for_advisor_product_question(
 
 def test_resolve_library_exact_match_dispatch_none_when_no_exact_match(ns, library_fixture):
     assert ns["_resolve_library_exact_match_dispatch"]("แนะนำสาย CAT-6", user_id=1, chat_id=1) is None
+
+
+# ---------- feat/library-search-and-api-errors ส่วนต่อ: รหัสเอกสารติดอักษรไทย (ไม่เว้นวรรค) ----------
+# บั๊ก: \b ใน Python regex นับอักษรไทยเป็น \w ด้วย -> ไม่มีขอบเขต \w ระหว่างรหัสอังกฤษ/ตัวเลขกับอักษรไทยที่ติดกัน
+# "เปิดใบSSF-02"/"เลขเอกสารSSF-02"/"SSF-02ครับ" (คนไทยพิมพ์ติดกันบ่อยมาก) จึงไม่เจอทั้งที่แบบเว้นวรรคเจอปกติ —
+# แก้ด้วย lookaround ที่เช็คเฉพาะอักษรอังกฤษ/ตัวเลข (_LIBRARY_DOCUMENT_CODE_RE, _library_search_exact_match_fields)
+
+def test_query_matches_document_code_context_true_for_code_touching_polite_word(ns):
+    """"SSF-02ครับ" (รหัสติดคำลงท้ายสุภาพ ไม่มีช่องว่างคั่น) -> ตัดรหัสออกแล้วเหลือ "ครับ" ล้วนๆ -> True เหมือนกับ
+    "SSF-02 ครับ" ที่เว้นวรรค"""
+    assert ns["_query_matches_document_code_context"]("SSF-02ครับ") is True
+
+
+@pytest.mark.parametrize("query", ["เปิดใบSSF-02", "เลขเอกสารSSF-02", "SSF-02ครับ", "ssf-02"])
+def test_search_library_exact_match_works_when_code_touches_thai_text(ns, library_fixture, query):
+    results = ns["search_library"](query, user_id=1)
+    exact_file_ids = {r["file_id"] for r in results if r["exact"]}
+    assert exact_file_ids == {1}
+
+
+@pytest.mark.parametrize("query", ["เปิดใบSSF-02", "เลขเอกสารSSF-02", "SSF-02ครับ", "ssf-02"])
+def test_resolve_library_exact_match_dispatch_opens_when_code_touches_thai_text(ns, library_fixture, query):
+    result = ns["_resolve_library_exact_match_dispatch"](query, user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is not None
+
+
+def test_resolve_library_exact_match_dispatch_lists_multiple_when_code_touches_thai_text(ns, library_fixture):
+    """"ASA-02ครับ" (รหัสลูกค้าติดคำลงท้ายสุภาพ ไม่เว้นวรรค) ต้องยังตรงเป๊ะ 2 ไฟล์เหมือน "ASA-02" เดี่ยวๆ"""
+    result = ns["_resolve_library_exact_match_dispatch"]("ASA-02ครับ", user_id=1, chat_id=1)
+    assert result is not None
+    assert result["document_id"] is None
+    assert "ต้องการเปิดข้อไหนครับ" in result["answer"]
+
+
+def test_resolve_library_exact_match_dispatch_none_for_product_code_touching_thai_text(ns, library_fixture):
+    """"แนะนำสายCAT-6ที่ดีที่สุด" (รหัสรุ่นสินค้าติดอักษรไทย ไม่เว้นวรรค) ต้องยังไม่ถูกตัดสินเป็น library เลย
+    เหมือนเวอร์ชันเว้นวรรค ไม่เปิดไฟล์อัตโนมัติจากคะแนน BM25/embedding"""
+    assert ns["_looks_like_library_query"]("แนะนำสายCAT-6ที่ดีที่สุด") is False
+    result = ns["_resolve_library_exact_match_dispatch"]("แนะนำสายCAT-6ที่ดีที่สุด", user_id=1, chat_id=1)
+    assert result is None
+
+
+@pytest.mark.parametrize("query", ["RSSF-02", "SSF-021"])
+def test_search_library_exact_match_does_not_match_longer_adjacent_codes(ns, library_fixture, query):
+    """"RSSF-02"/"SSF-021" มีตัวอักษร/ตัวเลขภาษาอังกฤษติดกับ "SSF-02" จริงๆ (ไม่ใช่อักษรไทย) -> ต้องไม่ถือว่าตรงเป๊ะ
+    กับ SSF-02 (lookaround กันเฉพาะอักษรไทยที่ติดกัน ต้องไม่กันหลวมจนจับรหัสอื่นที่ยาว/สั้นกว่าผิด)"""
+    results = ns["search_library"](query, user_id=1)
+    exact_file_ids = {r["file_id"] for r in results if r["exact"]}
+    assert 1 not in exact_file_ids

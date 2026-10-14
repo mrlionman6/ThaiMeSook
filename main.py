@@ -1054,7 +1054,10 @@ def _library_search_exact_match_fields(query: str, candidate: dict) -> list[str]
     def _code_matches(code: Optional[str]) -> bool:
         if not code:
             return False
-        pattern = r"\b" + re.escape(code.strip().lower()) + r"\b"
+        # \b ใช้ไม่ได้ตรงนี้เหมือนกัน (ดู _LIBRARY_DOCUMENT_CODE_RE) — "เลขเอกสารSSF-02"/"SSF-02ครับ" ไม่มีขอบเขต
+        # \w ระหว่างรหัสกับอักษรไทยที่ติดกัน lookaround นี้เช็คเฉพาะว่าไม่ติดอักษรอังกฤษ/ตัวเลขอีกตัว (กัน "SSF-02"
+        # ไปแมตช์ใน "RSSF-02"/"SSF-021" ที่เป็นรหัสอื่น)
+        pattern = r"(?<![a-z0-9])" + re.escape(code.strip().lower()) + r"(?![a-z0-9])"
         return re.search(pattern, lowered_query) is not None
 
     matches = []
@@ -4437,7 +4440,9 @@ _LIBRARY_ROUTE_KEYWORDS = (
 )
 # รูปแบบเลขที่เอกสาร เช่น "SSF-02"/"ASA-02"/"DEF-01" (ตัวอักษร 2-5 ตัว ตามด้วย "-" แล้วตัวเลข 1-5 หลัก) — ดู
 # _query_matches_document_code_context ก่อนใช้จริง (รูปแบบนี้แมตช์รหัสรุ่นสินค้าด้วย เช่น CAT-6/RJ-45/IPC-2125)
-_LIBRARY_DOCUMENT_CODE_RE = re.compile(r"\b[A-Za-z]{2,5}-\d{1,5}\b")
+# ใช้ lookaround ตรวจเฉพาะอักษรอังกฤษ/ตัวเลข แทน \b เพราะ \b ใน Python regex นับอักษรไทยเป็น \w ด้วย — \b จึงไม่ขึ้น
+# ขอบเขตตรง "เปิดใบSSF-02"/"SSF-02ครับ" (คนไทยพิมพ์รหัสติดกับคำไทยบ่อยมาก ไม่ใส่ช่องว่างคั่น)
+_LIBRARY_DOCUMENT_CODE_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]{2,5}-\d{1,5}(?![A-Za-z0-9])")
 # คำลงท้ายสุภาพที่ถือว่า "แทบไม่มีเนื้อหาอะไรเพิ่ม" หลังตัดรหัสเอกสารออกแล้ว — ดู _query_matches_document_code_context
 _LIBRARY_DOCUMENT_CODE_TRAILING_WORDS = ("ครับ", "ค่ะ", "คะ", "นะ")
 # คำอ้างอิงเอกสารที่ต้องมีปนมาด้วยถ้าข้อความไม่ได้ "เกือบทั้งหมด" เป็นรหัสเอกสารเฉยๆ — แคบกว่า
