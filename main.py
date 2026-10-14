@@ -636,7 +636,11 @@ SEARCH_LIBRARY_TOOL = {
         "ชื่อไฟล์, รายการสินค้าในไฟล์, วันที่, ยอดเงิน, หรือความหมายใกล้เคียง) เรียกเครื่องมือนี้ก่อนเสมอเมื่อ"
         "ต้องการค้นหาเอกสารเฉพาะเจาะจง ห้ามตอบว่า \"ไม่พบ\"/\"ไม่มีคลังเอกสาร\" โดยไม่ได้เรียกเครื่องมือนี้ก่อน — "
         "เครื่องมือ find_customers/list_customer_documents/list_project_documents/list_templates ใช้เฉพาะตอน"
-        "ต้องการรายการทั้งหมดของบริษัท/โปรเจกต์/แม่แบบเท่านั้น ไม่ใช่สำหรับค้นหาเอกสารเฉพาะเจาะจง"
+        "ต้องการรายการทั้งหมดของบริษัท/โปรเจกต์/แม่แบบเท่านั้น ไม่ใช่สำหรับค้นหาเอกสารเฉพาะเจาะจง "
+        "ถ้าผู้ใช้ถามหาเอกสารที่มีสินค้า/รายการใดอยู่ในตาราง ให้ใส่ contains_item เสมอ (ไม่ใช่แค่ใส่ query เฉยๆ) "
+        "แต่ละผลที่คืนมามี match_type: \"exact\"/\"keyword\" (มีคำค้นตรงในเอกสารจริง) พูดได้ตรงๆ ว่าเอกสารนั้นมี"
+        "สิ่งที่ค้น แต่ \"semantic\" (ได้จากความหมายใกล้เคียงเท่านั้น ไม่มีคำตรงกันเลย) ห้ามพูดว่าเอกสารนั้น \"มี\" "
+        "สิ่งที่ค้นเด็ดขาด ให้พูดแยกว่าเป็น \"เอกสารที่อาจเกี่ยวข้อง\" แทน"
     ),
     "input_schema": {
         "type": "object",
@@ -655,7 +659,11 @@ SEARCH_LIBRARY_TOOL = {
             "min_total": {"type": "number", "description": "กรองเฉพาะเอกสารที่ยอดรวมอย่างน้อยเท่านี้ (ไม่บังคับ)"},
             "max_total": {"type": "number", "description": "กรองเฉพาะเอกสารที่ยอดรวมไม่เกินนี้ (ไม่บังคับ)"},
             "contains_item": {
-                "type": "string", "description": "กรองเฉพาะเอกสารที่มีรายการสินค้านี้ในตาราง (ไม่บังคับ)",
+                "type": "string",
+                "description": (
+                    "กรองเฉพาะเอกสารที่มีรายการสินค้านี้ในตาราง (ไม่บังคับ) — ใส่ทุกครั้งที่ผู้ใช้ถามหาเอกสารที่มี"
+                    "สินค้า/รายการใดอยู่ เช่น \"Rack 9U\" (ไม่ต้องพิมพ์ตรงเป๊ะกับคำในตาราง แค่ใกล้เคียงพอ)"
+                ),
             },
         },
         "required": ["query"],
@@ -1035,6 +1043,11 @@ _LIBRARY_SEARCH_MAX_RESULTS = 5
 _LIBRARY_SEARCH_SCORE_THRESHOLD = 0.15
 # คะแนนที่การันตีว่าผลตรงเป๊ะชนะผลที่ได้แค่จาก BM25/embedding เสมอไม่ว่ากรณีใด (คะแนนรวมปกติอยู่ในช่วง 0-1)
 _LIBRARY_SEARCH_EXACT_MATCH_BONUS = 1000.0
+# ผลที่ไม่ตรงเป๊ะต้องได้คะแนนรวม (ก่อนบวกโบนัสตรงเป๊ะ) อย่างน้อยสัดส่วนนี้ของคะแนนรวมสูงสุดในชุด candidates เดียวกัน
+# (ไม่ใช่แค่ผ่าน _LIBRARY_SEARCH_SCORE_THRESHOLD เฉยๆ) — เหตุการณ์จริงที่แก้: คลังที่ไฟล์ส่วนใหญ่เป็นงานประเภท
+# เดียวกันหมด (เช่น CCTV ทุกไฟล์) ทำให้คะแนน embedding ใกล้เคียงกันแทบทุกไฟล์ "ใบที่มี Rack 9U" จึงได้ผลลัพธ์ทุก
+# ไฟล์ในคลังกลับมาทั้งที่มีคำว่า Rack จริงแค่ไฟล์เดียว (SSF-02) ทั้งที่ทุกไฟล์ผ่าน threshold สัมบูรณ์ได้สบายๆ
+_LIBRARY_SEARCH_RELATIVE_CUTOFF = 0.6
 
 
 def _library_search_exact_match_fields(query: str, candidate: dict) -> list[str]:
@@ -1075,13 +1088,32 @@ def _library_search_exact_match_fields(query: str, candidate: dict) -> list[str]
     return matches
 
 
+def _library_search_matches_contains_item(card_text: str, contains_item: str) -> bool:
+    """เช็คว่ามีบรรทัดรายการสินค้า ("รายการ: ...") บรรทัดไหนในบัตร (ดู build_library_search_card) ที่มีคำทุกคำใน
+    contains_item ปนอยู่ไหม (หลัง normalize ไม่สนตัวพิมพ์/วรรณยุกต์/ช่องว่าง) เช่น contains_item="Rack 9U" ต้อง
+    ตรงกับบรรทัด "รายการ: Rack case server 9U ..." เพราะมีทั้งคำ "rack" และ "9u" อยู่ในบรรทัดเดียวกัน แม้จะไม่ติด
+    กันเป็น substring เดียวก็ตาม เช็คเฉพาะบรรทัดรายการเท่านั้น ไม่ใช่ทั้งบัตร — เหตุการณ์จริงที่แก้: เช็คกับทั้งบัตร
+    (ชื่อไฟล์/สรุป/ฯลฯ ปนด้วย) ทำให้คำที่บังเอิญไปตรงส่วนอื่นผ่านเกณฑ์ทั้งที่ไม่มีรายการสินค้านั้นจริงในตาราง"""
+    terms = _normalize_library_search_text(contains_item).split()
+    if not terms:
+        return False
+    for line in card_text.splitlines():
+        if not line.strip().startswith("รายการ:"):
+            continue
+        normalized_line = _normalize_library_search_text(line)
+        if all(term in normalized_line for term in terms):
+            return True
+    return False
+
+
 def _library_search_matches_filters(candidate: dict, filters: Optional[dict]) -> bool:
     """กรอง candidate (ไฟล์ในคลัง 1 ไฟล์ — ต้องมี card_text/total_amount/issue_date ผสมเข้ามาแล้ว) ตาม filters
     (ถ้ามี) ด้วยโค้ดล้วนๆ ทุกเงื่อนไขที่ระบุมาต้องผ่านหมด (AND) ไม่ระบุ filters เลย หรือ filters ว่างเปล่า ->
     ผ่านเสมอ:
     - customer: ชื่อลูกค้า (หรือชื่อไฟล์ถ้าไม่มีชื่อลูกค้า) หลัง normalize มี customer เป็นส่วนหนึ่งหรือกลับกัน
       (ตรรกะเดียวกับ search_library_files)
-    - document_type/contains_item: card_text หลัง normalize มีคำนี้เป็นส่วนหนึ่ง
+    - document_type: card_text หลัง normalize มีคำนี้เป็นส่วนหนึ่ง
+    - contains_item: เฉพาะบรรทัดรายการสินค้า ("รายการ: ...") ในบัตร — ดู _library_search_matches_contains_item
     - date_from/date_to: เทียบ issue_date แบบ string ตรงๆ (คาดหวังรูปแบบ "YYYY-MM-DD") ไม่มี issue_date เลย ->
       ไม่ผ่านถ้ามีการกรองวันที่ (ปลอดภัยกว่าปล่อยผ่านเงียบๆ ทั้งที่ไม่รู้วันที่จริง)
     - min_total/max_total: เทียบ total_amount ตรงๆ ไม่มี total_amount เลย -> ไม่ผ่านถ้ามีการกรองยอดเงิน"""
@@ -1094,13 +1126,13 @@ def _library_search_matches_filters(candidate: dict, filters: Optional[dict]) ->
         if not (normalized_customer in normalized_source or normalized_source in normalized_customer):
             return False
 
-    card_text_normalized = None
-    if filters.get("document_type") or filters.get("contains_item"):
+    if filters.get("document_type"):
         card_text_normalized = _normalize_library_search_text(candidate.get("card_text") or "")
-
-    if filters.get("document_type") and _normalize_library_search_text(filters["document_type"]) not in card_text_normalized:
-        return False
-    if filters.get("contains_item") and _normalize_library_search_text(filters["contains_item"]) not in card_text_normalized:
+        if _normalize_library_search_text(filters["document_type"]) not in card_text_normalized:
+            return False
+    if filters.get("contains_item") and not _library_search_matches_contains_item(
+        candidate.get("card_text") or "", filters["contains_item"]
+    ):
         return False
 
     if filters.get("date_from") and (not candidate.get("issue_date") or candidate["issue_date"] < filters["date_from"]):
@@ -1145,28 +1177,56 @@ def _library_search_matched_on_text(exact_fields: list[str], candidate: dict, qu
 
 def _score_library_search_candidates(
     query: str, candidates: list[dict], bm25_scores: dict[int, float], embedding_scores: dict[int, float],
+    keyword_overlap: Optional[dict[int, bool]] = None,
 ) -> list[dict]:
     """ให้คะแนนและเรียงไฟล์ในคลัง (candidates ผ่านการกรองด้วย filters มาแล้วจาก caller — ดู search_library)
     คะแนน = ตรงเป๊ะ (document_no/customer_code/project_code/customer_name — ดู _library_search_exact_match_
     fields) ชนะ BM25/embedding เสมอ (บวก _LIBRARY_SEARCH_EXACT_MATCH_BONUS) + BM25 บน card_text (normalize เป็น
     0-1 ด้วยคะแนนสูงสุดในชุดนี้) + cosine embedding (normalize เป็น 0-1 เหมือนกัน) ถ่วงน้ำหนักเท่ากัน (0.5/0.5)
-    ตัดผลที่ไม่ตรงเป๊ะและคะแนนต่ำกว่า _LIBRARY_SEARCH_SCORE_THRESHOLD ทิ้ง คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS
-    รายการ เรียงคะแนนมากไปน้อย แยกฟังก์ชันนี้ออกมาจาก search_library เพื่อให้ทดสอบตรรกะให้คะแนน/กรองได้โดยไม่ต้อง
-    พึ่ง BM25Okapi/embed_model จริง (เทสต์ส่ง bm25_scores/embedding_scores มาตรงๆ ได้เลย)"""
+
+    ตัดทิ้งสองชั้น: (ก) ไม่ตรงเป๊ะและคะแนนรวม (ก่อนบวกโบนัส) ต่ำกว่า _LIBRARY_SEARCH_SCORE_THRESHOLD (ข) ไม่ตรงเป๊ะ
+    และคะแนนรวมต่ำกว่า _LIBRARY_SEARCH_RELATIVE_CUTOFF ของคะแนนรวมสูงสุดในชุด candidates นี้ (เหตุการณ์จริงที่แก้:
+    คลังที่ไฟล์ส่วนใหญ่เนื้อหาคล้ายกันมาก เช่น CCTV ทุกไฟล์ ทำให้ embedding ใกล้เคียงกันหมดจนผ่าน threshold สัมบูรณ์
+    ได้ทุกไฟล์ แม้มีไฟล์เดียวที่ตรงกับคำค้นจริงๆ — ตัดสัมพัทธ์นี้ทำให้เหลือเฉพาะไฟล์ที่คะแนนใกล้เคียงไฟล์ที่ดีที่สุด
+    จริงๆ)
+
+    แต่ละผลมี match_type: "exact" (ตรงเป๊ะ) / "keyword" (มีคำจาก query ทับกับ card_text จริง หลังตัด stopwords — ดู
+    keyword_overlap ที่ caller ส่งมา) / "semantic" (ได้คะแนนจาก embedding ล้วนๆ ไม่มีคำตรงกันเลย) ผลอันดับ 1 เป็น
+    "exact"/"keyword" -> ตัดผล "semantic" ล้วนๆ ทิ้งทั้งหมด (มีผลตรงคำจริงแล้ว ไม่ต้องเติมผลที่แค่หัวข้อคล้ายกัน)
+
+    คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS รายการ เรียงคะแนนมากไปน้อย แยกฟังก์ชันนี้ออกมาจาก search_library เพื่อให้
+    ทดสอบตรรกะให้คะแนน/กรองได้โดยไม่ต้องพึ่ง BM25Okapi/embed_model จริง (เทสต์ส่ง bm25_scores/embedding_scores/
+    keyword_overlap มาตรงๆ ได้เลย)"""
+    keyword_overlap = keyword_overlap or {}
     max_bm25 = max(bm25_scores.values(), default=0.0) or 1.0
     max_embedding = max(embedding_scores.values(), default=0.0) or 1.0
+
+    combined_by_file = {}
+    for candidate in candidates:
+        file_id = candidate["file_id"]
+        bm25_norm = bm25_scores.get(file_id, 0.0) / max_bm25
+        embedding_norm = embedding_scores.get(file_id, 0.0) / max_embedding
+        combined_by_file[file_id] = bm25_norm * 0.5 + embedding_norm * 0.5
+    max_combined = max(combined_by_file.values(), default=0.0)
 
     scored = []
     for candidate in candidates:
         file_id = candidate["file_id"]
         exact_fields = _library_search_exact_match_fields(query, candidate)
-        bm25_norm = bm25_scores.get(file_id, 0.0) / max_bm25
-        embedding_norm = embedding_scores.get(file_id, 0.0) / max_embedding
-        combined = bm25_norm * 0.5 + embedding_norm * 0.5
+        combined = combined_by_file[file_id]
         is_exact = bool(exact_fields)
+        if not is_exact:
+            if combined < _LIBRARY_SEARCH_SCORE_THRESHOLD:
+                continue
+            if combined < max_combined * _LIBRARY_SEARCH_RELATIVE_CUTOFF:
+                continue
         final_score = (_LIBRARY_SEARCH_EXACT_MATCH_BONUS + combined) if is_exact else combined
-        if not is_exact and final_score < _LIBRARY_SEARCH_SCORE_THRESHOLD:
-            continue
+        if is_exact:
+            match_type = "exact"
+        elif keyword_overlap.get(file_id):
+            match_type = "keyword"
+        else:
+            match_type = "semantic"
         scored.append({
             "file_id": file_id,
             "filename": candidate["filename"],
@@ -1174,10 +1234,13 @@ def _score_library_search_candidates(
             "document_no": candidate.get("document_no"),
             "matched_on": _library_search_matched_on_text(exact_fields, candidate, query),
             "exact": is_exact,
+            "match_type": match_type,
             "score": final_score,
         })
 
     scored.sort(key=lambda item: item["score"], reverse=True)
+    if scored and scored[0]["match_type"] in ("exact", "keyword"):
+        scored = [item for item in scored if item["match_type"] != "semantic"]
     return scored[:_LIBRARY_SEARCH_MAX_RESULTS]
 
 
@@ -1221,11 +1284,18 @@ def search_library(query: str, user_id: Optional[int], filters: Optional[dict] =
     bm25 = BM25Okapi(tokenized_corpus)
     raw_bm25_scores = bm25.get_scores(tokenized_query)
     bm25_scores = {c["file_id"]: float(s) for c, s in zip(candidates, raw_bm25_scores)}
+    # ไฟล์นี้มีคำจาก query ทับกับ card_text จริงไหม (ใช้ตัดสิน match_type="keyword" ใน
+    # _score_library_search_candidates) — เช็คจาก token set ตรงๆ ไม่ใช่แค่ bm25_score > 0 (คะแนน BM25 เป็นลบได้ถ้า
+    # คำนั้นปรากฏในเอกสารส่วนใหญ่ของคลัง ทั้งที่ยังนับเป็น "มีคำตรงกันจริง" อยู่ดี)
+    query_token_set = set(tokenized_query)
+    keyword_overlap = {
+        c["file_id"]: bool(query_token_set & set(tokens)) for c, tokens in zip(candidates, tokenized_corpus)
+    }
 
     query_embedding = embed_model.encode(query).tolist()
     embedding_scores = get_library_search_vector_scores_for_all(query_embedding)
 
-    results = _score_library_search_candidates(query, candidates, bm25_scores, embedding_scores)
+    results = _score_library_search_candidates(query, candidates, bm25_scores, embedding_scores, keyword_overlap)
 
     top_score = results[0]["score"] if results else 0.0
     exact = bool(results) and results[0]["exact"]
@@ -1329,17 +1399,33 @@ def _strip_file_extension(filename: str) -> str:
     return os.path.splitext(filename)[0]
 
 
-def _order_library_documents_by_folder(documents: list[dict]) -> list[dict]:
-    """เรียงเอกสารตามลำดับเดียวกับที่ _format_library_document_list ใช้ขึ้นบรรทัด (จัดกลุ่มตามโฟลเดอร์ เรียงชื่อ
-    โฟลเดอร์ ก-ฮ/A-Z ภายในกลุ่มคงลำดับเดิมจาก input) ใช้ร่วมกันทั้งตอนสร้างข้อความและตอนบันทึกลง
-    chat_last_listing กันเลขข้อที่บันทึกไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
-    by_folder: dict[str, list[dict]] = {}
+def _order_library_documents_by_key(documents: list[dict], key_fn) -> list[dict]:
+    """จัดกลุ่มเอกสารตามคีย์ที่ key_fn คำนวณ เรียงชื่อกลุ่ม ก-ฮ/A-Z ภายในกลุ่มคงลำดับเดิมจาก input — ตัวช่วยกลางที่
+    _order_library_documents_by_folder/_order_library_documents_by_customer ใช้ร่วมกัน"""
+    grouped: dict[str, list[dict]] = {}
     for doc in documents:
-        by_folder.setdefault(doc.get("folder") or "ไม่มีหมวดหมู่", []).append(doc)
+        grouped.setdefault(key_fn(doc), []).append(doc)
     ordered = []
-    for folder in sorted(by_folder.keys()):
-        ordered.extend(by_folder[folder])
+    for key in sorted(grouped.keys()):
+        ordered.extend(grouped[key])
     return ordered
+
+
+def _order_library_documents_by_folder(documents: list[dict]) -> list[dict]:
+    """เรียงเอกสารตามลำดับเดียวกับที่ _format_library_document_list ใช้ขึ้นบรรทัดโดย default (จัดกลุ่มตามโฟลเดอร์
+    เรียงชื่อโฟลเดอร์ ก-ฮ/A-Z ภายในกลุ่มคงลำดับเดิมจาก input) ใช้ร่วมกันทั้งตอนสร้างข้อความและตอนบันทึกลง
+    chat_last_listing กันเลขข้อที่บันทึกไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
+    return _order_library_documents_by_key(documents, lambda doc: doc.get("folder") or "ไม่มีหมวดหมู่")
+
+
+def _order_library_documents_by_customer(documents: list[dict]) -> list[dict]:
+    """เหมือน _order_library_documents_by_folder แต่จัดกลุ่มตามชื่อลูกค้าแทน (หลัง normalize ด้วย
+    _normalize_customer_name กันพิมพ์ชื่อเดียวกันแต่วรรณยุกต์/ตัวพิมพ์ต่างกันแยกกลุ่มผิด) — ใช้โดย
+    _resolve_library_full_listing_dispatch ("ในคลังมีเอกสารอะไรบ้าง") ให้ไฟล์ของลูกค้าเดียวกันอยู่ติดกันในรายการ
+    แทนที่จะกระจายไปตามโฟลเดอร์เหมือนรายการอื่นๆ"""
+    return _order_library_documents_by_key(
+        documents, lambda doc: _normalize_customer_name(doc.get("customer_name") or doc["filename"])
+    )
 
 
 def _resolve_flat_document_labels(documents: list[dict]) -> list[str]:
@@ -1377,17 +1463,20 @@ def _format_document_line_flat(n: int, doc: dict, label: str) -> str:
     return line
 
 
-def _format_library_document_list(title: str, documents: list[dict]) -> str:
-    """สร้างรายการเอกสารแบบ markdown ด้วยโค้ดล้วนๆ แบบแบน (ไม่มีหัวกลุ่มโฟลเดอร์แล้ว) เรียงตามโฟลเดอร์แล้วตาม
-    ลำดับเดิม (ดู _order_library_documents_by_folder) ลำดับนี้ต้องตรงกับที่บันทึกใน chat_last_listing เป๊ะ
-    (ดู _record_chat_document_listing) ใช้รูปแบบเดียวกันทั้ง list_customer_documents, list_project_documents,
-    list_templates (title ต่างกันไปตามบริบท) ห้ามแสดง customer_code/project_code เลย (ใช้ project_name หรือ
-    ชื่อไฟล์แทน) เลขเอกสาร (document_no) แสดงได้ในวงเล็บท้ายบรรทัด ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู
-    LIBRARY_LOGGED_IN_RULES)"""
+def _format_library_document_list(
+    title: str, documents: list[dict], order_fn=_order_library_documents_by_folder,
+) -> str:
+    """สร้างรายการเอกสารแบบ markdown ด้วยโค้ดล้วนๆ แบบแบน (ไม่มีหัวกลุ่มโฟลเดอร์แล้ว) เรียงตาม order_fn (default
+    จัดกลุ่มตามโฟลเดอร์ — ดู _order_library_documents_by_folder) แล้วตามลำดับเดิม ลำดับนี้ต้องตรงกับที่บันทึกใน
+    chat_last_listing เป๊ะ (ดู _record_chat_document_listing — ต้องส่ง order_fn เดียวกันให้ทั้งคู่เสมอ) ใช้รูปแบบ
+    เดียวกันทั้ง list_customer_documents, list_project_documents, list_templates (title ต่างกันไปตามบริบท) และ
+    _resolve_library_full_listing_dispatch (ส่ง order_fn=_order_library_documents_by_customer แทน default) ห้าม
+    แสดง customer_code/project_code เลย (ใช้ project_name หรือชื่อไฟล์แทน) เลขเอกสาร (document_no) แสดงได้ในวงเล็บ
+    ท้ายบรรทัด ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู LIBRARY_LOGGED_IN_RULES)"""
     if not documents:
         return f"{title}\n\n(ไม่มีเอกสาร)"
 
-    ordered = _order_library_documents_by_folder(documents)
+    ordered = order_fn(documents)
     labels = _resolve_flat_document_labels(ordered)
 
     lines = [title, ""]
@@ -1506,11 +1595,13 @@ def _find_library_file_by_document_no(document_no: str) -> Optional[dict]:
     return None
 
 
-def _record_chat_document_listing(chat_id: int, documents: list[dict]) -> None:
-    """บันทึกทับรายการล่าสุดของแชทนี้เป็น kind="documents" — เลขข้อ (n) ต้องคำนวณด้วย
-    _order_library_documents_by_folder เส้นทางเดียวกับที่ _format_library_document_list ใช้ขึ้นบรรทัดเป๊ะ
-    ไม่งั้นเลขข้อที่บันทึกจะไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
-    ordered = _order_library_documents_by_folder(documents)
+def _record_chat_document_listing(
+    chat_id: int, documents: list[dict], order_fn=_order_library_documents_by_folder,
+) -> None:
+    """บันทึกทับรายการล่าสุดของแชทนี้เป็น kind="documents" — เลขข้อ (n) ต้องคำนวณด้วย order_fn เดียวกับที่
+    _format_library_document_list ใช้ขึ้นบรรทัดเป๊ะ (ส่ง order_fn เดียวกันให้ทั้งคู่เสมอ) ไม่งั้นเลขข้อที่บันทึกจะ
+    ไม่ตรงกับเลขข้อที่ผู้ใช้เห็นจริงในข้อความ"""
+    ordered = order_fn(documents)
     items = [{"n": i, "file_id": doc["file_id"]} for i, doc in enumerate(ordered, start=1)]
     set_chat_last_listing(chat_id, "documents", items)
 
@@ -5111,6 +5202,76 @@ def _resolve_library_exact_match_dispatch(query: str, user_id: int, chat_id: int
     return None
 
 
+# คำที่บ่งบอกว่าผู้ใช้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" (ไม่ใช่ของบริษัท/โปรเจกต์ใดบริษัทหนึ่งโดยเฉพาะ) — ดู
+# _looks_like_full_library_listing_query เหตุการณ์จริงที่แก้: "ในคลังมีเอกสารอะไรบ้าง" เคยถูก AI ตีความว่าต้อง
+# เรียก find_customers (เพราะ LIBRARY_LOGGED_IN_RULES เดิมพูดถึงแค่ "ถ้าผู้ใช้พูดถึงบริษัท") แล้วตอบรายชื่อบริษัท
+# กลับมาแทนรายชื่อเอกสารจริงๆ
+_LIBRARY_FULL_LISTING_KEYWORDS = (
+    "ในคลังมีเอกสารอะไรบ้าง", "คลังมีเอกสารอะไรบ้าง", "คลังมีไฟล์อะไรบ้าง", "ในคลังมีไฟล์อะไรบ้าง",
+    "เอกสารทั้งหมดในคลัง", "ไฟล์ทั้งหมดในคลัง", "มีเอกสารอะไรบ้างในคลัง", "มีไฟล์อะไรบ้างในคลัง",
+    "เอกสารในคลังมีอะไรบ้าง", "ไฟล์ในคลังมีอะไรบ้าง",
+)
+# คลังใหญ่เกินจำนวนนี้ -> แสดงจำนวนเอกสารแยกตามบริษัทแทนการแจกแจงทีละไฟล์ (กันข้อความยาวเกินไป) — ดู
+# _resolve_library_full_listing_dispatch
+_LIBRARY_FULL_LISTING_SIZE_CUTOFF = 30
+
+
+def _looks_like_full_library_listing_query(query: str) -> bool:
+    """เช็คด้วยโค้ดล้วนๆ ว่าข้อความนี้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" ไหม (normalize เเ→แ ก่อนเช็ค เหตุการณ์จริง
+    เดียวกับ _looks_like_library_query — ผู้ใช้พิมพ์สระเอซ้ำบ่อย)"""
+    normalized = query.replace("เเ", "แ").lower()
+    return any(keyword.lower() in normalized for keyword in _LIBRARY_FULL_LISTING_KEYWORDS)
+
+
+def _resolve_library_full_listing_dispatch(query: str, chat_id: int) -> Optional[dict]:
+    """ตอบ "ในคลังมีเอกสารอะไรบ้าง" (และคำถามขอรายชื่อเอกสารทั้งหมดแบบเดียวกัน) ด้วยโค้ดล้วนๆ แทนที่จะปล่อยให้ AI
+    เดาว่าควรเรียกเครื่องมือไหน (ดู _looks_like_full_library_listing_query) จัดกลุ่มเอกสารตามลูกค้า (ไม่ใช่ตาม
+    โฟลเดอร์เหมือนรายการอื่นๆ — ดู _order_library_documents_by_customer) ไฟล์แม่แบบแยกไปต่อท้ายเป็นหัวข้อของ
+    ตัวเอง ใช้ _get_enriched_library_files ตรงๆ แล้วส่งต่อให้ _format_library_document_list/
+    _record_chat_document_listing เดิมจัดรูปแบบ+บันทึกเลขข้อ (ให้ select_list_item ใช้ต่อได้ปกติ) เหมือนรายการ
+    คลังตัวอื่นๆ ทุกจุด
+
+    คลังมีเอกสาร (ไม่รวมแม่แบบ) เกิน _LIBRARY_FULL_LISTING_SIZE_CUTOFF ไฟล์ -> ไม่แจกแจงทีละไฟล์ (ข้อความจะยาว
+    เกินไป) แสดงจำนวนเอกสารแยกตามบริษัทแทน (เหมือน find_customers) พร้อมขอให้ระบุชื่อบริษัทต่อ บันทึกเป็นรายการ
+    บริษัท (kind="customers") แทนรายการเอกสาร เพื่อให้เลือกข้อต่อได้เหมือน find_customers คืน None ถ้าข้อความนี้
+    ไม่ใช่คำถามแบบนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    if not _looks_like_full_library_listing_query(query):
+        return None
+
+    enriched = _get_enriched_library_files()
+    non_templates = [doc for doc in enriched if not doc["is_template"]]
+    templates = [doc for doc in enriched if doc["is_template"]]
+
+    if len(non_templates) > _LIBRARY_FULL_LISTING_SIZE_CUTOFF:
+        counts_by_code: dict[str, dict] = {}
+        for doc in non_templates:
+            code = (doc.get("customer_code") or "").strip()
+            key = code.lower() or f"__no_code_{doc['file_id']}"
+            entry = counts_by_code.setdefault(key, {
+                "customer_code": code, "customer_name": doc.get("customer_name"), "document_count": 0,
+            })
+            entry["document_count"] += 1
+        customers = sorted(
+            counts_by_code.values(),
+            key=lambda c: _normalize_customer_name(c.get("customer_name") or c["customer_code"]),
+        )
+        _record_chat_customer_listing(chat_id, customers)
+        answer = _format_customer_list(
+            f"คลังมีเอกสารทั้งหมด {len(non_templates)} ไฟล์ มากกว่า {_LIBRARY_FULL_LISTING_SIZE_CUTOFF} ไฟล์ "
+            "ขอแสดงจำนวนเอกสารแยกตามบริษัทแทน ระบุชื่อบริษัทที่ต้องการดูได้เลยครับ:",
+            customers,
+        )
+        return {"document_id": None, "answer": answer}
+
+    _record_chat_document_listing(chat_id, non_templates, order_fn=_order_library_documents_by_customer)
+    answer = _format_library_document_list(
+        "**เอกสารทั้งหมดในคลัง**", non_templates, order_fn=_order_library_documents_by_customer,
+    )
+    if templates:
+        answer += "\n\n" + _format_library_document_list("**ไฟล์แม่แบบ**", templates)
+    return {"document_id": None, "answer": answer}
+
+
 @app.post("/ask")
 async def ask_question(
     request: Request,
@@ -5220,6 +5381,17 @@ async def ask_question(
             )
             print(f"[Route] chat={chat_id} branch={branch} active_doc={library_exact_dispatch['document_id']}")
             answer = library_exact_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+        # ทางลัด "ในคลังมีเอกสารอะไรบ้าง" (ดู _resolve_library_full_listing_dispatch) — เหตุการณ์จริงที่แก้: เคย
+        # ถูก AI ตีความว่าต้องเรียก find_customers แล้วตอบรายชื่อบริษัทแทนรายชื่อเอกสารจริงๆ
+        library_full_listing_dispatch = _resolve_library_full_listing_dispatch(query, chat_id)
+        if library_full_listing_dispatch is not None:
+            print(f"[Route] chat={chat_id} branch=library_full_listing")
+            answer = library_full_listing_dispatch["answer"]
             add_chat_message(chat_id, "user", query)
             add_chat_message(chat_id, "assistant", answer)
             touch_chat_session(chat_id)

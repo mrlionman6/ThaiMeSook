@@ -2332,3 +2332,139 @@ def test_search_library_exact_match_does_not_match_longer_adjacent_codes(ns, lib
     results = ns["search_library"](query, user_id=1)
     exact_file_ids = {r["file_id"] for r in results if r["exact"]}
     assert 1 not in exact_file_ids
+
+
+# ---------- fix/library-search-precision ----------
+# ผลทดสอบจริงหลัง #38: "ใบที่มี Rack 9U" ได้ผล 4 ไฟล์ทั้งที่มี Rack 9U จริงแค่ไฟล์เดียว (ทุกไฟล์ในคลังเป็นงาน
+# CCTV คะแนน embedding ใกล้กันหมด) และ "ในคลังมีเอกสารอะไรบ้าง" ได้รายชื่อบริษัทแทนรายชื่อเอกสาร
+
+def test_search_library_relative_cutoff_drops_lookalikes_with_only_embedding_signal(ns, library_fixture):
+    """เพิ่มไฟล์ CCTV อีก 2 ไฟล์ที่ไม่มีคำว่า Rack/9U เลยสักคำ (card_text ไม่ทับกับคำค้นเลย — bm25=0) แต่จำลองให้
+    embedding score ใกล้เคียงไฟล์ SSF-02 มาก (เหมือนเหตุการณ์จริง: ทุกไฟล์เป็นงานประเภทเดียวกันหมด) — override
+    get_library_search_vector_scores_for_all ชั่วคราวใน ns (namespace สดใหม่ต่อเทสเสมอ ไม่กระทบเทสอื่น) เพราะ
+    _FakeEmbedModel คืนเวกเตอร์คงที่เสมอ ไม่สะท้อนความคล้ายจริงได้ ต้องเหลือเฉพาะไฟล์ที่มี Rack ในบรรทัดรายการจริง
+    (ตัดสัมพัทธ์ _LIBRARY_SEARCH_RELATIVE_CUTOFF ตัดไฟล์ CCTV ทิ้งแม้ผ่าน threshold สัมบูรณ์ได้สบายๆ)"""
+    fake_db = ns["_fake_db"]
+    fake_db.add_library_file(10, "ใบเสนอราคากล้องวงจรปิดเอ.xlsx", "lib/10.xlsx")
+    fake_db.add_library_file_meta(10, customer_code="CCTV-01", customer_name="กล้องวงจรปิดเอ")
+    fake_db.add_library_search_card(
+        10,
+        "ชื่อไฟล์: ใบเสนอราคากล้องวงจรปิดเอ.xlsx\nหมวดหมู่: ใบเสนอราคา\nชื่อลูกค้า: กล้องวงจรปิดเอ\n"
+        "รหัสลูกค้า: CCTV-01\nรายการ: กล้องวงจรปิด 4MP จำนวน 8 ตัว",
+    )
+    fake_db.add_library_file(11, "ใบเสนอราคากล้องวงจรปิดบี.xlsx", "lib/11.xlsx")
+    fake_db.add_library_file_meta(11, customer_code="CCTV-02", customer_name="กล้องวงจรปิดบี")
+    fake_db.add_library_search_card(
+        11,
+        "ชื่อไฟล์: ใบเสนอราคากล้องวงจรปิดบี.xlsx\nหมวดหมู่: ใบเสนอราคา\nชื่อลูกค้า: กล้องวงจรปิดบี\n"
+        "รหัสลูกค้า: CCTV-02\nรายการ: เครื่องบันทึก NVR 16 ช่อง",
+    )
+
+    ns["get_library_search_vector_scores_for_all"] = (
+        lambda query_embedding: {1: 0.90, 2: 0.85, 3: 0.80, 10: 0.88, 11: 0.87}
+    )
+
+    results = ns["search_library"]("ใบที่มี Rack 9U", user_id=1)
+    assert {r["file_id"] for r in results} == {1}
+
+
+def test_search_library_contains_item_filter_only_matches_item_line(ns, library_fixture):
+    """filters contains_item="Rack 9U" ต้องเหลือเฉพาะ SSF-02 (ไฟล์เดียวที่มี "Rack"/"9U" อยู่ในบรรทัดรายการจริง —
+    ไม่ใช่แค่บังเอิญมีคำไปตรงส่วนอื่นของบัตร เช่น ชื่อไฟล์/สรุป)"""
+    results = ns["search_library"]("ป่าไม้เขียว", user_id=1, filters={"contains_item": "Rack 9U"})
+    assert {r["file_id"] for r in results} == {1}
+
+
+def test_score_library_search_candidates_assigns_semantic_match_type_without_keyword_overlap(ns):
+    """ผลที่คะแนนมาจาก embedding ล้วนๆ (ไม่มีคำจาก query ทับกับ card_text เลยสักคำ — keyword_overlap=False) ต้อง
+    ได้ match_type="semantic" ไม่ใช่ "keyword" (ทดสอบฟังก์ชันล้วนๆ ไม่ต้องพึ่ง BM25Okapi/embed_model จริง)"""
+    candidates = [{
+        "file_id": 1, "filename": "a.xlsx", "customer_name": "ลูกค้า1", "document_no": None,
+        "customer_code": None, "project_code": None, "card_text": "ชื่อไฟล์: a.xlsx",
+    }]
+    results = ns["_score_library_search_candidates"](
+        "คำถามทั่วไปที่ไม่มีคำตรงกันเลย", candidates,
+        bm25_scores={1: 0.0}, embedding_scores={1: 1.0}, keyword_overlap={1: False},
+    )
+    assert len(results) == 1
+    assert results[0]["match_type"] == "semantic"
+
+
+def test_score_library_search_candidates_keyword_top_result_drops_pure_semantic_results(ns):
+    """ผลอันดับ 1 เป็น match_type="keyword" -> ผลอื่นที่เป็น "semantic" ล้วนๆ ต้องถูกตัดทิ้งทั้งหมด (มีผลตรงคำจริง
+    แล้ว ไม่ต้องเติมผลที่แค่หัวข้อคล้ายกัน)"""
+    candidates = [
+        {
+            "file_id": 1, "filename": "a.xlsx", "customer_name": "ลูกค้า1", "document_no": None,
+            "customer_code": None, "project_code": None, "card_text": "รายการ: Rack case server 9U",
+        },
+        {
+            "file_id": 2, "filename": "b.xlsx", "customer_name": "ลูกค้า2", "document_no": None,
+            "customer_code": None, "project_code": None, "card_text": "ชื่อไฟล์: b.xlsx",
+        },
+    ]
+    results = ns["_score_library_search_candidates"](
+        "ใบที่มี Rack 9U", candidates,
+        bm25_scores={1: 1.0, 2: 0.0}, embedding_scores={1: 0.9, 2: 0.85},
+        keyword_overlap={1: True, 2: False},
+    )
+    file_ids = {r["file_id"] for r in results}
+    assert file_ids == {1}
+
+
+def test_resolve_library_full_listing_dispatch_lists_documents_grouped_by_customer(ns, library_fixture):
+    """"ในคลังมีเอกสารอะไรบ้าง" ต้องได้ชื่อเอกสารทุกไฟล์ (ไม่ใช่รายชื่อบริษัท) บันทึก listing แบบ kind="documents"
+    ให้ตอบเลขข้อเปิดได้ต่อ (เหมือน find_customers/list_customer_documents ฯลฯ)"""
+    result = ns["_resolve_library_full_listing_dispatch"]("ในคลังมีเอกสารอะไรบ้าง", chat_id=1)
+    assert result is not None
+    assert result["document_id"] is None
+    for name in ("ใบเสนอราคาป่าไม้เขียว", "ใบประเมินป่าไม้เขียว", "ห้างทองร่ำรวย"):
+        assert name in result["answer"]
+
+    listing = ns["_fake_db"].get_chat_last_listing(1)
+    assert listing is not None
+    assert listing["kind"] == "documents"
+    assert len(listing["items"]) == 3
+
+
+def test_resolve_library_full_listing_dispatch_separates_templates(ns, library_fixture):
+    """ไฟล์แม่แบบ (is_template=True) ต้องไม่ปนอยู่ในรายการเอกสารหลัก ไม่นับรวมในเลขข้อที่บันทึกไว้ให้เลือก แต่ยัง
+    แสดงชื่อแยกต่างหากท้ายข้อความในหัวข้อของตัวเอง"""
+    fake_db = ns["_fake_db"]
+    fake_db.add_library_file(50, "แม่แบบใบเสนอราคา.xlsx", "lib/50.xlsx")
+    fake_db.add_library_file_meta(50, is_template=True)
+
+    result = ns["_resolve_library_full_listing_dispatch"]("ในคลังมีเอกสารอะไรบ้าง", chat_id=1)
+    assert result is not None
+    assert "แม่แบบใบเสนอราคา" in result["answer"]
+    assert "**ไฟล์แม่แบบ**" in result["answer"]
+
+    listing = ns["_fake_db"].get_chat_last_listing(1)
+    assert len(listing["items"]) == 3
+    assert all(item["file_id"] != 50 for item in listing["items"])
+
+
+def test_resolve_library_full_listing_dispatch_shows_customer_counts_when_library_is_large(ns):
+    """คลังมีเอกสาร (ไม่รวมแม่แบบ) เกิน _LIBRARY_FULL_LISTING_SIZE_CUTOFF (30) ไฟล์ -> ต้องแสดงจำนวนเอกสารแยกตาม
+    บริษัทแทนการแจกแจงทีละไฟล์ พร้อมขอให้ระบุชื่อบริษัท บันทึก listing แบบ kind="customers" แทน"""
+    fake_db = ns["_fake_db"]
+    for i in range(31):
+        file_id = 200 + i
+        fake_db.add_library_file(file_id, f"เอกสาร{i}.xlsx", f"lib/{file_id}.xlsx")
+        fake_db.add_library_file_meta(file_id, customer_code=f"CUS-{i:02d}", customer_name=f"ลูกค้า{i}")
+
+    result = ns["_resolve_library_full_listing_dispatch"]("ในคลังมีเอกสารอะไรบ้าง", chat_id=1)
+    assert result is not None
+    assert result["document_id"] is None
+    assert "31 ไฟล์" in result["answer"]
+    assert "ระบุชื่อบริษัท" in result["answer"]
+
+    listing = fake_db.get_chat_last_listing(1)
+    assert listing["kind"] == "customers"
+    assert len(listing["items"]) == 31
+
+
+def test_resolve_library_full_listing_dispatch_none_for_unrelated_query(ns, library_fixture):
+    """"เอกสารของป่าไม้เขียว" ไม่ใช่คำขอรายชื่อเอกสารทั้งหมดในคลัง -> ต้องคืน None ปล่อยให้ routing ทางอื่นตัดสินต่อ"""
+    assert ns["_looks_like_full_library_listing_query"]("เอกสารของป่าไม้เขียว") is False
+    assert ns["_resolve_library_full_listing_dispatch"]("เอกสารของป่าไม้เขียว", chat_id=1) is None
