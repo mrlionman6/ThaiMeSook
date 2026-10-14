@@ -109,6 +109,10 @@ from db import (
     get_recent_document_edits,
     get_document_edit_count,
     get_chat_pending_actions,
+    upsert_library_search_card,
+    get_all_library_search_cards,
+    get_library_file_ids_without_search_card,
+    get_library_search_vector_scores_for_all,
 )
 
 import os
@@ -123,6 +127,7 @@ import random
 import difflib
 import datetime
 import tempfile
+import threading
 from zoneinfo import ZoneInfo
 import concurrent.futures
 import urllib.parse
@@ -618,10 +623,50 @@ PRESENT_RECOMMENDATIONS_TOOL = {
 # ให้ AI เรียก tool แก้ไฟล์เองได้เลยในเส้นทางนี้ กันพลาดแก้ไฟล์โดยไม่ได้ตั้งใจ
 ADVISOR_TOOLS = [GENERAL_WEB_SEARCH_TOOL, PRESENT_RECOMMENDATIONS_TOOL]
 
+# เครื่องมือเดียวที่ค้นคลังเอกสารได้จากทุกมุม (เลขที่เอกสาร/รหัส-ชื่อลูกค้า/รหัส-ชื่อโปรเจกต์/ชื่อไฟล์/รายการ
+# สินค้าในไฟล์/วันที่/ยอดเงิน/ความหมายใกล้เคียง) ด้วยคำค้นเดียว — ดู search_library/build_library_search_card
+# เหตุการณ์จริงที่แก้: "SSF-02" เคยตอบว่า "ไม่พบเอกสารที่มีรหัส SSF-02" ทั้งที่มีจริง เพราะมีเครื่องมือคลังเดิม 5
+# ตัวที่รู้แค่ข้อมูลระบุตัวตนคงที่ ต้องให้ AI เดาว่าใช้ตัวไหน ตัวนี้แทนที่ด้วยการค้นแบบเดียวที่ครอบคลุมทุกอย่าง
+# ต้องใส่ทั้งใน LIBRARY_TOOLS (เส้นทาง legal/library) และ ADVISOR_TOOLS (เมื่อล็อกอิน — ดู advisor_answer) —
+# คงเครื่องมือเดิม 5 ตัวด้านล่างไว้ทั้งหมด (ห้ามลบ) ใช้เฉพาะตอนต้องการรายการทั้งหมดของบริษัท/โปรเจกต์/แม่แบบ
+SEARCH_LIBRARY_TOOL = {
+    "name": "search_library",
+    "description": (
+        "ค้นหาเอกสารในคลังจากข้อมูลอะไรก็ได้ที่ผู้ใช้จำได้ (เลขที่เอกสาร, รหัส/ชื่อลูกค้า, รหัส/ชื่อโปรเจกต์, "
+        "ชื่อไฟล์, รายการสินค้าในไฟล์, วันที่, ยอดเงิน, หรือความหมายใกล้เคียง) เรียกเครื่องมือนี้ก่อนเสมอเมื่อ"
+        "ต้องการค้นหาเอกสารเฉพาะเจาะจง ห้ามตอบว่า \"ไม่พบ\"/\"ไม่มีคลังเอกสาร\" โดยไม่ได้เรียกเครื่องมือนี้ก่อน — "
+        "เครื่องมือ find_customers/list_customer_documents/list_project_documents/list_templates ใช้เฉพาะตอน"
+        "ต้องการรายการทั้งหมดของบริษัท/โปรเจกต์/แม่แบบเท่านั้น ไม่ใช่สำหรับค้นหาเอกสารเฉพาะเจาะจง"
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "คำค้นหา (เลขที่เอกสาร/ชื่อลูกค้า/รายการสินค้า/ฯลฯ)"},
+            "customer": {"type": "string", "description": "กรองเฉพาะลูกค้ารายนี้ (ไม่บังคับ)"},
+            "document_type": {
+                "type": "string", "description": "กรองเฉพาะประเภทเอกสาร เช่น ใบเสนอราคา/ใบประเมิน (ไม่บังคับ)",
+            },
+            "date_from": {
+                "type": "string", "description": "กรองเอกสารตั้งแต่วันที่นี้เป็นต้นไป รูปแบบ YYYY-MM-DD (ไม่บังคับ)",
+            },
+            "date_to": {
+                "type": "string", "description": "กรองเอกสารถึงวันที่นี้ รูปแบบ YYYY-MM-DD (ไม่บังคับ)",
+            },
+            "min_total": {"type": "number", "description": "กรองเฉพาะเอกสารที่ยอดรวมอย่างน้อยเท่านี้ (ไม่บังคับ)"},
+            "max_total": {"type": "number", "description": "กรองเฉพาะเอกสารที่ยอดรวมไม่เกินนี้ (ไม่บังคับ)"},
+            "contains_item": {
+                "type": "string", "description": "กรองเฉพาะเอกสารที่มีรายการสินค้านี้ในตาราง (ไม่บังคับ)",
+            },
+        },
+        "required": ["query"],
+    },
+}
+
 # แยกจาก AVAILABLE_TOOLS โดยตั้งใจ — สอง tool นี้เข้าถึงข้อมูลส่วนตัวของ user (สร้าง EditableDocument
 # ผูกกับ user_id/chat_id) จึงต้องส่งให้ Claude เห็นเฉพาะตอนมี user_id ที่ล็อกอินอยู่จริงเท่านั้น
 # (เช็คใน run_agentic_tool_loop() ตอนประกอบ tools list ที่จะส่งจริง ไม่ใช่แค่ปฏิเสธตอน dispatch)
 LIBRARY_TOOLS = [
+    SEARCH_LIBRARY_TOOL,
     {
         "name": "find_customers",
         "description": (
@@ -752,6 +797,11 @@ _LIBRARY_QUERY_STOPWORDS = {
     "เปิด", "ดู", "อ่าน", "ไฟล์", "ของ", "ด้วย", "และ", "ให้", "หน่อย", "ขอ", "แล้ว", "เปรียบเทียบ", "แก้",
     "ปิด", "ใช้", "ลบ", "เลิก",
     "ใน", "ที่", "ได้", "ทำ", "จะ", "เป็น", "มี",
+    # "ใบ" เป็นคำลักษณนาม/คำนำหน้าทั่วไปของเอกสาร (เช่น "ใบเสนอราคา"/"ใบประเมิน"/"ใบสั่งซื้อ") เหมือน "ไฟล์"/
+    # "เอกสาร" ไม่ช่วยแยกไฟล์เลย เหตุการณ์จริงที่แก้ตอนพัฒนา search_library: pythainlp แยกคำ "ใบเสนอราคา" เป็น
+    # โทเคนเดียว แต่แยก "ใบประเมิน" เป็น "ใบ"+"ประเมิน" สองโทเคน (dictionary-based tokenizer ไม่สม่ำเสมอ) ทำให้
+    # query ที่มีคำว่า "ใบ" ลอยๆ ให้คะแนนไฟล์ที่บังเอิญถูกตัดคำแยก "ใบ" ออกมาสูงเกินจริง ทั้งที่ไม่เกี่ยวกับคำค้นจริง
+    "ใบ",
 }
 
 # วรรณยุกต์ไทย (่ ้ ๊ ๋) และไม้ไต่คู้ (็) — ตัดออกก่อนเทียบกันคีย์คำค้นหา/ชื่อไฟล์ต่างกันแค่พิมพ์ผิดวรรณยุกต์
@@ -771,6 +821,14 @@ def _normalize_library_search_text(text: str) -> str:
     return result
 
 
+# เทียบกับโทเคนที่ normalize แล้วเสมอ (ดู _tokenize_library_query) ต้อง normalize ชุดคำนี้ด้วยเหมือนกัน — เหตุการณ์
+# จริงที่แก้ตอนพัฒนา search_library: หลายคำใน _LIBRARY_QUERY_STOPWORDS มีวรรณยุกต์ปนอยู่ (เช่น "อ่าน"/"ด้วย"/
+# "ให้"/"แล้ว"/"ได้"/"ที่") แต่ _normalize_library_search_text ตัดวรรณยุกต์ทิ้งก่อนเทียบเสมอ ทำให้คำพวกนี้ไม่ตรงกับ
+# ชุดเดิมอีกต่อไป (เช่น "ที่" กลายเป็น "ที") หลุดเข้าไปเป็นโทเคนที่ "มีความหมาย" ปลอมๆ กระทบ BM25/matched_on ของ
+# search_library (คำทั่วไปที่ปนแทบทุกประโยคภาษาไทย ทำให้ไฟล์ที่ไม่เกี่ยวข้องได้คะแนนร่วมกับ query ไปด้วย)
+_LIBRARY_QUERY_STOPWORDS_NORMALIZED = {_normalize_library_search_text(w) for w in _LIBRARY_QUERY_STOPWORDS}
+
+
 def _normalize_customer_name(name: str) -> str:
     """เหมือน _normalize_library_search_text แต่ตัดคำว่า บริษัท/จำกัด/บจก./หจก. ออกด้วย — ใช้เทียบชื่อลูกค้า
     เท่านั้น (ผู้ใช้มักพิมพ์ "บริษัท ป่าไม้เขียว จำกัด" ทั้งที่ไฟล์/ข้อมูลประกอบระบุแค่ "ป่าไม้เขียว")"""
@@ -783,12 +841,14 @@ def _normalize_customer_name(name: str) -> str:
 def _tokenize_library_query(text: str) -> list[str]:
     """ตัดคำด้วย pythainlp (engine='newmm') แล้ว normalize ทีละ token (ดู _normalize_library_search_text —
     กันพิมพ์ผิดวรรณยุกต์) กรองคำที่ไม่ช่วยระบุไฟล์ออก: ช่องว่างล้วน/สั้นกว่า 2 ตัวอักษร และคำทั่วไปใน
-    _LIBRARY_QUERY_STOPWORDS — ใช้ให้คะแนนไฟล์ใน search_library_files"""
+    _LIBRARY_QUERY_STOPWORDS_NORMALIZED (เทียบกับเวอร์ชัน normalize แล้ว ไม่ใช่ _LIBRARY_QUERY_STOPWORDS ดิบๆ —
+    ดู docstring ของ _LIBRARY_QUERY_STOPWORDS_NORMALIZED) — ใช้ให้คะแนนไฟล์ใน search_library_files/
+    search_library"""
     tokens = word_tokenize(text, engine="newmm")
     result = []
     for tok in tokens:
         tok = _normalize_library_search_text(tok)
-        if len(tok) < 2 or tok in _LIBRARY_QUERY_STOPWORDS:
+        if len(tok) < 2 or tok in _LIBRARY_QUERY_STOPWORDS_NORMALIZED:
             continue
         result.append(tok)
     return result
@@ -841,6 +901,343 @@ def _get_enriched_library_files() -> list[dict]:
             "uploaded_at": f["uploaded_at"],
         })
     return enriched
+
+
+# คำที่บ่งบอกประเภทเอกสารจากชื่อไฟล์ (เดาแบบง่ายๆ ไม่ใช้ AI) — ดู build_library_search_card
+_LIBRARY_DOCUMENT_TYPE_WORDS = ("ใบเสนอราคา", "ใบประเมิน", "ใบสั่งซื้อ", "ใบกำกับภาษี", "ใบวางบิล", "สัญญา", "ใบส่งของ")
+# คำในชื่อป้าย (label) ที่ถือว่าเป็น "วันที่" ของเอกสาร — รวมบรรทัดนี้ในบัตรค้นหาเสมอถ้าเจอ (ดู
+# build_library_search_card) ป้ายที่มีคำว่า "ออก" ด้วย ใช้ตั้งเป็น issue_date (คอลัมน์แยกสำหรับ filter)
+_LIBRARY_CARD_DATE_LABEL_WORDS = ("วันที่", "ครบกำหนด")
+# คำในชื่อป้ายที่ถือว่าเป็นยอดเงินรวมของเอกสาร — รวมในบัตรค้นหาเสมอถ้าเจอ ป้ายที่มีคำว่า "ทั้งสิ้น" ด้วย (ยอด
+# สุทธิรวม VAT แล้ว) ใช้ตั้งเป็น total_amount (คอลัมน์แยกสำหรับ filter min_total/max_total)
+_LIBRARY_CARD_TOTAL_LABEL_WORDS = ("รวมเงิน", "ภาษีมูลค่าเพิ่ม", "vat", "รวมราคาทั้งสิ้น", "รวมทั้งสิ้น")
+
+
+def _guess_library_document_type(filename: str) -> Optional[str]:
+    """เดาประเภทเอกสารจากคำสำคัญที่พบบ่อยในชื่อไฟล์ (ไม่ใช้ AI) — ใช้แค่ประกอบบัตรค้นหา (ดู
+    build_library_search_card) ไม่พบคำที่รู้จักเลย -> คืน None"""
+    for word in _LIBRARY_DOCUMENT_TYPE_WORDS:
+        if word in filename:
+            return word
+    return None
+
+
+def build_library_search_card(file_id: int) -> Optional[dict]:
+    """สร้าง "บัตรค้นหา" (search card) ของไฟล์ในคลัง 1 ไฟล์ — ข้อความเดียวที่รวมทุกอย่างที่ผู้ใช้อาจจำได้เกี่ยวกับ
+    เอกสารนี้ (ชื่อไฟล์, หมวดหมู่, ประเภทเอกสาร, ชื่อ/รหัสลูกค้า, ชื่อ/รหัสโปรเจกต์, เลขที่เอกสาร, สรุป, วันที่
+    ออก/ครบกำหนดถ้ามีในป้าย, ทุกรายการในตาราง, รวมเงิน/VAT/รวมทั้งสิ้น) ให้ search_library ค้นได้จากทุกมุม ไม่ใช่
+    แค่ข้อมูลระบุตัวตนคงที่ไม่กี่ฟิลด์เหมือน _get_enriched_library_files เดิม
+
+    ไฟล์ที่อ่านค่าไม่ได้ (เช่น storage ล่ม/ไฟล์เสีย/ตารางคำนวณไม่ได้) ใช้เท่าที่มี (แค่ข้อมูลระบุตัวตน) ไม่เคย
+    raise ออกไปเด็ดขาด — ไฟล์ในคลังจำนวนมากจะถูกสร้างบัตรพร้อมกันตอน backfill (ดู backfill_library_search_cards)
+    ไฟล์เดียวพังไม่ควรทำให้ทั้งชุดหยุด คืน None ถ้าไม่พบไฟล์นี้ในคลังเลย (ถูกลบไปแล้ว)
+
+    คืน {"card_text": str, "total_amount": float|None, "issue_date": str|None} ให้ caller
+    (upsert_library_search_card) บันทึกลง DB เอง (รวม embedding ด้วย — ไม่คำนวณ embedding ในนี้ เพราะ caller
+    บางจุด เช่น backfill แบบ batch อาจอยากเรียก embed_model.encode() ทีละหลายไฟล์พร้อมกันเพื่อประสิทธิภาพ)"""
+    file_row = get_library_file(file_id)
+    if file_row is None:
+        return None
+    meta = get_library_file_meta(file_id) or {}
+    categories = {c["id"]: c["name"] for c in get_file_categories_with_counts()}
+    folder = categories.get(file_row["category_id"]) or "ไม่มีหมวดหมู่"
+
+    lines = [f"ชื่อไฟล์: {file_row['filename']}", f"หมวดหมู่: {folder}"]
+    document_type = _guess_library_document_type(file_row["filename"])
+    if document_type:
+        lines.append(f"ประเภทเอกสาร: {document_type}")
+    if meta.get("customer_name"):
+        lines.append(f"ชื่อลูกค้า: {meta['customer_name']}")
+    if meta.get("customer_code"):
+        lines.append(f"รหัสลูกค้า: {meta['customer_code']}")
+    if meta.get("project_name"):
+        lines.append(f"ชื่อโปรเจกต์: {meta['project_name']}")
+    if meta.get("project_code"):
+        lines.append(f"รหัสโปรเจกต์: {meta['project_code']}")
+    if meta.get("document_no"):
+        lines.append(f"เลขที่เอกสาร: {meta['document_no']}")
+    if file_row.get("summary"):
+        lines.append(f"สรุป: {file_row['summary']}")
+
+    total_amount = None
+    issue_date = None
+    try:
+        raw_bytes = storage_get(file_row["storage_key"])
+        data = _read_values_from_bytes(raw_bytes, file_row["label_map"])
+
+        for label_info in data["labels"]:
+            if label_info["value"] is None:
+                continue
+            label_text = label_info["label"]
+            value = label_info["value"]
+            if any(word in label_text for word in _LIBRARY_CARD_DATE_LABEL_WORDS):
+                lines.append(f"{label_text}: {value}")
+                if issue_date is None and "ออก" in label_text:
+                    issue_date = str(value)
+            if any(word.lower() in label_text.lower() for word in _LIBRARY_CARD_TOTAL_LABEL_WORDS):
+                lines.append(f"{label_text}: {_format_money_value(value)}")
+                if total_amount is None and "ทั้งสิ้น" in label_text and isinstance(value, (int, float)):
+                    total_amount = float(value)
+
+        for table in data["tables"]:
+            for row in table["rows"]:
+                values = row["values"]
+                description = values.get("description")
+                if not description:
+                    continue
+                parts = [f"รายการ: {description}"]
+                if values.get("qty") is not None:
+                    parts.append(f"จำนวน {_format_money_value(values['qty'])}")
+                if values.get("unit"):
+                    parts.append(str(values["unit"]))
+                if values.get("unit_price") is not None:
+                    parts.append(f"ราคา/หน่วย {_format_money_value(values['unit_price'])}")
+                lines.append(" ".join(parts))
+    except Exception as e:
+        print(f"[LibrarySearchCard] read_values_failed file_id={file_id} exception_type={type(e).__name__}")
+
+    return {"card_text": "\n".join(lines), "total_amount": total_amount, "issue_date": issue_date}
+
+
+def save_library_search_card(file_id: int) -> None:
+    """สร้างบัตรค้นหา (build_library_search_card) + คำนวณ embedding จาก card_text แล้วบันทึกลง DB ให้ไฟล์นี้
+    ทันทีหนึ่งไฟล์ — ใช้ตอนเหตุการณ์ที่กระทบบัตรเดี่ยวๆ (อัปโหลดไฟล์ใหม่เข้าคลัง, แก้ข้อมูลระบุตัวตน,
+    บันทึกไฟล์ทับในคลัง) ไม่ raise ออกไปเด็ดขาด (ล้มเหลว -> log แล้วปล่อยผ่าน ไม่ทำให้ action หลัก เช่น
+    อัปโหลดไฟล์ ล้มไปด้วย — ไฟล์นี้แค่ค้นหาไม่เจอด้วย search_library ชั่วคราว ยังใช้งานปกติทางอื่นได้ทุกอย่าง)"""
+    try:
+        card = build_library_search_card(file_id)
+        if card is None:
+            return
+        embedding = embed_model.encode(card["card_text"]).tolist()
+        upsert_library_search_card(
+            file_id, card["card_text"], embedding, card["total_amount"], card["issue_date"],
+        )
+    except Exception as e:
+        print(f"[LibrarySearchCard] save_failed file_id={file_id} exception_type={type(e).__name__}")
+
+
+def backfill_library_search_cards() -> None:
+    """สร้างบัตรค้นหาให้ไฟล์ในคลังทุกไฟล์ที่ยังไม่มีบัตรเลย (ดู get_library_file_ids_without_search_card) —
+    เรียกตอน startup ของแอป (background thread ไม่บล็อก startup — ดู @app.on_event("startup")) ไม่มีไฟล์ขาดเลย
+    จะไม่ทำอะไร (loop ว่าง) ไฟล์เดียวพังไม่ทำให้ไฟล์อื่นหยุดสร้างตาม (save_library_search_card กลืน exception
+    ของตัวเองอยู่แล้ว)"""
+    missing = get_library_file_ids_without_search_card()
+    for file_id in missing:
+        save_library_search_card(file_id)
+    if missing:
+        print(f"[LibrarySearchCard] backfill สร้างบัตรค้นหาให้ {len(missing)} ไฟล์ที่ยังไม่มี")
+
+
+_LIBRARY_SEARCH_MAX_RESULTS = 5
+# คะแนนรวม (BM25+embedding หลัง normalize เป็น 0-1 แล้วถ่วงน้ำหนักเท่ากัน) ต่ำกว่านี้ไม่ถือว่าเกี่ยวข้องพอจะ
+# แสดงผล — ไม่กระทบผลที่ตรงเป๊ะเลย (ผ่านเกณฑ์นี้เสมอไม่ว่าคะแนนจะเท่าไร) ปรับได้ถ้าคลังใหญ่ขึ้นแล้วพบว่าหลวม/
+# แน่นเกินไป
+_LIBRARY_SEARCH_SCORE_THRESHOLD = 0.15
+# คะแนนที่การันตีว่าผลตรงเป๊ะชนะผลที่ได้แค่จาก BM25/embedding เสมอไม่ว่ากรณีใด (คะแนนรวมปกติอยู่ในช่วง 0-1)
+_LIBRARY_SEARCH_EXACT_MATCH_BONUS = 1000.0
+
+
+def _library_search_exact_match_fields(query: str, candidate: dict) -> list[str]:
+    """เช็คว่า query ตรงเป๊ะกับ document_no/customer_code/project_code (ไม่สนตัวพิมพ์ใหญ่เล็ก — ตรงทั้งข้อความ
+    หรือเป็นคำเต็มๆ คำหนึ่งในข้อความก็นับ เช่น "เลขเอกสาร SSF-02" ก็ยังถือว่าตรงเป๊ะกับ document_no "SSF-02" ไม่ใช่
+    แค่ "SSF-02" เดี่ยวๆ เท่านั้น) หรือ customer_name (หลัง normalize ด้วย _normalize_customer_name ทั้งข้อความ)
+    ของไฟล์นี้ไหม คืนรายการชื่อฟิลด์ที่ตรง (ว่างเปล่าถ้าไม่ตรงเลยสักฟิลด์) — ใช้ตัดสินทั้งคะแนน "ตรงเป๊ะ" (ชนะ
+    BM25/embedding เสมอไม่ว่าคะแนนจะเท่าไร — ดู _LIBRARY_SEARCH_EXACT_MATCH_BONUS) และข้อความ matched_on คืนได้
+    มากกว่า 1 ฟิลด์ถ้าตรงพร้อมกันหลายอัน (เช่น document_no กับ customer_name บังเอิญเหมือนกัน — เคสแปลกแต่ไม่ผิด
+    อะไร)"""
+    stripped_query = query.strip()
+    if not stripped_query:
+        return []
+    lowered_query = stripped_query.lower()
+    normalized_query_name = _normalize_customer_name(stripped_query)
+
+    def _code_matches(code: Optional[str]) -> bool:
+        if not code:
+            return False
+        pattern = r"\b" + re.escape(code.strip().lower()) + r"\b"
+        return re.search(pattern, lowered_query) is not None
+
+    matches = []
+    if _code_matches(candidate.get("document_no")):
+        matches.append("เลขที่เอกสาร")
+    if _code_matches(candidate.get("customer_code")):
+        matches.append("รหัสลูกค้า")
+    if _code_matches(candidate.get("project_code")):
+        matches.append("รหัสโปรเจกต์")
+    if (
+        candidate.get("customer_name") and normalized_query_name
+        and normalized_query_name == _normalize_customer_name(candidate["customer_name"])
+    ):
+        matches.append("ชื่อลูกค้า")
+    return matches
+
+
+def _library_search_matches_filters(candidate: dict, filters: Optional[dict]) -> bool:
+    """กรอง candidate (ไฟล์ในคลัง 1 ไฟล์ — ต้องมี card_text/total_amount/issue_date ผสมเข้ามาแล้ว) ตาม filters
+    (ถ้ามี) ด้วยโค้ดล้วนๆ ทุกเงื่อนไขที่ระบุมาต้องผ่านหมด (AND) ไม่ระบุ filters เลย หรือ filters ว่างเปล่า ->
+    ผ่านเสมอ:
+    - customer: ชื่อลูกค้า (หรือชื่อไฟล์ถ้าไม่มีชื่อลูกค้า) หลัง normalize มี customer เป็นส่วนหนึ่งหรือกลับกัน
+      (ตรรกะเดียวกับ search_library_files)
+    - document_type/contains_item: card_text หลัง normalize มีคำนี้เป็นส่วนหนึ่ง
+    - date_from/date_to: เทียบ issue_date แบบ string ตรงๆ (คาดหวังรูปแบบ "YYYY-MM-DD") ไม่มี issue_date เลย ->
+      ไม่ผ่านถ้ามีการกรองวันที่ (ปลอดภัยกว่าปล่อยผ่านเงียบๆ ทั้งที่ไม่รู้วันที่จริง)
+    - min_total/max_total: เทียบ total_amount ตรงๆ ไม่มี total_amount เลย -> ไม่ผ่านถ้ามีการกรองยอดเงิน"""
+    if not filters:
+        return True
+
+    if filters.get("customer"):
+        normalized_customer = _normalize_customer_name(filters["customer"])
+        normalized_source = _normalize_customer_name(candidate.get("customer_name") or candidate["filename"])
+        if not (normalized_customer in normalized_source or normalized_source in normalized_customer):
+            return False
+
+    card_text_normalized = None
+    if filters.get("document_type") or filters.get("contains_item"):
+        card_text_normalized = _normalize_library_search_text(candidate.get("card_text") or "")
+
+    if filters.get("document_type") and _normalize_library_search_text(filters["document_type"]) not in card_text_normalized:
+        return False
+    if filters.get("contains_item") and _normalize_library_search_text(filters["contains_item"]) not in card_text_normalized:
+        return False
+
+    if filters.get("date_from") and (not candidate.get("issue_date") or candidate["issue_date"] < filters["date_from"]):
+        return False
+    if filters.get("date_to") and (not candidate.get("issue_date") or candidate["issue_date"] > filters["date_to"]):
+        return False
+
+    if filters.get("min_total") is not None and (
+        candidate.get("total_amount") is None or candidate["total_amount"] < filters["min_total"]
+    ):
+        return False
+    if filters.get("max_total") is not None and (
+        candidate.get("total_amount") is None or candidate["total_amount"] > filters["max_total"]
+    ):
+        return False
+
+    return True
+
+
+def _library_search_matched_on_text(exact_fields: list[str], candidate: dict, query: str) -> str:
+    """สร้างข้อความอธิบายว่าไฟล์นี้ถูกเจอเพราะอะไร — ตรงเป๊ะ: "ตรงกับ<ชื่อฟิลด์>" ไม่ตรงเป๊ะ: หาบรรทัดใน card_text
+    ที่มีคำค้นปนอยู่ "มากที่สุด" (นับจำนวนโทเคนที่ตรงกัน หลัง tokenize ตัดคำทั่วไป/สั้นเกินไปออกทั้งคู่ — ดู
+    _tokenize_library_query) ไม่ใช่แค่บรรทัดแรกที่เจอคำใดคำหนึ่ง (เหตุการณ์จริงที่แก้ตอนพัฒนา: query "ใบที่มี Rack
+    9U" มีโทเคน "ใบ" ที่ดันเป็น substring ของ "ใบเสนอราคา" ในบรรทัด "ชื่อไฟล์: ..." ซึ่งอยู่บรรทัดแรกสุดเสมอ ทำให้
+    เลือกบรรทัดนั้นผิดแทนที่จะเป็นบรรทัด "รายการ: Rack case server 9U ..." ที่ตรงกับคำค้นมากกว่าจริงๆ) ไม่มีบรรทัด
+    ไหนตรงเลยสักโทเคน (มาจาก embedding ล้วนๆ — ความหมายใกล้เคียงแต่ไม่มีคำตรงกันเป๊ะสักคำ) ใช้ข้อความทั่วไปแทน"""
+    if exact_fields:
+        return "ตรงกับ" + "/".join(exact_fields)
+    card_text = candidate.get("card_text") or ""
+    query_tokens = _tokenize_library_query(query)
+    best_line = None
+    best_count = 0
+    if query_tokens:
+        for line in card_text.splitlines():
+            normalized_line = _normalize_library_search_text(line)
+            count = sum(1 for tok in query_tokens if tok in normalized_line)
+            if count > best_count:
+                best_count = count
+                best_line = line
+    return best_line if best_line is not None else "ความหมายใกล้เคียงกับคำค้น"
+
+
+def _score_library_search_candidates(
+    query: str, candidates: list[dict], bm25_scores: dict[int, float], embedding_scores: dict[int, float],
+) -> list[dict]:
+    """ให้คะแนนและเรียงไฟล์ในคลัง (candidates ผ่านการกรองด้วย filters มาแล้วจาก caller — ดู search_library)
+    คะแนน = ตรงเป๊ะ (document_no/customer_code/project_code/customer_name — ดู _library_search_exact_match_
+    fields) ชนะ BM25/embedding เสมอ (บวก _LIBRARY_SEARCH_EXACT_MATCH_BONUS) + BM25 บน card_text (normalize เป็น
+    0-1 ด้วยคะแนนสูงสุดในชุดนี้) + cosine embedding (normalize เป็น 0-1 เหมือนกัน) ถ่วงน้ำหนักเท่ากัน (0.5/0.5)
+    ตัดผลที่ไม่ตรงเป๊ะและคะแนนต่ำกว่า _LIBRARY_SEARCH_SCORE_THRESHOLD ทิ้ง คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS
+    รายการ เรียงคะแนนมากไปน้อย แยกฟังก์ชันนี้ออกมาจาก search_library เพื่อให้ทดสอบตรรกะให้คะแนน/กรองได้โดยไม่ต้อง
+    พึ่ง BM25Okapi/embed_model จริง (เทสต์ส่ง bm25_scores/embedding_scores มาตรงๆ ได้เลย)"""
+    max_bm25 = max(bm25_scores.values(), default=0.0) or 1.0
+    max_embedding = max(embedding_scores.values(), default=0.0) or 1.0
+
+    scored = []
+    for candidate in candidates:
+        file_id = candidate["file_id"]
+        exact_fields = _library_search_exact_match_fields(query, candidate)
+        bm25_norm = bm25_scores.get(file_id, 0.0) / max_bm25
+        embedding_norm = embedding_scores.get(file_id, 0.0) / max_embedding
+        combined = bm25_norm * 0.5 + embedding_norm * 0.5
+        is_exact = bool(exact_fields)
+        final_score = (_LIBRARY_SEARCH_EXACT_MATCH_BONUS + combined) if is_exact else combined
+        if not is_exact and final_score < _LIBRARY_SEARCH_SCORE_THRESHOLD:
+            continue
+        scored.append({
+            "file_id": file_id,
+            "filename": candidate["filename"],
+            "customer_name": candidate.get("customer_name"),
+            "document_no": candidate.get("document_no"),
+            "matched_on": _library_search_matched_on_text(exact_fields, candidate, query),
+            "exact": is_exact,
+            "score": final_score,
+        })
+
+    scored.sort(key=lambda item: item["score"], reverse=True)
+    return scored[:_LIBRARY_SEARCH_MAX_RESULTS]
+
+
+def search_library(query: str, user_id: Optional[int], filters: Optional[dict] = None) -> list[dict]:
+    """เครื่องมือค้นหาคลังเอกสารจากทุกข้อมูลที่ผู้ใช้อาจจำได้ (เลขที่เอกสาร/รหัส-ชื่อลูกค้า/รหัส-ชื่อโปรเจกต์/
+    ชื่อไฟล์/รายการสินค้าในไฟล์/วันที่/ยอดเงิน/ความหมายใกล้เคียง) ด้วยเครื่องมือเดียว (ดู build_library_search_
+    card ที่สร้าง "บัตรค้นหา" ของแต่ละไฟล์ไว้ล่วงหน้า) เคารพสิทธิ์การเห็นไฟล์แบบเดียวกับฟังก์ชันคลังเดิมทั้งหมด
+    (ใช้ _get_enriched_library_files() เป็นฐานเหมือนกัน — คลังนี้ใช้ร่วมกันทุกผู้ใช้ที่ล็อกอินอยู่ ไม่มีการจำกัด
+    สิทธิ์ต่อ user_id เป็นพิเศษ เหมือน find_customers/search_library_files เดิมทุกจุด — รับ user_id มาเผื่ออนาคต
+    และให้ signature สอดคล้องกับเครื่องมือคลังตัวอื่น ไม่ได้ใช้งานจริงตอนนี้)
+
+    ไฟล์ที่ยังไม่มีบัตรค้นหาเลย (รอ backfill ตอน startup อยู่ — ดู backfill_library_search_cards) ถูกข้ามไปก่อน
+    ไม่ error คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS ไฟล์เรียงคะแนน แต่ละไฟล์มี file_id/filename/customer_name/
+    document_no/matched_on/exact/score log [LibrarySearch] hits=<n> top_score=<x> exact=<bool> เสมอ (ห้าม log
+    เนื้อหาไฟล์/คำค้นของผู้ใช้)"""
+    enriched = _get_enriched_library_files()
+    cards = get_all_library_search_cards()
+
+    candidates = []
+    for item in enriched:
+        card = cards.get(item["file_id"])
+        if card is None:
+            continue
+        merged = {
+            **item, "card_text": card["card_text"], "total_amount": card["total_amount"],
+            "issue_date": card["issue_date"],
+        }
+        if _library_search_matches_filters(merged, filters):
+            candidates.append(merged)
+
+    if not candidates:
+        print("[LibrarySearch] hits=0 top_score=0.000 exact=False")
+        return []
+
+    # ใช้ _tokenize_library_query (ไม่ใช่ word_tokenize ตรงๆ) ทั้งฝั่ง query และ corpus เสมอ — ตัดทิ้งโทเคน
+    # ช่องว่าง/สั้นเกินไป/คำทั่วไปที่ไม่ช่วยแยกไฟล์ (ดู _LIBRARY_QUERY_STOPWORDS) เหตุการณ์จริงที่แก้ตอนพัฒนา:
+    # ไม่กรองโทเคนช่องว่าง (" ") ออกก่อน ทำให้ทุกไฟล์มีคะแนน BM25 ไม่เป็นศูนย์เสมอ (เพราะมีโทเคนช่องว่างร่วมกับ
+    # query ทุกครั้ง) แม้ query จะไม่เกี่ยวกับไฟล์ไหนในคลังเลยสักไฟล์เดียว
+    tokenized_query = _tokenize_library_query(query)
+    tokenized_corpus = [_tokenize_library_query(c["card_text"]) for c in candidates]
+    bm25 = BM25Okapi(tokenized_corpus)
+    raw_bm25_scores = bm25.get_scores(tokenized_query)
+    bm25_scores = {c["file_id"]: float(s) for c, s in zip(candidates, raw_bm25_scores)}
+
+    query_embedding = embed_model.encode(query).tolist()
+    embedding_scores = get_library_search_vector_scores_for_all(query_embedding)
+
+    results = _score_library_search_candidates(query, candidates, bm25_scores, embedding_scores)
+
+    top_score = results[0]["score"] if results else 0.0
+    exact = bool(results) and results[0]["exact"]
+    print(f"[LibrarySearch] hits={len(results)} top_score={top_score:.3f} exact={exact}")
+    return results
+
+
+def execute_search_library(tool_input: dict, user_id: Optional[int]) -> dict:
+    """เครื่องมือ AI สำหรับค้นหาคลังเอกสาร (ดู search_library) — ประกอบ filters จาก tool_input เองจากฟิลด์ที่
+    ระบุมาเท่านั้น (ไม่บังคับต้องส่งมาครบทุกตัว) คืน {"results": [...]} เสมอ (list ว่างเปล่าถ้าไม่พบเลย)"""
+    query = (tool_input.get("query") or "").strip()
+    filter_keys = ("customer", "document_type", "date_from", "date_to", "min_total", "max_total", "contains_item")
+    filters = {key: tool_input[key] for key in filter_keys if tool_input.get(key) is not None}
+    results = search_library(query, user_id, filters=filters or None)
+    return {"results": results}
 
 
 def search_library_files(
@@ -3056,6 +3453,13 @@ def run_agentic_tool_loop(
                     "tool_use_id": block.id,
                     "content": json.dumps(result, ensure_ascii=False, default=str),
                 })
+            elif block.type == "tool_use" and block.name == "search_library" and user_id and chat_id:
+                result = _safe_execute_tool("search_library", execute_search_library, block.input, user_id)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": json.dumps(result, ensure_ascii=False, default=str),
+                })
             elif block.type == "tool_use" and block.name == "find_customers" and user_id and chat_id:
                 result = _safe_execute_tool("find_customers", execute_find_customers, block.input, chat_id)
                 tool_results.append({
@@ -3544,7 +3948,13 @@ def describe_image_for_retrieval(image_data: dict, query: str) -> tuple[bool, st
 LIBRARY_LOGGED_IN_RULES = (
     # ตัดออก 4 ข้อเดิมที่อ้างอิง list_library_files (เครื่องมือที่เลิกใช้แล้ว) และ "รายชื่อไฟล์ในคลังด้านล่าง"
     # (ด้านล่างตอนนี้เป็นรายชื่อบริษัทแทน ไม่ใช่รายชื่อไฟล์) — ดูรายละเอียดเหตุผลใน PR description
-    "\n- ห้ามแสดง file_id หรือ document_id ให้ผู้ใช้เห็นเด็ดขาด ใช้ชื่อไฟล์เสมอเวลาพูดถึงไฟล์\n"
+    # เหตุการณ์จริงที่แก้: "SSF-02" ตอบว่า "ไม่พบเอกสารที่มีรหัส SSF-02" ทั้งที่มีจริง เพราะมีเครื่องมือคลังเดิม 5
+    # ตัวที่รู้แค่ข้อมูลระบุตัวตนคงที่ ต้องเดาว่าใช้ตัวไหน — search_library ค้นได้จากทุกอย่างด้วยคำค้นเดียว
+    "\n- ค้นหาเอกสารในคลัง (เลขที่เอกสาร/ชื่อลูกค้า/รายการสินค้า/วันที่/ยอดเงิน/ความหมายใกล้เคียง) ให้เรียก "
+    "search_library ก่อนเสมอ ห้ามตอบว่า \"ไม่พบ\"/\"ไม่มีคลังเอกสาร\"/\"ไม่มีเอกสารนี้\" โดยไม่ได้เรียกเครื่องมือ"
+    "นี้ก่อนเด็ดขาด find_customers/list_customer_documents/list_project_documents/list_templates ใช้เฉพาะตอน"
+    "ต้องการรายการทั้งหมดของบริษัท/โปรเจกต์/แม่แบบเท่านั้น\n"
+    "- ห้ามแสดง file_id หรือ document_id ให้ผู้ใช้เห็นเด็ดขาด ใช้ชื่อไฟล์เสมอเวลาพูดถึงไฟล์\n"
     "- เมื่อคุณถามกลับว่าหมายถึงไฟล์ไหน แล้วผู้ใช้ตอบยืนยัน (เช่น \"ใช่\", \"ใช่ไฟล์นั้น\") ให้เรียก "
     "open_library_file เปิดไฟล์ที่ถามไปทันที ห้ามถามยืนยันซ้ำอีก\n"
     "- ถ้ายังไม่ได้เปิดไฟล์ (ไม่มีผลจาก tool ยืนยัน) ห้ามอธิบายว่าเอกสารประเภทนี้มักมีเนื้อหาอะไรจากความรู้ทั่วไป\n"
@@ -3621,6 +4031,35 @@ def _build_library_file_listing_text(limit: int = 100) -> str:
     return "\n".join(lines)
 
 
+# system prompt แยกต่างหากสำหรับเส้นทาง library (ดู _classify_question_route/skip_legal_context) — เขียนใหม่
+# ทั้งก้อนแทนที่จะตัดบางบรรทัดออกจาก system prompt เดิมของเส้นทาง legal (ลดความเสี่ยงแก้ string เดิมผิดพลาด)
+# เหตุการณ์จริงที่แก้: "เลขเอกสาร SSF-02" (เส้นทาง library) เคยได้คำตอบ "ข้อมูลอ้างอิงที่ให้มาไม่มี..." เพราะ
+# system prompt เดิมของเส้นทางกฎหมาย (มีกติกาเรื่อง "ข้อมูลอ้างอิง"/ฐานความรู้กฎหมายเต็มไปหมด) ถูกใช้ร่วมกันทุก
+# เส้นทางโดยไม่แยก ไม่มีฐานความรู้กฎหมายเกี่ยวข้องกับคำถามคลังเอกสารเลยสักนิด
+LIBRARY_ROUTE_SYSTEM_PROMPT = (
+    "คุณเป็นผู้ช่วยค้นหา/จัดการคลังเอกสาร Excel (ใบเสนอราคา ใบประเมิน สัญญา ฯลฯ) ของผู้ประกอบการในประเทศไทย "
+    "คำถามนี้เกี่ยวกับการค้นหา เปิด หรือดูรายการเอกสารในคลัง ไม่ใช่คำถามเชิงความรู้กฎหมาย/ภาษี/การลงทุน ไม่มีฐาน"
+    "ความรู้พิเศษด้านกฎหมายเกี่ยวข้องกับคำถามนี้เลย ห้ามใช้คำว่า \"ข้อมูลอ้างอิง\"/\"ข้อมูลที่ให้มา\" กับผู้ใช้"
+    "เด็ดขาด ใช้กติกาคลังเอกสารด้านล่างแทนทั้งหมด\n"
+    "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใส่ \"ครับ\" ท้ายทุกย่อหน้าหรือเป็นบรรทัด"
+    "เดี่ยวๆ ห้ามใช้ \"ค่ะ\" เด็ดขาด\n"
+    "- ห้ามใส่ข้อความ disclaimer หรือคำเตือนทางกฎหมายท้ายคำตอบเอง เพราะมีข้อความนี้แสดงอยู่ใต้กล่องแชทบนหน้าเว็บ"
+    "อยู่แล้ว\n"
+    "- ถ้าคำถามล่าสุดอ้างอิงถึงสิ่งที่คุยไว้ก่อนหน้าในบทสนทนานี้ ให้ใช้บริบทนั้นประกอบการตอบด้วย\n"
+    "- การแก้ไขทำกับสำเนาในแชทเท่านั้น บอกผู้ใช้ว่าต้นฉบับในคลังไม่เปลี่ยน และดาวน์โหลดฉบับแก้ได้\n"
+    "- ถ้าไฟล์ (จากคลังหรือที่แนบมาเอง) มีมาโคร (has_macros เป็น true) ให้บอกผู้ใช้ว่าไฟล์นี้มีมาโคร "
+    "ระบบไม่ได้รันมาโครใดๆ เลย และ Excel จะถามก่อนเปิดใช้งานมาโครเองตามปกติเมื่อเปิดไฟล์\n"
+    "- ระบบจะแสดงผลการเปิด แก้ ปิด หรือย้อนไฟล์ให้ผู้ใช้เห็นเองเสมอ (เป็นใบยืนยันจากโค้ด ไม่ใช่คำตอบของคุณ) "
+    "ห้ามบอกว่าทำสำเร็จ (เปิด/แก้/ปิด/ย้อนไฟล์) ด้วยคำพูดของตัวเองเด็ดขาด ไม่ว่าจะมีผลจาก tool หรือไม่ก็ตาม "
+    "ให้บอกเฉพาะขั้นตอนถัดไปหรือข้อมูลอื่นที่เกี่ยวข้องแทน ถ้าต้องเปิดไฟล์ ต้องเรียกเครื่องมือเสมอ แม้เคยเห็น "
+    "ข้อมูลไฟล์นั้นในประวัติแชทมาก่อนแล้วก็ตาม\n"
+    "- ห้ามบรรยายเนื้อหาในไฟล์จากความรู้ทั่วไป ใช้เฉพาะข้อมูลที่ได้จาก tool\n"
+    "- ถ้าได้ผลเปรียบเทียบไฟล์จากเครื่องมือ compare_chat_documents กลับมาเป็นตาราง markdown สำเร็จรูป "
+    "ให้แสดงตารางทั้งหมดตามที่ได้รับทุกแถวเป๊ะๆ ห้ามย่อ ห้ามตัดแถว ห้ามแก้ตัวเลขหรือข้อความในตาราง "
+    "แล้วต่อท้ายด้วยข้อสังเกตสำคัญไม่เกิน 3 ข้อ"
+)
+
+
 def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None, skip_legal_context=False):
     """ขั้นตอนเตรียมข้อมูลทั้งหมดก่อนเรียก Claude ตัวตอบจริง — ใช้ร่วมกันทั้งโหมด
     non-streaming (rag_answer) และ streaming (rag_answer_stream) กันโค้ดซ้ำซ้อน
@@ -3667,7 +4106,10 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
         top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=5)
         context = "\n".join([f"- {c}" for c in top_chunks])
 
-    system_prompt = (
+    if skip_legal_context:
+        system_prompt = LIBRARY_ROUTE_SYSTEM_PROMPT
+    else:
+        system_prompt = (
         "คุณเป็นผู้ช่วยธุรกิจทั่วไปสำหรับผู้ประกอบการในประเทศไทย ตอบคำถามธุรกิจได้กว้าง "
         "รวมถึงการเลือกอุปกรณ์/ประเมินความคุ้มค่าการลงทุนในอุปกรณ์ (เช่น CCTV, OLT/ONT/ONU, ระบบเครือข่าย ฯลฯ) "
         "และยังช่วยตอบคำถามหรืออธิบายเนื้อหาเอกสารธุรกิจทั่วไปที่ผู้ใช้ถามหรือแนบมาได้ "
@@ -4370,9 +4812,14 @@ def advisor_answer(
     messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
     messages.append({"role": "user", "content": query})
 
+    # search_library เข้าถึงข้อมูลส่วนตัวของ user เหมือน LIBRARY_TOOLS ทุกตัว (ดู comment ของ LIBRARY_TOOLS) —
+    # เพิ่มเข้า ADVISOR_TOOLS เฉพาะตอนล็อกอินอยู่จริงเท่านั้น (ต่างจาก ADVISOR_TOOLS ปกติที่เป็น list คงที่ ไม่ผ่าน
+    # เงื่อนไข user_id/chat_id แบบที่ AVAILABLE_TOOLS+LIBRARY_TOOLS+CHAT_DOCUMENT_TOOLS ทำใน run_agentic_tool_
+    # loop ปกติ เพราะเส้นทางนี้ใช้ tools_override เสมอ ต้องเช็คเองตรงนี้)
+    advisor_tools = ADVISOR_TOOLS + ([SEARCH_LIBRARY_TOOL] if (user_id and chat_id) else [])
     raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
-        tools_override=ADVISOR_TOOLS, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
+        tools_override=advisor_tools, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
         max_tokens=ADVISOR_MAX_TOKENS,
     )
     answer = _normalize_polite_particles(raw_answer)
@@ -4619,6 +5066,46 @@ def _ask_question_api_error_response(error: Exception, chat_id: Optional[int]) -
     return {"answer": _categorize_anthropic_api_error(error), "sources": [], "chat_id": chat_id}
 
 
+def _resolve_library_exact_match_dispatch(query: str, user_id: int, chat_id: int) -> Optional[dict]:
+    """ตัดสินใจว่าข้อความนี้เป็นการเรียกหาเอกสารในคลังด้วยเลขที่เอกสาร/รหัสลูกค้า/รหัสโปรเจกต์/ชื่อลูกค้าที่
+    "ตรงเป๊ะ" ไหม (ดู search_library/_library_search_exact_match_fields) แล้วเปิดไฟล์ทันทีถ้าใช่ — ต่างจากทางลัด
+    parse_open_command (ต้องขึ้นต้นด้วย "เปิด") เพราะข้อความแบบ "SSF-02"/"เลขเอกสาร SSF-02" ไม่มีคำว่า "เปิด" ปน
+    มาเลยสักคำ เหตุการณ์จริงที่แก้: "SSF-02" เคยหลุดไปให้ AI ตัดสินใจเอง ตอบว่า "ไม่พบเอกสารที่มีรหัส SSF-02" ทั้ง
+    ที่มีจริง (มีเครื่องมือคลังเดิม 5 ตัวที่รู้แค่ข้อมูลระบุตัวตนคงที่ ต้องเดาว่าใช้ตัวไหน) — ห้ามเปิดไฟล์อัตโนมัติ
+    จากคะแนน BM25/embedding อย่างเดียวเด็ดขาด (กัน "แนะนำตู้ Rack 9U ที่ดีที่สุด" ไปเปิดใบเสนอราคาป่าไม้เขียวที่มี
+    "Rack case server 9U" อยู่ในรายการโดยไม่ได้ตั้งใจ) เฉพาะผลที่ exact=True เท่านั้น แยกออกมาเป็นฟังก์ชันเดี่ยว
+    เพื่อให้ทดสอบได้โดยไม่ต้องพึ่ง FastAPI/Request จริง (เหมือน _resolve_direct_structural_dispatch/
+    _resolve_recommendation_command_dispatch)
+
+    คืน {"document_id": int|None, "answer": str} ถ้าตรงเป๊ะอย่างน้อย 1 ไฟล์ (document_id เป็น None ถ้าตรงเป๊ะ
+    หลายไฟล์พร้อมกัน — ยังไม่ได้เปิดไฟล์ไหนเลย แสดงรายการให้เลือกแทน ถือเป็นคำสั่งที่ยืนยันแล้ว ให้ตอบเลขข้อได้ด้วย
+    select_list_item ต่อ) หรือ None ถ้าไม่ตรงเป๊ะเลยสักไฟล์ (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
+    if not _looks_like_library_query(query):
+        return None
+
+    search_results = search_library(query, user_id)
+    exact_matches = [r for r in search_results if r["exact"]]
+
+    if len(exact_matches) == 1:
+        tool_result = _safe_execute_tool(
+            "open_library_file", execute_open_library_file,
+            {"file_id": exact_matches[0]["file_id"]}, user_id, chat_id,
+        )
+        answer = tool_result.get("message") or tool_result.get("error") or "เปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
+        return {"document_id": tool_result.get("document_id"), "answer": answer}
+
+    if len(exact_matches) > 1:
+        enriched_by_id = {f["file_id"]: f for f in _get_enriched_library_files()}
+        listing_files = [
+            enriched_by_id[r["file_id"]] for r in exact_matches if r["file_id"] in enriched_by_id
+        ]
+        _record_chat_document_listing(chat_id, listing_files)
+        listing_text = _format_library_document_list("พบเอกสารที่ตรงกับคำค้นนี้หลายรายการ:", listing_files)
+        return {"document_id": None, "answer": listing_text + "\n\nต้องการเปิดข้อไหนครับ"}
+
+    return None
+
+
 @app.post("/ask")
 async def ask_question(
     request: Request,
@@ -4716,6 +5203,22 @@ async def ask_question(
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
                 return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+        # ทางลัดค้นหา/เปิดไฟล์ด้วยเลขที่เอกสาร/รหัสลูกค้า/รหัสโปรเจกต์/ชื่อลูกค้าที่ "ตรงเป๊ะ" (ดู
+        # _resolve_library_exact_match_dispatch) — ต่างจากทางลัด parse_open_command ด้านบน (ต้องขึ้นต้นด้วย
+        # "เปิด") เพราะข้อความแบบ "SSF-02"/"เลขเอกสาร SSF-02" ไม่มีคำว่า "เปิด" ปนมาเลยสักคำ
+        library_exact_dispatch = _resolve_library_exact_match_dispatch(query, user_id, chat_id)
+        if library_exact_dispatch is not None:
+            branch = (
+                "open_by_exact_match" if library_exact_dispatch["document_id"] is not None
+                else "open_by_exact_match_multiple"
+            )
+            print(f"[Route] chat={chat_id} branch={branch} active_doc={library_exact_dispatch['document_id']}")
+            answer = library_exact_dispatch["answer"]
+            add_chat_message(chat_id, "user", query)
+            add_chat_message(chat_id, "assistant", answer)
+            touch_chat_session(chat_id)
+            return {"answer": answer, "sources": [], "chat_id": chat_id}
 
     # ถ้าแชทนี้มี EditableDocument (Excel Editor) ที่ยังไม่หมดอายุผูกอยู่ และข้อความนี้ไม่มีไฟล์แนบมาด้วย
     # ให้ Claude ตัดสินใจก่อนว่าเกี่ยวกับการแก้ไฟล์ต่อไหม (edit/finalize/compare) หรือเป็นเรื่องอื่นที่ไม่เกี่ยวเลย
@@ -5506,8 +6009,14 @@ def close_chat_document_endpoint(chat_id: int, document_id: int, user_id: int = 
 # ---------- Startup Event ----------
 @app.on_event("startup")
 async def startup_event():
-    init_db()       # สร้างตาราง knowledge_base และ logs ถ้ายังไม่มี
+    init_db()       # สร้างตาราง knowledge_base และ logs ถ้ายังไม่มี (รวม library_search_index ด้วย)
     rebuild_index()  # โหลด knowledge base จาก DB + build BM25/vector index
+    # บัตรค้นหาคลังเอกสาร (ดู build_library_search_card/search_library) — รันใน background thread แยกต่างหาก
+    # ไม่บล็อก startup เลย (ต่างจาก backfill_missing_embeddings ของ KB กฎหมายด้านบนที่บล็อก เพราะ KB ต้องพร้อม
+    # ค้นได้ทันทีตั้งแต่ request แรก แต่คลังเอกสารมีเครื่องมือเดิม 5 ตัวที่ยังใช้งานได้ปกติระหว่างรอบัตรสร้างเสร็จ
+    # อยู่แล้ว ไม่จำเป็นต้องรอ) คลังขนาดหลักร้อย-พันไฟล์ใช้เวลาสร้างหลักนาที (ส่วนใหญ่หมดไปกับ embed_model.encode
+    # ทีละไฟล์) ไม่ควรทำให้แอปตอบสนอง request แรกช้าไปด้วย
+    threading.Thread(target=backfill_library_search_cards, daemon=True).start()
 
 # ---------- Admin Login/Logout ----------
 @app.get("/admin/login")
@@ -7666,18 +8175,26 @@ def _compute_table_amount_values(file_bytes: bytes, tables: list[dict]) -> None:
 
 def read_document_values(document: dict) -> dict:
     """คืนค่าปัจจุบันของทุก label และตารางรายการ (ถ้ามี) ของสำเนาทำงานปัจจุบัน (ดู get_working_copy) ใช้เป็น
-    แหล่งข้อมูลเดียวให้ tool read_document_values ของ AI (ดู execute_read_document_values) label ที่เซลล์เป็น
-    สูตรและคำนวณไม่ได้ (เช่น BAHTTEXT ที่ pycel ไม่รองรับ — ดู _recalculate_formula_values) ได้ value เป็น None
-    พร้อม not_computable=True แทนที่จะ error หรือปล่อยค่าที่ผิดเงียบๆ ออกไป
+    แหล่งข้อมูลเดียวให้ tool read_document_values ของ AI (ดู execute_read_document_values) — ส่วนคำนวณจริงอยู่ใน
+    _read_values_from_bytes (แยกออกมาให้ build_library_search_card เรียกตรงๆ ได้โดยไม่ต้องมี "เอกสาร"
+    (EditableDocument) เลยด้วย — ไฟล์ในคลังที่ยังไม่เคยถูกเปิดเป็น EditableDocument ไม่มี document["id"] ให้
+    get_working_copy ใช้)"""
+    base_bytes, label_map = get_working_copy(document)
+    return _read_values_from_bytes(base_bytes, label_map)
 
-    labels: list [{"label":, "value":, "is_formula":, "not_computable":}, ...] ตามลำดับใน label_map
+
+def _read_values_from_bytes(base_bytes: bytes, label_map: dict) -> dict:
+    """ส่วนคำนวณจริงของ read_document_values ที่ไม่ต้องพึ่ง "เอกสาร" (EditableDocument)/get_working_copy เลย ใช้
+    แค่ (bytes, label_map) ตรงๆ — ดู docstring เดิมของ read_document_values สำหรับรูปแบบผลลัพธ์:
+
+    labels: list [{"label":, "value":, "is_formula":, "not_computable":}, ...] ตามลำดับใน label_map label ที่
+    เซลล์เป็นสูตรและคำนวณไม่ได้ (เช่น BAHTTEXT ที่ pycel ไม่รองรับ — ดู _recalculate_formula_values) ได้ value
+    เป็น None พร้อม not_computable=True แทนที่จะ error หรือปล่อยค่าที่ผิดเงียบๆ ออกไป
     tables: list [{"sheet":, "header_row":, "first_row":, "last_row":, "capacity":, "empty_row_count":,
     "rows": [{"row":, "values": {no,description,qty,unit,unit_price,amount}, "amount_is_formula":,
     "not_computable":}]}] เฉพาะชีตที่มีตารางรายการจริง (ดู _detect_item_table) — rows ไม่รวมแถวที่ is_empty
     (กรองออกให้แล้ว นับจำนวนแยกไว้ที่ empty_row_count) capacity = last_row - first_row + 1 (ความจุทั้งหมดของ
     ตาราง ไม่ใช่แค่แถวที่มีเนื้อหา)"""
-    base_bytes, label_map = get_working_copy(document)
-
     labels = []
     for label, info in label_map.items():
         is_formula = _is_label_cell_formula(base_bytes, info)
@@ -10037,6 +10554,11 @@ async def import_library_files(
             if identity["customer_code"]:
                 upsert_customer(identity["customer_code"], identity["customer_name"])
 
+            # สร้างบัตรค้นหาให้ไฟล์นี้ทันที (ดู build_library_search_card/search_library) ให้ค้นเจอได้ทันทีที่
+            # import เสร็จ ไม่ต้องรอ backfill ตอน startup รอบถัดไป — ล้มเหลวไม่ทำให้การ import ทั้งไฟล์นี้ล้มไป
+            # ด้วย (save_library_search_card กลืน exception ของตัวเองอยู่แล้ว)
+            save_library_search_card(file_id)
+
             results.append({"filename": filename, "ok": True, "file_id": file_id, "summary": summary})
 
         except Exception as e:
@@ -10113,6 +10635,9 @@ def update_library_file_meta_endpoint(file_id: int, body: LibraryFileMetaUpdate,
     if customer_code:
         upsert_customer(customer_code, customer_name)
 
+    # ข้อมูลระบุตัวตนเปลี่ยน -> บัตรค้นหาต้องอัปเดตตาม (ดู build_library_search_card/search_library)
+    save_library_search_card(file_id)
+
     return {"status": "updated"}
 
 
@@ -10169,6 +10694,7 @@ def generate_library_file_meta_endpoint(body: LibraryMetaGenerateRequest, _: boo
         )
         if identity["customer_code"]:
             upsert_customer(identity["customer_code"], identity["customer_name"])
+        save_library_search_card(file_id)
 
         results.append({"file_id": file_id, "filename": file_row["filename"], "ok": True, **identity})
 
