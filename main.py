@@ -10133,7 +10133,7 @@ def _dispatch_router_clarification(route: dict, chat_id: int) -> Optional[dict]:
     question = route.get("clarification_question")
     if not isinstance(question, str) or not question.strip():
         return None
-    if _is_router_clarification_fresh(chat_id):
+    if chat_id is not None and _is_router_clarification_fresh(chat_id):
         print(f"[Router] chat={chat_id} branch=clarification_repeat_blocked")
         return None
 
@@ -10143,7 +10143,8 @@ def _dispatch_router_clarification(route: dict, chat_id: int) -> Optional[dict]:
     elif _looks_like_fabricated_edit_claim(safe_question):
         safe_question = "ขอรายละเอียดเพิ่มเติมอีกนิดได้ไหมครับ ยังไม่แน่ใจว่าหมายถึงอะไรครับ"
 
-    set_chat_router_clarification_flag(chat_id)
+    if chat_id is not None:
+        set_chat_router_clarification_flag(chat_id)
     return {"document_id": None, "answer": safe_question}
 
 
