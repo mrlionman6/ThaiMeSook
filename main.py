@@ -71,6 +71,7 @@ from db import (
     get_latest_document_version,
     get_second_latest_document_version,
     create_document_version,
+    update_document_version_change_summary,
     link_edit_log_to_version,
     delete_latest_document_version,
     StorageNotConfiguredError,
@@ -2377,6 +2378,9 @@ def execute_get_document_download_link(tool_input: dict, user_id: int, chat_id: 
     }
 
 
+_COMPOUND_GROUP_MARKER_RE = re.compile(r"^__compound_group__:(\d+)$")
+
+
 def undo_last_edit(document_id: int, user_id: int) -> dict:
     """ย้อนการแก้ล่าสุดของไฟล์นี้กลับ — ลบเวอร์ชันล่าสุดทิ้ง (พร้อมประวัติการแก้ของเวอร์ชันนั้น ดู
     delete_latest_document_version) ไฟล์กลับไปอยู่ที่เวอร์ชันก่อนหน้าโดยอัตโนมัติ (หรือต้นฉบับถ้าไม่มีเวอร์ชัน
@@ -2384,8 +2388,11 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
     เก่าเลยสักไบต์เดียว คืน dict เสมอ ไม่ raise เลย รูปแบบเดียวกับ _match_and_apply_excel_edit
     ({"matched": True/False, "message": ...}) ตรวจ ownership ผ่าน get_editable_document() ก่อนเสมอ
 
-    ข้อความยืนยันบอกช่องที่ค่าเปลี่ยนกลับ โดยเทียบ label_map ของเวอร์ชันที่เพิ่งลบไป กับ label_map ของสถานะ
-    ปัจจุบันหลังย้อน (เวอร์ชันก่อนหน้า หรือต้นฉบับ) ตรงๆ ไม่พึ่งประวัติ document_edit_log เลย (เพราะช่อง
+    change_summary ของเวอร์ชันล่าสุดเป็น "__compound_group__:N" (ดู compound_edits.apply_compound_edit) -> ย้อน
+    ทีเดียว N เวอร์ชัน (คำสั่งผสมที่สร้างหลายเวอร์ชันในเทิร์นเดียว ต้อง undo ครั้งเดียวจบ ไม่ใช่ย้อนทีละขั้น)
+
+    ข้อความยืนยันบอกช่องที่ค่าเปลี่ยนกลับ โดยเทียบ label_map ของเวอร์ชันล่าสุดที่เพิ่งลบไป กับ label_map ของสถานะ
+    ปัจจุบันหลังย้อนครบทุกเวอร์ชันในกลุ่มแล้ว ไม่พึ่งประวัติ document_edit_log เลย (เพราะช่อง
     ผลข้างเคียงจากสูตรไม่ถูกบันทึกเป็นประวัติอีกต่อไป — ดู _match_and_apply_excel_edit)"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
@@ -2394,6 +2401,15 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
     deleted = delete_latest_document_version(document_id)
     if deleted is None:
         return {"matched": False, "message": f"ไม่มีประวัติการแก้ไขของไฟล์ '{doc['filename']}' ให้ย้อนกลับครับ"}
+
+    steps_undone = 1
+    group_match = _COMPOUND_GROUP_MARKER_RE.match(deleted.get("change_summary") or "")
+    if group_match:
+        for _ in range(int(group_match.group(1)) - 1):
+            extra = delete_latest_document_version(document_id)
+            if extra is None:
+                break
+            steps_undone += 1
 
     if doc.get("chat_id"):
         set_chat_document_focus(doc["chat_id"], document_id)
@@ -2406,6 +2422,8 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
         and not _cell_values_equal(deleted_label_map[lbl]["current_value"], current_label_map[lbl]["current_value"])
     ]
 
+    steps_note = f"ย้อนคำสั่งผสมล่าสุดทั้งหมด {steps_undone} ขั้นตอนแล้วครับ\n\n" if steps_undone > 1 else ""
+
     if not changed_labels:
         # เวอร์ชันที่ลบไปไม่มีช่องไหนค่าต่างจากสถานะปัจจุบันเลย (ไม่ควรเกิดในทางปฏิบัติ) ยังถือว่าย้อนสำเร็จ
         # (ไฟล์กลับเวอร์ชันก่อนหน้าแล้วจริง) แค่ไม่มีรายละเอียดระดับ label ให้บอก
@@ -2414,14 +2432,14 @@ def undo_last_edit(document_id: int, user_id: int) -> dict:
             "label": None,
             "old_value": None,
             "new_value": None,
-            "message": f"ย้อนไฟล์ '{doc['filename']}' กลับเวอร์ชันก่อนหน้าแล้วครับ",
+            "message": steps_note + f"ย้อนไฟล์ '{doc['filename']}' กลับเวอร์ชันก่อนหน้าแล้วครับ",
         }
 
     # อาจมีหลาย label เปลี่ยนกลับพร้อมกัน (label หลักที่แก้ตรงๆ + label สูตรอื่นที่เปลี่ยนตาม — ดู
     # _match_and_apply_excel_edit) บอกรายละเอียดไม่เกิน 3 รายการเหมือนข้อความยืนยันตอนแก้
     primary = changed_labels[0]
     primary_new_value = current_label_map[primary]["current_value"]
-    message = f"ย้อนการแก้ '{primary}' ในไฟล์ '{doc['filename']}' กลับเป็น '{primary_new_value}' แล้ว"
+    message = steps_note + f"ย้อนการแก้ '{primary}' ในไฟล์ '{doc['filename']}' กลับเป็น '{primary_new_value}' แล้ว"
     extra_labels = changed_labels[1:4]
     if extra_labels:
         extra_lines = [f"{lbl}กลับเป็น {current_label_map[lbl]['current_value']}" for lbl in extra_labels]
@@ -2514,21 +2532,26 @@ def execute_add_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict
     return apply_add_table_item(doc["id"], user_id, tool_input.get("fields") or {})
 
 
-_UNDO_COMMAND_TEXTS = ("ย้อนกลับ", "ย้อนการแก้", "ย้อน", "ยกเลิกการแก้", "ยกเลิกล่าสุด", "เอาคืน", "undo")
-_UNDO_COMMAND_MAX_TOKENS = 4
+_UNDO_COMMAND_TEXTS = (
+    "ย้อนกลับ", "ย้อนการแก้", "ย้อนการแก้ไข", "ย้อนการแก้ล่าสุด",
+    "ยกเลิกการแก้", "ยกเลิกการแก้ล่าสุด", "เอาคืน", "undo",
+)
+_UNDO_TRAILING_PARTICLE_RE = re.compile(r"[\s.]*(?:ครับ|ค่ะ|คะ|นะ|หน่อย|ให้|ที|เลย)+[\s.]*$")
+_UNDO_QUESTION_MARKERS = ("ไหม", "มั้ย", "อย่างไร", "ยังไง", "หรือเปล่า", "หรือไม่", "?")
 
 
 def _is_undo_command(query: str) -> bool:
-    """True ถ้ามีคำสั่งย้อนการแก้ (ดู _UNDO_COMMAND_TEXTS) และข้อความสั้น (≤4 token) หรือมีคำว่า "แก้"/"ไฟล์"
-    ประกอบ — กันจับผิดข้อความยาวที่บังเอิญมีคำว่า "ย้อน" ปนอยู่ (เช่น "ย้อนกลับไปดูกฎหมายมาตรา 10")"""
+    """undo ลบ version ถาวร ต้องเข้มงวด: ตัดคำลงท้ายสุภาพ/คำเติมออกก่อนแล้วต้องตรงวลี undo ทั้งข้อความเป๊ะ
+    (ไม่ใช่ substring) มีคำเชิงคำถามปนมา -> False เสมอ ไม่ตรงเป๊ะ -> ปล่อยให้ router intent "undo" ตัดสินแทน"""
     normalized = _normalize_thai_typos(query.strip())
-    lowered = normalized.lower()
-    if not any(word in lowered for word in _UNDO_COMMAND_TEXTS):
+    if any(marker in normalized for marker in _UNDO_QUESTION_MARKERS):
         return False
-    if "แก้" in lowered or "ไฟล์" in lowered:
-        return True
-    tokens = word_tokenize(normalized, engine="newmm")
-    return len(tokens) <= _UNDO_COMMAND_MAX_TOKENS
+    cleaned = normalized
+    previous = None
+    while previous != cleaned:
+        previous = cleaned
+        cleaned = _UNDO_TRAILING_PARTICLE_RE.sub("", cleaned).strip()
+    return cleaned.lower() in _UNDO_COMMAND_TEXTS
 
 
 # คำสั่ง export บทสนทนาเป็นไฟล์ — เช็คแบบ substring ไม่สนตัวพิมพ์เล็กใหญ่ (ไม่ใช่เทียบเป๊ะเหมือน
@@ -10096,8 +10119,10 @@ ROUTER_SYSTEM_PROMPT = (
     "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
     "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
     "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
-    "- undo: ขอยกเลิก/ย้อนการแก้ไฟล์ครั้งล่าสุด เช่น \"ย้อนกลับ\", \"ยกเลิกการแก้ล่าสุด\", \"เอาคืน\" (คำสั้นๆ แบบนี้"
-    "ปกติถูกจับด้วยโค้ดก่อนถึงตานี้อยู่แล้ว — ใช้ intent นี้เป็นทางสำรองสำหรับคำพูดแบบอื่นที่สื่อความหมายเดียวกัน)\n"
+    "- undo: ขอยกเลิก/ย้อนการแก้ \"ไฟล์ที่เปิดอยู่ในแชทนี้\" เท่านั้น เช่น \"ย้อนกลับ\", \"เอาคืนให้หน่อย\" (คำสั้นๆ"
+    "แบบนี้ปกติถูกจับด้วยโค้ดก่อนถึงตานี้อยู่แล้ว — ใช้ intent นี้เป็นทางสำรองสำหรับคำพูดแบบอื่นที่สื่อความหมาย"
+    "เดียวกัน) คำถามเกี่ยวกับการยกเลิก/แก้ไขสัญญา/เอกสารทางกฎหมายทั่วไป (ไม่ใช่ไฟล์ที่เปิดอยู่) เช่น \"ยกเลิกการแก้ไข"
+    "สัญญาต้องทำอย่างไร\" = legal_question ไม่ใช่ undo\n"
     "- ask_clarification: สถานการณ์กำกวมจริงๆ (ดูหลักตัดสินด้านบน) จนตัดสิน intent อื่นไม่ได้อย่างมั่นใจ (เช่นมี"
     "อุปกรณ์ประเภทเดียวกันหลายรายการในตารางไม่รู้ว่าหมายถึงอันไหน) — ใส่ confidence เป็น low และเขียน clarification_"
     "question พูดกับผู้ใช้โดยตรงเหมือนคุยกันเอง ห้ามใช้คำว่า \"ผู้ใช้\"/\"ท่าน\" เรียกผู้ใช้ ห้ามเล่าว่าผู้ใช้พิมพ์"

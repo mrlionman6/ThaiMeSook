@@ -131,7 +131,8 @@ WANTED_MAIN_CONSTS = {
     "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS",
     "_PENDING_QUEUE_COMMAND_TRAILING_WORDS", "_PENDING_QUEUE_NEGATION_RE",
     "_OPEN_COMMAND_QUESTION_WORDS",
-    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE", "_UNDO_COMMAND_TEXTS", "_UNDO_COMMAND_MAX_TOKENS",
+    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE", "_UNDO_COMMAND_TEXTS", "_UNDO_TRAILING_PARTICLE_RE",
+    "_UNDO_QUESTION_MARKERS", "_COMPOUND_GROUP_MARKER_RE",
     "_STRUCTURAL_DIRECT_DELETE_RE", "_STRUCTURAL_DIRECT_RATE_RE",
     "_STRUCTURAL_CLAUSE_SPLIT_RE", "_STRUCTURAL_ITEM_NO_TARGET_RE",
     "_STRUCTURAL_DIRECT_FIELD_RE", "_STRUCTURAL_FIELD_NAME_MAP", "_STRUCTURAL_DIRECT_DESCRIPTION_RE",
@@ -246,7 +247,9 @@ class _FakeDb:
         if not versions:
             return None
         v = versions[-1]
-        return {"id": v["id"], "file_bytes": v["file_bytes"], "label_map": v["label_map"]}
+        return {
+            "id": v["id"], "version_no": len(versions), "file_bytes": v["file_bytes"], "label_map": v["label_map"],
+        }
 
     def get_second_latest_document_version(self, document_id):
         versions = self.versions.get(document_id, [])
@@ -263,12 +266,22 @@ class _FakeDb:
         })
         return vid
 
+    def update_document_version_change_summary(self, version_id, change_summary):
+        for versions in self.versions.values():
+            for v in versions:
+                if v["id"] == version_id:
+                    v["change_summary"] = change_summary
+                    return
+
     def delete_latest_document_version(self, document_id):
         versions = self.versions.get(document_id, [])
         if not versions:
             return None
         deleted = versions.pop()
-        return {"version_no": len(versions) + 1, "label_map": deleted["label_map"]}
+        return {
+            "version_no": len(versions) + 1, "label_map": deleted["label_map"],
+            "change_summary": deleted.get("change_summary"),
+        }
 
     def link_edit_log_to_version(self, edit_log_id, version_id):
         if edit_log_id in self.edit_logs:
@@ -729,6 +742,7 @@ def build_namespace() -> dict:
         "get_latest_document_version": fake_db.get_latest_document_version,
         "get_second_latest_document_version": fake_db.get_second_latest_document_version,
         "create_document_version": fake_db.create_document_version,
+        "update_document_version_change_summary": fake_db.update_document_version_change_summary,
         "delete_latest_document_version": fake_db.delete_latest_document_version,
         "link_edit_log_to_version": fake_db.link_edit_log_to_version,
         "log_document_edit": fake_db.log_document_edit,

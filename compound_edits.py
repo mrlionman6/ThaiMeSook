@@ -1,9 +1,9 @@
-"""คำสั่งแก้ไฟล์เดียวที่มีหลายคำสั่งย่อยผสมกัน (field_edits/rate_changes/edit_instruction) ต้องได้ใบยืนยัน ✓/✗
-ครบทุกส่วน ไม่หายเงียบ — ไฟล์แยกจาก main.py เพราะต้องใช้ apply_change_rate/_resolve_direct_structural_dispatch/
-_match_and_apply_excel_edit/rag_answer ที่นิยามอยู่ "หลัง" จุด import นี้ในไฟล์นั้นเอง (ดูคอมเมนต์ตรงจุด import)"""
+"""คำสั่งแก้ไฟล์เดียวที่มีหลายคำสั่งย่อยผสมกันต้องได้ใบยืนยันครบทุกส่วน ไม่หายเงียบ และ undo ครั้งเดียวต้องย้อน
+ทั้งคำสั่งถ้าสร้างหลายเวอร์ชัน — ไฟล์แยกจาก main.py เพราะต้องใช้ชื่อที่นิยามอยู่ "หลัง" จุด import นี้ในไฟล์นั้นเอง"""
 from main import (
     apply_change_rate, _resolve_direct_structural_dispatch, _match_and_apply_excel_edit, rag_answer,
-    get_chat_messages, _document_totals_lines, _UNDO_HINT_LINE,
+    get_chat_messages, _document_totals_lines, _UNDO_HINT_LINE, get_latest_document_version,
+    update_document_version_change_summary, _STRUCTURAL_CLAUSE_SPLIT_RE, _STRUCTURAL_DIRECT_RATE_RE,
 )
 from document_fields import apply_field_edits
 
@@ -21,11 +21,24 @@ def _strip_totals_and_undo_tail(message: str) -> str:
     return message
 
 
+def _strip_rate_clauses(edit_instruction: str) -> str:
+    """ตัดประโยคย่อยที่ตรง _STRUCTURAL_DIRECT_RATE_RE (คำสั่งเปลี่ยนอัตรา) ออก — กันเปลี่ยนอัตราซ้ำสองรอบ (rate_
+    changes apply ไปแล้วรอบหนึ่ง edit_instruction ไม่ควรพูดเรื่องเดียวกันซ้ำอีก)"""
+    clauses = _STRUCTURAL_CLAUSE_SPLIT_RE.split(edit_instruction)
+    remaining = [c for c in clauses if c.strip() and not _STRUCTURAL_DIRECT_RATE_RE.search(c)]
+    return " และ ".join(remaining)
+
+
+def _version_no(document_id: int) -> int:
+    latest = get_latest_document_version(document_id)
+    return latest["version_no"] if latest else 0
+
+
 def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int, chat_id: int) -> dict:
-    """apply field_edits -> rate_changes (ผ่าน apply_change_rate เดิม) -> table edits อื่น (edit_instruction) ตาม
-    ลำดับ รวมใบยืนยันทุกส่วนเป็นข้อความเดียว ต่อท้ายด้วยยอดล่าสุด+undo hint ครั้งเดียวรวมทั้งหมด จำนวน sub_commands
-    ที่ router แยกมามากกว่าจำนวนที่ apply/ปฏิเสธไปแล้ว -> ต่อท้าย "✗ ยังไม่ได้ทำ: ..." กันหายเงียบ"""
+    """apply field_edits -> rate_changes -> table edit_instruction ตามลำดับ รวมใบยืนยันเป็นข้อความเดียว sub_
+    commands ที่ไม่มีอะไรทำ -> "✗ ยังไม่ได้ทำ" สร้าง >1 เวอร์ชัน -> ฝัง marker ให้ undo ย้อนทีเดียวทั้งกลุ่ม"""
     document_id = target_doc["id"]
+    version_before = _version_no(document_id)
     receipt_sections: list[str] = []
     accounted = 0
 
@@ -53,6 +66,9 @@ def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int,
 
     edit_instruction = route.get("edit_instruction")
     if isinstance(edit_instruction, str) and edit_instruction.strip():
+        if rate_changes:
+            edit_instruction = _strip_rate_clauses(edit_instruction)
+    if isinstance(edit_instruction, str) and edit_instruction.strip():
         direct = _resolve_direct_structural_dispatch(edit_instruction, [target_doc], chat_id, user_id)
         if direct is not None:
             table_answer = direct["answer"]
@@ -76,6 +92,7 @@ def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int,
             query, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
             structural_route=True, skip_legal_context=False,
         )
+        _mark_compound_group(document_id, version_before)
         return {"document_id": document_id, "answer": answer}
 
     sub_commands = route.get("sub_commands")
@@ -84,5 +101,17 @@ def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int,
             if isinstance(sub_command, str) and sub_command.strip():
                 receipt_sections.append(f"✗ ยังไม่ได้ทำ: {sub_command.strip()}")
 
+    _mark_compound_group(document_id, version_before)
     message_lines = ["\n\n".join(receipt_sections)] + _document_totals_lines(document_id) + ["", _UNDO_HINT_LINE]
     return {"document_id": document_id, "answer": "\n".join(message_lines)}
+
+
+def _mark_compound_group(document_id: int, version_before: int) -> None:
+    """เทิร์นนี้สร้างมากกว่า 1 เวอร์ชัน -> ฝัง "__compound_group__:N" ใน change_summary ของเวอร์ชันสุดท้าย (ไม่
+    แสดงผลที่ไหนเลย — ดู create_new_version) ให้ undo_last_edit() อ่านแล้วย้อนทีเดียวทั้ง N เวอร์ชัน"""
+    latest = get_latest_document_version(document_id)
+    if latest is None:
+        return
+    versions_created = latest["version_no"] - version_before
+    if versions_created > 1:
+        update_document_version_change_summary(latest["id"], f"__compound_group__:{versions_created}")
