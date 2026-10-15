@@ -35,6 +35,8 @@ from rank_bm25 import BM25Okapi
 MAIN_PY = Path(__file__).parent.parent / "main.py"
 DB_PY = Path(__file__).parent.parent / "db.py"
 DOCUMENT_FIELDS_PY = Path(__file__).parent.parent / "document_fields.py"
+LLM_TOOLS_PY = Path(__file__).parent.parent / "llm_tools.py"
+ANSWER_GUARD_PY = Path(__file__).parent.parent / "answer_guard.py"
 
 WANTED_MAIN_FUNCS = {
     "_json_safe_cell_value", "_parse_iso_datetime_like",
@@ -112,6 +114,7 @@ WANTED_MAIN_FUNCS = {
     "_dispatch_router_legal", "_dispatch_router_library_search", "_dispatch_router_clarification",
     "_is_router_clarification_fresh",
     "_resolve_llm_router_dispatch",
+    "_normalize_thai_typos", "_query_has_edit_verb", "_force_structural_edit_dispatch",
 }
 
 WANTED_MAIN_CONSTS = {
@@ -757,9 +760,18 @@ def build_namespace() -> dict:
     main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
     db_tree = ast.parse(DB_PY.read_text(encoding="utf-8"))
     document_fields_tree = ast.parse(DOCUMENT_FIELDS_PY.read_text(encoding="utf-8"))
+    llm_tools_tree = ast.parse(LLM_TOOLS_PY.read_text(encoding="utf-8"))
+    answer_guard_tree = ast.parse(ANSWER_GUARD_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
     _extract_all(document_fields_tree, ns, "document_fields.py")
+    # fix/router-toolchoice-truth-guard: llm_tools.py/answer_guard.py เป็นไฟล์เล็กที่ทุกอย่างในนั้นเกี่ยวข้องกันหมด
+    # เหมือน document_fields.py — ดึงทั้งไฟล์อัตโนมัติด้วย _extract_all เช่นกัน (กันบั๊กเดิมที่เคยเกิด: ดึงแค่
+    # ฟังก์ชัน public แล้วลืมฟังก์ชันช่วยภายใน) ต้องดึง "หลัง" main.py เสมอ เพราะ answer_guard.py อ้างชื่อจาก
+    # main.py (_get_document_version_marker/build_editable_fields/_document_totals_lines/
+    # _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE) เป็น bare global ใน ns เดียวกัน
+    _extract_all(llm_tools_tree, ns, "llm_tools.py")
+    _extract_all(answer_guard_tree, ns, "answer_guard.py")
 
     # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
     # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง

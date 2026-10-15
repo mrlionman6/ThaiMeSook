@@ -154,6 +154,8 @@ import numpy as np
 from starlette.middleware.sessions import SessionMiddleware
 from PIL import Image, ImageDraw, ImageFont
 
+from llm_tools import call_with_required_tool
+
 app = FastAPI()
 app.add_middleware(
     SessionMiddleware,
@@ -2553,6 +2555,23 @@ _DOCUMENT_REFERENCE_KEYWORDS = (
 _DOCUMENT_EDIT_COMMAND_WORDS = ("แก้", "เปลี่ยน", "ลบ", "เพิ่ม", "ใส่", "ปิด", "ย้อน", "แทน")
 
 
+def _normalize_thai_typos(text: str) -> str:
+    """รวม typo ที่พบบ่อยให้เป็นรูปแบบมาตรฐานก่อนเทียบกับ regex/คำสำคัญเกี่ยวกับคำสั่งแก้ไฟล์ "ทุกจุด" เสมอ (จุด
+    เดียว ไม่กระจายไป .replace("เเ","แ") ทีละที่เหมือนเดิม) "เเ" (สระเอซ้ำ พิมพ์ผิดคีย์บอร์ดที่พบบ่อย) -> "แ",
+    "เปลียน" (พิมพ์ขาดไม้เอก) -> "เปลี่ยน" — เหตุการณ์จริงที่แก้: "เปลียนรายการที่ 5 เป็น ..." ไม่ตรง
+    _STRUCTURAL_DIRECT_DESCRIPTION_RE (ต้องการ "เปลี่ยน"/"แก้" เป๊ะ) เลยตกไปให้ agent เขียนคำตอบเอง (รวมถึงแต่ง
+    ตัวเลขยอดใหม่เอง) ทั้งที่ parse ได้ชัดเจนด้วยโค้ดถ้า normalize typo นี้ก่อน"""
+    return text.replace("เเ", "แ").replace("เปลียน", "เปลี่ยน")
+
+
+def _query_has_edit_verb(query: str) -> bool:
+    """True ถ้าข้อความนี้มีคำกริยาแก้ไฟล์ปนมา (ดู _DOCUMENT_EDIT_COMMAND_WORDS) หลัง normalize typo ที่พบบ่อยก่อน
+    เสมอ (ดู _normalize_thai_typos) — ใช้เป็นสัญญาณ "edit_intent" ของ truth_guard (ดู answer_guard.py) และด่าน
+    บังคับเส้นทางแก้ไฟล์ตรงๆ (ดู _force_structural_edit_dispatch) แทนการพึ่งว่า router ตัดสิน intent ถูกไหม"""
+    normalized = _normalize_thai_typos(query.strip())
+    return any(word in normalized for word in _DOCUMENT_EDIT_COMMAND_WORDS)
+
+
 def _is_document_reading_question(query: str) -> bool:
     """เช็คว่าข้อความนี้อ้างถึงเนื้อหา/ค่าของไฟล์ที่เปิดอยู่จริงๆ ไหม (เช่น "มีรายการอะไรบ้าง", "ยอดรวมตอนนี้
     เท่าไร") — ใช้ดักใน ask_question() ก่อนเข้า branch ตัดสินใจของ Excel editor (single/multi-document) เสมอ
@@ -2574,7 +2593,7 @@ def _is_document_reading_question(query: str) -> bool:
     normalize "เเ"→"แ" ก่อนเช็คทุกเงื่อนไขในฟังก์ชันนี้เสมอ "ดู" นับเฉพาะตอนเป็นคำขึ้นต้นของข้อความ (โทเคนแรกจาก
     word_tokenize ตรงกับ "ดู" เป๊ะ) หรือมี "ขอดู"/"ดูรายการ" เท่านั้น ไม่ใช่ substring ของคำอื่น (เช่น "ดูดี" ใน
     ชื่อบริษัท)"""
-    stripped = query.strip().replace("เเ", "แ")
+    stripped = _normalize_thai_typos(query.strip())
     if any(word in stripped for word in _DOCUMENT_EDIT_COMMAND_WORDS):
         return False
     if "คลัง" in stripped:
@@ -2817,6 +2836,7 @@ def _parse_direct_structural_commands(query: str, base_bytes: bytes, label_map: 
     กำกวมเลยสักนิด โค้ดรู้คำตอบได้เองอยู่แล้วโดยไม่ต้องถาม LLM
 
     คืน list ของ parsed command dict (อย่างน้อย 1 รายการ) หรือ None ถ้ามีประโยคย่อยไหนไม่ตรงรูปแบบ/กำกวมเลย"""
+    query = _normalize_thai_typos(query)
     table = _get_single_item_table(base_bytes)
     clauses = [c for c in _STRUCTURAL_CLAUSE_SPLIT_RE.split(query) if c.strip()]
     if not clauses:
@@ -2946,8 +2966,15 @@ def _is_reading_type_question(query: str, active_docs: list[dict], user_id: int,
     — หรือเอ่ยชื่อรายการ/label ที่มีอยู่จริงในไฟล์ตรงๆ — ดู _query_mentions_table_item_or_label) ไม่ว่าจะมีคำเชิง
     กฎหมายปนมาด้วยหรือไม่ก็ตาม (ดู _has_legal_keyword — เช็คแยกต่างหากใน _resolve_document_reading_dispatch) ใช้
     ทั้งเป็นเงื่อนไขของ dispatch นั้น และเป็นเงื่อนไขข้าม single/multi-doc classifier ใน ask_question() ด้วย
-    (คำถามแบบนี้ไม่เข้าพวกไหนใน 4 หมวดของ classifier นั้นเลย ไม่ว่าจะมีคำเชิงกฎหมายปนมาหรือไม่)"""
+    (คำถามแบบนี้ไม่เข้าพวกไหนใน 4 หมวดของ classifier นั้นเลย ไม่ว่าจะมีคำเชิงกฎหมายปนมาหรือไม่)
+
+    มีคำกริยาแก้ไฟล์ปนมา (ดู _query_has_edit_verb — normalize typo "เเ"→"แ" ก่อนเช็คเสมอ) -> False เสมอ แม้
+    _query_mentions_table_item_or_label จะ True ก็ตาม (เหตุการณ์จริงที่แก้: เปิดไฟล์ที่มี label "ที่อยู่" อยู่ ->
+    "ตรงที่อยู่ แก้เลขที่เป็น 32/14" ถูกตีความเป็นคำถามเชิงอ่านเพราะคำว่า "ที่อยู่" ตรง label เป๊ะ ทั้งที่มีคำว่า
+    "แก้" ปนมาด้วย ได้คำตอบแนะนำรูปแบบคำสั่งแทนที่จะพยายามแก้จริง)"""
     if not active_docs:
+        return False
+    if _query_has_edit_verb(query):
         return False
     focus_doc_for_reading = get_chat_document_focus(chat_id, user_id)
     reading_target_doc = focus_doc_for_reading if focus_doc_for_reading else (
@@ -3887,19 +3914,19 @@ def run_agentic_tool_loop(
                 nudge_appended = True
             if verified_source_urls:
                 try:
-                    forced_response = client.messages.create(
-                        model=model or "claude-haiku-4-5-20251001", max_tokens=effective_max_tokens,
-                        system=system_prompt,
-                        tools=tools_for_this_call,
-                        tool_choice={"type": "tool", "name": "present_recommendations"},
-                        messages=messages,
+                    forced_response = call_with_required_tool(
+                        client, model or "claude-haiku-4-5-20251001", effective_max_tokens, system_prompt,
+                        messages, tools_for_this_call, "present_recommendations",
                     )
-                    print(
-                        f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
-                        f"tools=present_recommendations text_len=0{_output_tokens_log_suffix(forced_response)}"
-                    )
-                    tool_use_block = next((b for b in forced_response.content if b.type == "tool_use"), None)
-                    if tool_use_block is not None:
+                    if forced_response is not None:
+                        print(
+                            f"[AgentLoop] iter=forced stop_reason={forced_response.stop_reason} "
+                            f"tools=present_recommendations text_len=0{_output_tokens_log_suffix(forced_response)}"
+                        )
+                        tool_use_block = next(
+                            b for b in forced_response.content
+                            if b.type == "tool_use" and b.name == "present_recommendations"
+                        )
                         present_recommendations_called = True
                         result = _safe_execute_tool(
                             "present_recommendations", execute_present_recommendations,
@@ -3954,13 +3981,13 @@ def run_agentic_tool_loop(
 
     # ไม่มี tool แก้โครงสร้างไฟล์สำเร็จเลยในเทิร์นนี้ (applied_messages ว่างเปล่า — เช็คด้านบนไปแล้ว) แต่ final_text
     # อาจมีบรรทัด "✓"/"✗" ที่ Claude เลียนแบบใบยืนยันของโค้ดแล้วแต่งขึ้นเอง (ดู _strip_fabricated_receipt_lines) —
-    # ตัดทิ้งก่อนเสมอ เหลือแต่ข้อความที่ยังอ้างว่าแก้ไฟล์สำเร็จ/ว่างเปล่า -> ไม่ใช่คำตอบจริง ใช้ fallback แทน
-    stripped_text = _strip_fabricated_receipt_lines(final_text)
-    if stripped_text != final_text.strip():
-        if not stripped_text or _looks_like_fabricated_edit_claim(stripped_text):
-            print(f"[Guard] ai_receipt_line_stripped chat={chat_id}")
-            return _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE, action_receipts, structural_tool_called
-        final_text = stripped_text
+    # ตัดทิ้งเสมอไม่มีเงื่อนไข (ไม่เคยเป็นส่วนหนึ่งของคำตอบที่ Claude เขียนเองจริงๆ) ตัดสินใจว่า final_text ที่เหลือ
+    # "แต่งเรื่องแก้ไฟล์สำเร็จ" ไปแล้วไหม ย้ายไปอยู่ที่ชั้น rag_answer/advisor_answer แทน (เทียบ version จริงของ
+    # เอกสารก่อน/หลังเทิร์น ดู answer_guard.truth_guard) ไม่เดาจากคำพูดแบบเดิมอีกต่อไป (เคยพลาดข้อความแปลกใหม่ที่
+    # ไม่อยู่ใน blacklist คำ เช่น "แก้ไขที่อยู่เรียบร้อยแล้ว ครับ")
+    final_text = _strip_fabricated_receipt_lines(final_text)
+    if not final_text:
+        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
     return final_text, action_receipts, structural_tool_called
 
 
@@ -4569,6 +4596,17 @@ def rag_answer(
     if ctx["early_exit"]:
         return ctx["message"], []
 
+    # fix/router-toolchoice-truth-guard: snapshot version ของทุกไฟล์ที่เปิดอยู่ "ก่อน" เรียก run_agentic_tool_loop
+    # เสมอ (ดู answer_guard.truth_guard — เทียบกับหลังเทิร์นว่ามีไฟล์ไหนแก้จริงไหม แทนการเดาจากคำพูด)
+    active_docs_for_guard = (
+        list_active_editable_documents_by_chat(chat_id, user_id) if (user_id and chat_id) else []
+    )
+    version_before = snapshot_document_versions(active_docs_for_guard)
+    # edit_intent: structural_route (ตัดสินมาแล้วว่าเป็นคำสั่งแก้โครงสร้าง) หรือข้อความมีคำกริยาแก้ไฟล์ปนมาเอง (ดู
+    # _query_has_edit_verb) — ยกเว้นเป็นคำถามเชิงกฎหมาย (ดู _has_legal_keyword) กันคำตอบกฎหมายปกติที่บังเอิญมีคำว่า
+    # "แก้/เปลี่ยน/ลบ/เพิ่ม" ปนมา (เช่น "ต้องยื่นคำขอแล้วรออนุมัติ") โดนบล็อกผิดๆ
+    edit_intent = structural_route or (_query_has_edit_verb(query) and not _has_legal_keyword(query))
+
     raw_answer = ""
     action_receipts: list[str] = []
     structural_tool_called = False
@@ -4583,34 +4621,18 @@ def rag_answer(
     else:
         print("[LanguageGuard] ลองใหม่ครบจำนวนแล้วแต่ยังเจอปัญหา — ส่งคำตอบล่าสุดกลับไปทั้งที่ยังมีปัญหา")
 
-    # ห้าม Claude "แต่ง" ผลการแก้ไฟล์เอง (deterministic guard — ดูส่วน 2 ของ task) จุดที่ 1: เส้นทางนี้ถูกตัดสิน
-    # แล้วว่าเป็นคำสั่งโครงสร้าง แต่ไม่มี structural tool ถูกเรียกเลยในเทิร์นนี้ (Claude เขียนคำตอบเอง เช่น
-    # "Preview ... พิมพ์ยืนยัน" ทั้งที่ไม่ได้เรียก tool ใดๆ เลย)
+    # ห้าม Claude "แต่ง" ผลการแก้ไฟล์เอง — จุดที่ 1: เส้นทางนี้ถูกตัดสินแล้วว่าเป็นคำสั่งโครงสร้าง แต่ไม่มี
+    # structural tool ถูกเรียกเลยในเทิร์นนี้ (สัญญาณแม่นเสมอ ไม่ต้องเดา) จุดที่ 2 (ทุกเส้นทางที่มีเอกสารเปิดอยู่):
+    # ไม่มี action_receipts เลย -> เทียบ version จริงของเอกสารก่อน/หลังเทิร์น (ดู answer_guard.truth_guard) แทนการ
+    # เดาจากคำพูดของ Claude ทั้งหมด (เคยพลาดคำพูดแปลกใหม่ที่ไม่อยู่ใน blacklist คำเดิม)
     if structural_route and not structural_tool_called:
         print(f"[Route] chat={chat_id} branch=structural_no_tool")
         raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
-    else:
-        # จุดที่ 2 (ทุกเส้นทางที่มีเอกสารเปิดอยู่): คำตอบอ้างว่าแก้/เสนอ preview ไปแล้ว (ดู
-        # _looks_like_fabricated_edit_claim) แต่ไม่มี receipt จาก tool ในเทิร์นนี้เลย — เช็คเฉพาะตอนมีเอกสาร
-        # เปิดอยู่จริงเท่านั้น (กันคำว่า "ยืนยัน" ที่เป็นคำปกติในคำตอบกฎหมายทั่วไปโดนเหมาเข่งผิดๆ)
-        has_active_docs = bool(
-            user_id and chat_id and list_active_editable_documents_by_chat(chat_id, user_id)
+    elif not action_receipts:
+        raw_answer = truth_guard(
+            raw_answer, query=query, active_docs=active_docs_for_guard, version_before=version_before,
+            edit_intent=edit_intent, chat_id=chat_id,
         )
-        if has_active_docs and not action_receipts:
-            if structural_route:
-                should_block = _looks_like_fabricated_edit_claim(raw_answer, structural_route=True)
-            else:
-                # เส้นทางทั่วไป (ไม่ใช่คำสั่งแก้โครงสร้าง): คำตอบกฎหมายปกติมักมีกริยา "แก้/เปลี่ยน/ลบ/เพิ่ม" กับ
-                # "แล้ว" ปนอยู่ในประโยคโดยไม่เกี่ยวกับการแก้ไฟล์เลย (เช่น "ต้องยื่นคำขอแล้วรออนุมัติ") — ถ้าคำถาม
-                # เป็นคำถามเชิงกฎหมาย (ดู _has_legal_keyword) ให้ข้าม guard นี้ไปเลย ไม่เสี่ยงบล็อกคำตอบกฎหมายที่
-                # ถูกต้องผิดๆ (ไม่ใช้ ctx["top_chunks"] เป็นเงื่อนไขร่วม — rerank_with_scores คืน top_k=5 เสมอใน
-                # production ไม่มี threshold กรองทิ้ง ทำให้ไม่ว่างแทบทุกครั้งอยู่แล้ว ไม่ได้แปลว่าคำตอบมาจาก RAG
-                # จริงๆ — regex ด้านล่างแคบพอแล้วที่จะพึ่งมันอย่างเดียวได้)
-                is_legal_answer = _has_legal_keyword(query)
-                should_block = not is_legal_answer and _looks_like_fabricated_edit_claim(raw_answer, structural_route=False)
-            if should_block:
-                print(f"[Guard] fabricated_edit_claim_blocked chat={chat_id}")
-                raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
 
     # log confidence ด้วยคำตอบดิบของ Claude เท่านั้น (ไม่ปนใบยืนยันจากโค้ด) กันตัวชี้วัดความมั่นใจเพี้ยน
     _log_if_low_confidence(query, raw_answer, ctx["top_chunks"], ctx["scores"])
@@ -5068,11 +5090,21 @@ def advisor_answer(
     # เงื่อนไข user_id/chat_id แบบที่ AVAILABLE_TOOLS+LIBRARY_TOOLS+CHAT_DOCUMENT_TOOLS ทำใน run_agentic_tool_
     # loop ปกติ เพราะเส้นทางนี้ใช้ tools_override เสมอ ต้องเช็คเองตรงนี้)
     advisor_tools = ADVISOR_TOOLS + ([SEARCH_LIBRARY_TOOL] if (user_id and chat_id) else [])
-    raw_answer, _action_receipts, _structural = run_agentic_tool_loop(
+    # fix/router-toolchoice-truth-guard: เส้นทางนี้ไม่มีเครื่องมือแก้ไฟล์เลยสักตัว (ดู docstring ด้านบน) — ถ้าผู้ใช้
+    # สั่งแก้ไฟล์ (edit_intent) แต่หลุดมาทางนี้ (เช่น router เลือก intent ผิด/ล้มแล้ว fallback) Claude ไม่มีทางแก้
+    # ไฟล์จริงได้เลย ต้องเช็คด้วย version จริงเหมือน rag_answer ทุกประการ (ดู answer_guard.truth_guard)
+    version_before = snapshot_document_versions(active_docs)
+    edit_intent = _query_has_edit_verb(query) and not _has_legal_keyword(query)
+    raw_answer, action_receipts, _structural = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
         tools_override=advisor_tools, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
         max_tokens=ADVISOR_MAX_TOKENS,
     )
+    if not action_receipts:
+        raw_answer = truth_guard(
+            raw_answer, query=query, active_docs=active_docs, version_before=version_before,
+            edit_intent=edit_intent, chat_id=chat_id,
+        )
     answer = _normalize_polite_particles(raw_answer)
     # offer_line อาจถูกต่อท้ายไปแล้วจาก _render_recommendations_answer (ตอน Claude เรียก present_recommendations
     # สำเร็จ) ไม่ต่อซ้ำอีกรอบถ้าเจอข้อความเดิมอยู่แล้ว (เช็คจากเนื้อหาคงที่ ไม่ใช่ flag แยก — ง่ายกว่าและปลอดภัย
@@ -5684,6 +5716,39 @@ async def ask_question(
                 return _ask_question_api_error_response(e, chat_id)
             if router_dispatch is not None:
                 answer = router_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            # router ล้ม (เช่น tool_choice ไม่รองรับ/API error ชั่วคราวอื่นๆ) หรือค่าไม่ผ่านการตรวจ -> ลองทางสำรอง
+            # ด้วยโค้ด+LLM เดิมก่อนปล่อยตกไปทาง reading_question/single-doc classifier ซึ่งไม่มี tool แก้ไฟล์เลย
+            # (ดู fix/router-toolchoice-truth-guard — เหตุการณ์จริงที่แก้: router ล้มทุกข้อความเพราะ tool_choice
+            # ไม่รองรับใน ROUTER_MODEL บางรุ่น ทำให้คำสั่งแก้ไฟล์ทุกคำสั่งหลุดไปให้ Claude เขียนคำตอบเองทั้งที่ไม่มี
+            # tool แก้ไฟล์ในเส้นทางที่หลุดไปถึง) ลองเชื่อมคำแนะนำเข้าไฟล์ก่อน (ครอบคลุม regex + #36 LLM fallback —
+            # allow_llm_fallback=True ต่างจากตอนเรียกก่อน router ด้านบน) แล้วค่อยลองคำสั่งแก้ไฟล์ทั่วไปถ้าข้อความมี
+            # คำกริยาแก้ไฟล์ปนมา (ดู _query_has_edit_verb/_force_structural_edit_dispatch)
+            fallback_recommendation_dispatch = _resolve_recommendation_command_dispatch(
+                query, active_docs, chat_id, user_id, allow_llm_fallback=True,
+            )
+            if fallback_recommendation_dispatch is not None:
+                print(
+                    f"[Route] chat={chat_id} branch=recommendation_fallback_after_router_failure "
+                    f"active_doc={fallback_recommendation_dispatch['document_id']}"
+                )
+                answer = fallback_recommendation_dispatch["answer"]
+                add_chat_message(chat_id, "user", query)
+                add_chat_message(chat_id, "assistant", answer)
+                touch_chat_session(chat_id)
+                return {"answer": answer, "sources": [], "chat_id": chat_id}
+
+            if active_docs and _query_has_edit_verb(query):
+                forced_edit_dispatch = _force_structural_edit_dispatch(query, active_docs, chat_id, user_id)
+                print(
+                    f"[Route] chat={chat_id} branch=structural_forced_after_router_failure "
+                    f"active_doc={forced_edit_dispatch['document_id']}"
+                )
+                answer = forced_edit_dispatch["answer"]
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -9293,6 +9358,10 @@ _UNDO_HINT_LINE = "พิมพ์ 'ย้อนการแก้' ถ้าต
 # จะวน circular import (document_fields import ชื่อที่ main.py ยังไม่ทันนิยามเลย)
 from document_fields import build_editable_fields, apply_field_edits
 
+# fix/router-toolchoice-truth-guard: answer_guard.py ต้อง import ที่นี่เหมือนกัน (ไม่ใช่หัวไฟล์) — ต้องการ
+# _get_document_version_marker/_document_totals_lines/_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE (นิยามไว้ข้างบนแล้ว)
+# และ build_editable_fields (เพิ่งนิยามชื่อนี้ที่บรรทัดบนสุดนี้เอง) เหตุผล circular import เดียวกับ document_fields
+from answer_guard import snapshot_document_versions, truth_guard
 
 def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: list[dict]) -> str:
     """apply คำสั่งแก้โครงสร้างที่ parse ได้จากข้อความเดียว (ดู _parse_direct_structural_commands — อาจมีมากกว่า
@@ -9536,10 +9605,10 @@ _RECOMMENDATION_INTENT_VERBS = ("แทน", "เปลี่ยน", "ใส่
 
 
 def _normalize_recommendation_intent_text(query: str) -> str:
-    """normalize "เเ" (สระเอ+สระเอ พิมพ์ผิดคีย์บอร์ดที่พบบ่อย) เป็น "แ" (สระแอตัวเดียวที่ถูกต้อง) ก่อนเช็คคำกริยา —
-    เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์ "เเทน" (ขึ้นต้นด้วยสระเอซ้ำ) ไม่ตรงกับคำว่า "แทน" ใน
+    """normalize typo ที่พบบ่อยก่อนเช็คคำกริยาเสมอ (ดู _normalize_thai_typos — จุดเดียวใช้ร่วมกับ regex/เช็คคำ
+    อื่นทุกจุดในไฟล์นี้) เหตุการณ์จริงที่แก้: ผู้ใช้พิมพ์ "เเทน" (ขึ้นต้นด้วยสระเอซ้ำ) ไม่ตรงกับคำว่า "แทน" ใน
     _RECOMMENDATION_INTENT_VERBS เป๊ะเลย ทั้งที่เจตนาเดียวกัน"""
-    return query.replace("เเ", "แ")
+    return _normalize_thai_typos(query)
 
 
 def _query_has_recommendation_intent_verb(query: str) -> bool:
@@ -9681,13 +9750,10 @@ def _resolve_recommendation_intent_with_llm(
     )
 
     try:
-        response = client.messages.create(
-            model=ADVISOR_MODEL,
-            max_tokens=1000,
-            system=_RECOMMENDATION_INTENT_SYSTEM_PROMPT,
-            tools=[RESOLVE_RECOMMENDATION_ACTION_TOOL],
-            tool_choice={"type": "tool", "name": "resolve_recommendation_action"},
-            messages=[{"role": "user", "content": prompt}],
+        response = call_with_required_tool(
+            client, ADVISOR_MODEL, 1000, _RECOMMENDATION_INTENT_SYSTEM_PROMPT,
+            [{"role": "user", "content": prompt}], [RESOLVE_RECOMMENDATION_ACTION_TOOL],
+            "resolve_recommendation_action",
         )
     except Exception as e:
         print(
@@ -9695,10 +9761,11 @@ def _resolve_recommendation_intent_with_llm(
             f"status={getattr(e, 'status_code', None)} message={str(e)[:300]!r}"
         )
         return None
-
-    tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
-    if tool_use_block is None:
+    if response is None:
+        print("[RecommendationResolver] llm_call_failed reason=no_tool_use")
         return None
+
+    tool_use_block = next(b for b in response.content if b.type == "tool_use" and b.name == "resolve_recommendation_action")
     parsed = tool_use_block.input
     action = parsed.get("action")
     target_item_index = parsed.get("target_item_index")
@@ -10126,24 +10193,21 @@ def route_intent_with_llm(
     )
 
     try:
-        response = client.messages.create(
-            model=ROUTER_MODEL,
-            max_tokens=800,
-            system=ROUTER_SYSTEM_PROMPT,
-            tools=[ROUTE_INTENT_TOOL],
-            tool_choice={"type": "tool", "name": "route_intent"},
-            messages=[{"role": "user", "content": prompt}],
+        response = call_with_required_tool(
+            client, ROUTER_MODEL, 800, ROUTER_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
+            [ROUTE_INTENT_TOOL], "route_intent",
         )
     except Exception as e:
         print(
             f"[Router] llm_call_failed exception_type={type(e).__name__} "
-            f"status={getattr(e, 'status_code', None)} message={str(e)[:300]!r}"
+            f"status={getattr(e, 'status_code', None)} message={str(e)[:300]!r} reason={type(e).__name__}"
         )
         return None
-
-    tool_use_block = next((b for b in response.content if b.type == "tool_use"), None)
-    if tool_use_block is None:
+    if response is None:
+        print("[Router] llm_call_failed reason=no_tool_use")
         return None
+
+    tool_use_block = next(b for b in response.content if b.type == "tool_use" and b.name == "route_intent")
     parsed = tool_use_block.input
     if not isinstance(parsed, dict) or not isinstance(parsed.get("intent"), str):
         return None
@@ -10165,9 +10229,11 @@ def _dispatch_router_edit_document(route: dict, target_doc: dict, query: str, us
     ก่อนเสมอ คืนผลนั้นตรงๆ ไม่ลองทางอื่นต่อ (router เลือก field_id จากรายการช่องที่แก้ได้มาแล้ว ไม่ใช่ข้อความดิบที่
     ต้อง parse เดาอีกที) ไม่มี field_edits -> ทางเดิม: ลอง _resolve_direct_structural_dispatch กับ edit_instruction
     (ประโยคคำสั่งที่ router เขียนให้ชัดเจนขึ้นแล้ว — ไม่ใช่ query ดิบของผู้ใช้) ก่อนเสมอ — parse ได้และ apply จริง
-    ไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน regex ตรงนี้จะ parse ได้) -> ส่งเส้นทาง structural/agent เดิมต่อ
-    (reuse rag_answer(structural_route=True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน
-    query เดิม (ให้ agent เห็นคำสั่งที่ชัดเจนกว่า)"""
+    ไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน regex ตรงนี้จะ parse ได้) -> ลอง _match_and_apply_excel_edit
+    (ตัวจับคู่ label เดี่ยวเดิม ใช้ LLM แค่จับคู่ label แต่ apply/เขียนข้อความยืนยันด้วยโค้ด ไม่ให้ LLM เขียนคำตอบ
+    เอง) ก่อนเสมอด้วย ยังไม่ match อีก -> ส่งเส้นทาง structural/agent เดิมต่อ (reuse rag_answer(structural_route=
+    True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน query เดิม (ให้ agent เห็นคำสั่งที่
+    ชัดเจนกว่า)"""
     field_edits = route.get("field_edits")
     if isinstance(field_edits, list) and field_edits:
         result = apply_field_edits(target_doc["id"], user_id, field_edits)
@@ -10179,12 +10245,44 @@ def _dispatch_router_edit_document(route: dict, target_doc: dict, query: str, us
     direct = _resolve_direct_structural_dispatch(edit_instruction, [target_doc], chat_id, user_id)
     if direct is not None:
         return direct
+    matcher_result = _match_and_apply_excel_edit(target_doc["id"], user_id, edit_instruction)
+    if matcher_result.get("matched"):
+        return {"document_id": target_doc["id"], "answer": matcher_result["message"]}
     history = get_chat_messages(chat_id) if chat_id else []
     answer, _sources = rag_answer(
         edit_instruction, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
         structural_route=True, skip_legal_context=False,
     )
     return {"document_id": target_doc["id"], "answer": answer}
+
+
+def _force_structural_edit_dispatch(query: str, active_docs: list[dict], chat_id: int, user_id: int) -> dict:
+    """ข้อความมีคำกริยาแก้ไฟล์ชัดเจน (ดู _query_has_edit_verb) ขณะมีไฟล์เปิดอยู่ แต่ router ไม่ได้ dispatch ให้เลย
+    (ล้ม/คืนค่าไม่ผ่านการตรวจ) — เรียกจาก ask_question() เฉพาะตอนนี้เท่านั้น บังคับให้ยังเป็นเส้นทางที่ "มี tool
+    แก้ไฟล์จริง" เสมอ ห้ามตกไป library/reading_question/single-doc classifier ที่ไม่มี tool แก้ไฟล์เลย (เหตุการณ์
+    จริงที่แก้: route_intent_with_llm ล้มเพราะ tool_choice ไม่รองรับ -> ตกไปถึง single_doc_classifier -> ตีความ
+    เป็นคำถามอื่น -> advisor_answer ไม่มี tool แก้ไฟล์ -> Claude แต่งคำตอบว่าแก้แล้วเอง) ลอง
+    _resolve_direct_structural_dispatch (regex ตรงไปตรงมา) -> _match_and_apply_excel_edit (จับคู่ label เดี่ยว) ->
+    สุดท้าย agent (rag_answer(structural_route=True) ซึ่งมี tool change_rate/update_table_item/
+    delete_table_item/add_table_item/edit_chat_document อยู่แล้ว) คืน dict เสมอ ไม่คืน None (ต่างจาก dispatch
+    อื่นๆ ในไฟล์นี้ — ที่นี่ไม่มีทาง fallback ต่อแล้ว)"""
+    direct = _resolve_direct_structural_dispatch(query, active_docs, chat_id, user_id)
+    if direct is not None:
+        return direct
+
+    focus_doc = get_chat_document_focus(chat_id, user_id)
+    target_doc = focus_doc if focus_doc else (active_docs[0] if len(active_docs) == 1 else None)
+    if target_doc is not None:
+        result = _match_and_apply_excel_edit(target_doc["id"], user_id, query)
+        if result.get("matched"):
+            return {"document_id": target_doc["id"], "answer": result["message"]}
+
+    history = get_chat_messages(chat_id) if chat_id else []
+    answer, _sources = rag_answer(
+        query, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
+        structural_route=True, skip_legal_context=False,
+    )
+    return {"document_id": target_doc["id"] if target_doc else None, "answer": answer}
 
 
 def _dispatch_router_recommendation_action(
@@ -10321,9 +10419,16 @@ def _resolve_llm_router_dispatch(
 
     intent = route.get("intent")
     confidence = route.get("confidence")
+    route_field_edits = route.get("field_edits")
+    field_edits_count = len(route_field_edits) if isinstance(route_field_edits, list) else 0
+    field_ids = (
+        [f.get("field_id") for f in route_field_edits if isinstance(f, dict)]
+        if isinstance(route_field_edits, list) else []
+    )
     print(
         f"[Router] chat={chat_id} intent={intent} confidence={confidence} "
-        f"target={route.get('target_item_index')} rec={route.get('recommendation_index')} fallback=False "
+        f"target={route.get('target_item_index')} rec={route.get('recommendation_index')} "
+        f"field_edits={field_edits_count} field_ids={field_ids} fallback=False "
         f"latency_ms={latency_ms}"
     )
 
@@ -10437,20 +10542,20 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
             "message": f"'{label}': {coerce_error} — กรุณาระบุค่าที่ถูกต้องสำหรับช่องนี้ครับ",
         }
 
-    # เช็คว่าเซลล์เดิม (ในสำเนาทำงานปัจจุบัน) เป็นสูตรคำนวณไหม "ก่อน" เขียนทับ — ยังแก้ได้ตามปกติเสมอ แค่เตือน
-    # ต่อท้ายข้อความยืนยันถ้าใช่ (เซลล์จะกลายเป็นค่าคงที่ถาวรในเวอร์ชันใหม่ ไม่คำนวณอัตโนมัติอีกต่อไปจนกว่าจะ
-    # ย้อนการแก้กลับไปเวอร์ชันก่อนหน้า)
+    # เช็คว่าเซลล์เป้าหมาย (ในสำเนาทำงานปัจจุบัน) เป็นสูตรคำนวณไหม "ก่อน" เขียนทับเสมอ — ห้ามเขียนทับเงียบๆ
+    # เด็ดขาดไม่ว่ากรณีไหน (ต่างจากเดิมที่แค่เตือนแล้วยอมให้เขียนทับ — เหตุการณ์จริงที่แก้: "แก้รวมเงินเป็น 50,000"
+    # เขียนทับสูตร SUM กลายเป็นค่าคงที่ถาวรโดยไม่มีใครเตือนก่อนจริงจัง) ตัวจับคู่นี้ไม่มีขั้น preview/ยืนยันเหมือน
+    # change_rate เลย — ฟิลด์สูตรทุกแบบ (ไม่ว่าจะเป็นอัตรา/ผลรวม/ยอดรวม) ต้องปฏิเสธเสมอ ข้อความอัตรา (มี label
+    # ชื่อมี "%" + สูตรตรงกับ _RATE_FORMULA_PATTERNS) แนะนำ change_rate ต่อ ส่วนสูตรอื่น (เช่น SUM ยอดรวม) ปฏิเสธ
+    # เฉยๆ (ไม่มีคำสั่งแก้ตรงให้ใช้แทน — ค่าคำนวณจากรายการในตารางเสมอ)
     was_formula = _is_label_cell_formula(base_bytes, target_info)
-
-    # ด่านป้องกันสุดท้าย (safety net) — ถ้าเซลล์เป้าหมายเป็นสูตรคำนวณอยู่แล้ว และค่าใหม่ที่จะเขียนมี "%" ปนมา
-    # (ดูเหมือนคำสั่งเปลี่ยนอัตรา เช่น "10%") ห้ามเขียนทับเงียบๆ เด็ดขาด ต้องใช้ change_rate แทน (ซึ่งมี preview/
-    # ยืนยันและปรับเฉพาะตัวเลขอัตราในสูตรจริงๆ ไม่ใช่ทับทั้งเซลล์เป็นค่าคงที่) — กันเคสหลุดจากด่านกรองโค้ด/
-    # classifier ชั้นก่อนหน้า (_is_structural_edit_command / intent="structural") มาถึงจุดนี้โดยบังเอิญ
-    if was_formula and isinstance(new_value, str) and "%" in new_value:
-        return {
-            "matched": False,
-            "message": f"'{label}' เป็นสูตรคำนวณอัตราอยู่ กรุณาใช้คำสั่งเปลี่ยนอัตราแทน (change_rate) ครับ",
-        }
+    if was_formula:
+        is_rate_field = "%" in label and _resolve_rate_formula(base_bytes, target_info, 0)[1] is None
+        if is_rate_field:
+            reason = 'เป็นอัตราที่คำนวณในสูตร ใช้คำสั่งแก้อัตราตรงๆ เช่น "เปลี่ยน VAT เป็น 10%" แทน'
+        else:
+            reason = "คำนวณอัตโนมัติจากสูตรในไฟล์"
+        return {"matched": False, "message": f"✗ '{label}' {reason} แก้ตรงไม่ได้ครับ"}
 
     old_value = target_info["current_value"]
 
@@ -10473,7 +10578,9 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
     new_value_actual = new_label_map.get(label, {}).get("current_value", coerced_value)
     # บันทึกประวัติเฉพาะ label ที่ผู้ใช้แก้ตรงๆ เท่านั้น — ช่องสูตรอื่นที่เปลี่ยนตาม (side_effect_labels) ไม่
     # บันทึกเป็นประวัติ เก็บไว้แค่ในข้อความยืนยันด้านล่าง (ประวัติของแต่ละเวอร์ชันจึงมีแค่การแก้ที่ตั้งใจจริงๆ)
-    edit_log_id = log_document_edit(document_id, label, old_value, new_value_actual, was_formula=was_formula)
+    # was_formula เป็น False เสมอถึงจุดนี้ได้ (เซลล์สูตรถูกปฏิเสธไปแล้วด้านบนก่อนเขียนทับเลย — ดูการเช็ค was_formula
+    # ก่อนหน้า) ไม่ต้องส่งต่อให้ log_document_edit อีก
+    edit_log_id = log_document_edit(document_id, label, old_value, new_value_actual)
     link_edit_log_to_version(edit_log_id, version_id)
 
     # แก้สำเร็จ = ไฟล์นี้กลายเป็นไฟล์ที่กำลังโฟกัสอยู่ในแชทนี้ (ถ้ามี chat_id ผูกอยู่จริง — อัปโหลดบางเส้นทาง
@@ -10483,8 +10590,6 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
 
     # สร้างข้อความยืนยันเองด้วยโค้ดเสมอ ห้ามใช้ parsed["reason"] (ข้อความภายในของตัวจับคู่)
     message = f"แก้ '{label}' ในไฟล์ '{doc['filename']}' จาก '{old_value}' เป็น '{new_value_actual}' แล้ว"
-    if was_formula:
-        message += FORMULA_EDIT_WARNING_NOTICE
     if side_effect_labels:
         side_effect_lines = [
             f"{side_label}เปลี่ยนจาก {label_map[side_label]['current_value']} เป็น {new_label_map[side_label]['current_value']}"
