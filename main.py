@@ -3976,12 +3976,8 @@ def run_agentic_tool_loop(
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
         return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
 
-    # ไม่มี tool แก้โครงสร้างไฟล์สำเร็จเลยในเทิร์นนี้ (applied_messages ว่างเปล่า — เช็คด้านบนไปแล้ว) แต่ final_text
-    # อาจมีบรรทัด "✓"/"✗" ที่ Claude เลียนแบบใบยืนยันของโค้ดแล้วแต่งขึ้นเอง (ดู _strip_fabricated_receipt_lines) —
-    # ตัดทิ้งเสมอ การตัดสินใจว่า "แต่งเรื่องแก้ไฟล์สำเร็จ" ไหมย้ายไปที่ rag_answer/advisor_answer (answer_guard.truth_guard)
-    final_text = _strip_fabricated_receipt_lines(final_text)
-    if not final_text:
-        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
+    # final_text อาจมีบรรทัด "✓"/"✗" ที่ Claude เลียนแบบใบยืนยันของโค้ดแล้วแต่งขึ้นเอง — การตัดทิ้ง/ตัดสินใจย้ายไปที่
+    # rag_answer/advisor_answer (answer_guard.truth_guard) ทั้งหมดแล้ว ส่ง final_text ดิบไปตรงๆ
     return final_text, action_receipts, structural_tool_called
 
 
@@ -10265,9 +10261,29 @@ def _query_references_open_file(query: str, active_docs: list[dict], chat_id, us
     )
 
 
+_EDIT_INTENT_QUESTION_ENDINGS = ("อย่างไร", "ยังไง", "ไหม", "หรือเปล่า", "อะไร", "เท่าไร", "เท่าไหร่")
+
+
+def _query_has_edit_command_form(query: str) -> bool:
+    """True ถ้าเป็นรูปคำสั่ง "<กริยาแก้> ... เป็น ..." (ไม่ใช่คำถาม) — ครอบกรณีระบุรายการ/ช่องที่ไม่มีในไฟล์"""
+    normalized = _normalize_thai_typos(query.strip())
+    if "?" in normalized or normalized.endswith(_EDIT_INTENT_QUESTION_ENDINGS):
+        return False
+    tokens = word_tokenize(normalized, engine="newmm")
+    verb_idx = next(
+        (i for i, t in enumerate(tokens) if any(t == v or t.startswith(v) for v in _EDIT_INTENT_VERB_WORDS)), None,
+    )
+    return verb_idx is not None and "เป็น" in tokens[verb_idx + 1:]
+
+
 def _resolve_fallback_edit_intent(query: str, active_docs: list[dict], chat_id, user_id) -> bool:
-    """True ถ้าน่าจะเป็นคำสั่งแก้ไฟล์จริง (มีคำกริยาแก้ + อ้างถึงสิ่งในไฟล์) ใช้เมื่อไม่มี router intent ให้เชื่อ"""
-    return _query_has_edit_verb(query) and _query_references_open_file(query, active_docs, chat_id, user_id)
+    """True ถ้าน่าจะเป็นคำสั่งแก้ไฟล์จริง (มีคำกริยาแก้ + อ้างถึงสิ่งในไฟล์ หรือเข้ารูปคำสั่ง "...เป็น...")"""
+    if not _query_has_edit_verb(query):
+        return False
+    return (
+        _query_references_open_file(query, active_docs, chat_id, user_id)
+        or _query_has_edit_command_form(query)
+    )
 
 
 def _force_structural_edit_dispatch(query: str, active_docs: list[dict], chat_id: int, user_id: int) -> dict:

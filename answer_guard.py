@@ -7,8 +7,10 @@ import re
 
 from main import (
     _get_document_version_marker, build_editable_fields, _document_totals_lines,
-    _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE,
+    _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE, _strip_fabricated_receipt_lines,
 )
+
+_EMPTY_ANSWER_FALLBACK = "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ"
 
 _MONEY_LINE_KEYWORDS = ("รวมเงิน", "รวมทั้งสิ้น", "ยอดรวม", "vat", "ภาษีมูลค่าเพิ่ม", "จำนวนเงิน")
 _MONEY_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:บาท|%)")
@@ -66,13 +68,24 @@ def truth_guard(
     raw_answer: str, *, query: str, active_docs: list, version_before: dict, edit_intent: bool, chat_id=None,
     strip_money_lines: bool = True,
 ) -> str:
-    """edit_intent + มีไฟล์เปิด + ไม่มี version ไหนเปลี่ยนเลย -> แทน raw_answer ทั้งก้อนด้วยข้อความจากโค้ด มิฉะนั้น
-    แค่ตัดตัวเลขยอดเงินที่ไม่ตรงค่าจริงออก (ถ้า strip_money_lines — ปิดได้สำหรับ advisor ที่พูดถึงยอดประมาณการ)"""
+    """version เปลี่ยนจริง -> เชื่อ raw_answer เต็มที่ ไม่เปลี่ยนเลย -> "✓"/"✗" ใดๆ ต้องปลอม: edit_intent หรือเจอ
+    บรรทัดปลอม -> แทนทั้งก้อนด้วยข้อความจากโค้ด ไม่งั้นแค่ตัดยอดเงินที่ไม่ตรงค่าจริง (strip_money_lines คุมได้)"""
     if not active_docs:
+        stripped = _strip_fabricated_receipt_lines(raw_answer)
+        return stripped or _EMPTY_ANSWER_FALLBACK
+
+    if _any_version_changed(active_docs, version_before):
         return raw_answer
-    if edit_intent and not _any_version_changed(active_docs, version_before):
+
+    stripped = _strip_fabricated_receipt_lines(raw_answer)
+    had_fake_receipt_line = stripped != raw_answer.strip()
+    if edit_intent:
         print(f"[Guard] truth_check_replaced chat={chat_id}")
         return _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE + _current_value_hint(active_docs, query)
+    if had_fake_receipt_line:
+        print(f"[Guard] fake_receipt_replaced chat={chat_id}")
+        return _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
+
     if strip_money_lines:
-        return _strip_unverified_money_lines(raw_answer, active_docs)
-    return raw_answer
+        return _strip_unverified_money_lines(stripped, active_docs)
+    return stripped
