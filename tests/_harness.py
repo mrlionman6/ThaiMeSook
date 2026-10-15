@@ -115,6 +115,7 @@ WANTED_MAIN_FUNCS = {
     "_is_router_clarification_fresh",
     "_resolve_llm_router_dispatch",
     "_normalize_thai_typos", "_query_has_edit_verb", "_force_structural_edit_dispatch",
+    "_query_references_open_file", "_resolve_fallback_edit_intent",
 }
 
 WANTED_MAIN_CONSTS = {
@@ -168,6 +169,7 @@ WANTED_MAIN_CONSTS = {
     "_ROUTER_FILE_INTENTS", "_ROUTER_VALID_INTENTS", "_ROUTER_FILE_LOGIN_REQUIRED_MESSAGE",
     "_ROUTER_CLARIFICATION_THIRD_PERSON_FALLBACK",
     "_ROUTER_EDITABLE_FIELDS_MAX", "_ROUTER_EDITABLE_FIELD_VALUE_MAX_CHARS",
+    "_EDIT_INTENT_VERB_WORDS", "_EDIT_INTENT_FILE_REFERENCE_WORDS",
 }
 
 # _looks_like_fabricated_edit_claim ไม่ได้อยู่ใน WANTED_MAIN_FUNCS ด้านบนโดยตั้งใจ — ไม่ต้องใช้ใน test ชุดนี้
@@ -765,11 +767,7 @@ def build_namespace() -> dict:
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
     _extract_all(document_fields_tree, ns, "document_fields.py")
-    # fix/router-toolchoice-truth-guard: llm_tools.py/answer_guard.py เป็นไฟล์เล็กที่ทุกอย่างในนั้นเกี่ยวข้องกันหมด
-    # เหมือน document_fields.py — ดึงทั้งไฟล์อัตโนมัติด้วย _extract_all เช่นกัน (กันบั๊กเดิมที่เคยเกิด: ดึงแค่
-    # ฟังก์ชัน public แล้วลืมฟังก์ชันช่วยภายใน) ต้องดึง "หลัง" main.py เสมอ เพราะ answer_guard.py อ้างชื่อจาก
-    # main.py (_get_document_version_marker/build_editable_fields/_document_totals_lines/
-    # _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE) เป็น bare global ใน ns เดียวกัน
+    # llm_tools.py/answer_guard.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย _extract_all "หลัง" main.py เสมอ
     _extract_all(llm_tools_tree, ns, "llm_tools.py")
     _extract_all(answer_guard_tree, ns, "answer_guard.py")
 

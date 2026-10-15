@@ -1,16 +1,8 @@
-"""ตรวจคำตอบที่ Claude เขียนเอง (ไม่ผ่าน tool จริง) ด้วยผลจริง (version ของเอกสารก่อน/หลังเทิร์น) แทนการเดาจาก
-คำพูด (blacklist คำอย่าง _looks_like_fabricated_edit_claim เดิม) — เรียกจาก main.py: rag_answer/advisor_answer
-เท่านั้น หลังได้ raw_answer จาก run_agentic_tool_loop แล้วเสมอ (ก่อนต่อท้าย action_receipts)
+"""ตรวจคำตอบที่ Claude เขียนเอง (ไม่ผ่าน tool จริง) ด้วย version ของเอกสารก่อน/หลังเทิร์น แทนการเดาจากคำพูด —
+เรียกจาก main.py: rag_answer/advisor_answer หลังได้ raw_answer จาก run_agentic_tool_loop แล้วเสมอ
 
-หลักการ: ผู้ใช้สั่งแก้ไฟล์ (edit_intent) ขณะมีไฟล์เปิดอยู่ แต่ version ของทุกไฟล์ที่เปิดอยู่ไม่เปลี่ยนเลยหลังเทิร์น
-นี้ (ไม่มี tool ไหนแก้ไฟล์จริงสำเร็จ) -> ไม่เชื่อข้อความที่ Claude เขียนเองเลยไม่ว่าจะฟังดูน่าเชื่อแค่ไหน แทนด้วย
-ข้อความจากโค้ดเสมอ — ครอบคลุมทุกเส้นทางที่จบที่ raw_answer เป็นข้อความอิสระของ Claude (router edit_document
-fallback, router advisor/legal/library ที่ไม่มี field_edits ตรง, legacy cascade, single/multi-doc classifier
-"unrelated" fallthrough ฯลฯ) เพราะ rag_answer/advisor_answer เป็นจุดที่ raw_answer ทุกเส้นทางไหลผ่านจริง
-
-import จาก main.py แบบ deferred (หลังนิยาม _get_document_version_marker/_document_totals_lines และหลัง import
-build_editable_fields จาก document_fields.py แล้ว) เหมือน document_fields.py ทุกประการ — ดู main.py ตรงจุดที่
-import ไฟล์นี้กลับ (หลัง "from document_fields import build_editable_fields, apply_field_edits")"""
+import จาก main.py แบบ deferred (หลังนิยาม _get_document_version_marker/_document_totals_lines/
+_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE และ build_editable_fields) เหมือน document_fields.py ทุกประการ"""
 import re
 
 from main import (
@@ -23,8 +15,7 @@ _MONEY_TOKEN_RE = re.compile(r"\d[\d,]*(?:\.\d+)?\s*(?:บาท|%)")
 
 
 def snapshot_document_versions(active_docs: list) -> dict:
-    """คืน {document_id: version marker ปัจจุบัน} ของทุกไฟล์ใน active_docs — เรียก "ก่อน" run_agentic_tool_loop
-    เสมอ (ดู main.py: rag_answer/advisor_answer) ใช้เทียบกับสถานะหลังเทิร์นใน truth_guard ด้านล่าง"""
+    """คืน {document_id: version marker ปัจจุบัน} ของทุกไฟล์ใน active_docs — เรียก "ก่อน" run_agentic_tool_loop"""
     return {doc["id"]: _get_document_version_marker(doc) for doc in active_docs}
 
 
@@ -33,8 +24,7 @@ def _any_version_changed(active_docs: list, version_before: dict) -> bool:
 
 
 def _current_value_hint(active_docs: list, query: str) -> str:
-    """เดาว่า query เอ่ยถึง field ไหนในไฟล์ที่เปิดอยู่ (ด้วย build_editable_fields — ดู document_fields.py) แล้วคืน
-    ค่าปัจจุบันจริงของ field นั้นต่อท้ายข้อความ guard ถ้าเดาได้ คืน "" ถ้าเดาไม่ได้/มีมากกว่า 1 ไฟล์เปิดอยู่"""
+    """เดาว่า query เอ่ยถึง field ไหน (ด้วย build_editable_fields) แล้วคืนค่าปัจจุบันจริงต่อท้าย คืน "" ถ้าเดาไม่ได้"""
     if len(active_docs) != 1:
         return ""
     try:
@@ -50,9 +40,7 @@ def _current_value_hint(active_docs: list, query: str) -> str:
 
 
 def _strip_unverified_money_lines(raw_answer: str, active_docs: list) -> str:
-    """ตัดบรรทัดที่อ้างยอดเงิน/VAT/รวมทั้งสิ้น (มีคำใน _MONEY_LINE_KEYWORDS + ตัวเลขแบบเงิน) ที่ไม่ตรงกับค่าจริง
-    ปัจจุบันของไฟล์เลยสักตัวเลข (ดู _document_totals_lines) ออก แล้วต่อท้ายด้วยยอดจริงแทน — ใช้เฉพาะมีไฟล์เดียว
-    เปิดอยู่ชัดเจนเท่านั้น (หลายไฟล์ -> ไม่รู้จะเทียบกับไฟล์ไหน ปล่อยผ่าน)"""
+    """ตัดบรรทัดที่อ้างยอดเงิน/VAT (มีคำใน _MONEY_LINE_KEYWORDS + ตัวเลข) ที่ไม่ตรงค่าจริงออก แล้วต่อยอดจริงแทน"""
     if len(active_docs) != 1:
         return raw_answer
     real_lines = _document_totals_lines(active_docs[0]["id"])
@@ -74,15 +62,17 @@ def _strip_unverified_money_lines(raw_answer: str, active_docs: list) -> str:
     return "\n".join(kept).rstrip() + "\n" + "\n".join(real_lines)
 
 
-def truth_guard(raw_answer: str, *, query: str, active_docs: list, version_before: dict, edit_intent: bool, chat_id=None) -> str:
-    """เรียกหลังได้ raw_answer จาก run_agentic_tool_loop แล้วเสมอ (เฉพาะตอนไม่มี action_receipts ในเทิร์นนี้ —
-    มี receipt แปลว่ามี tool แก้ไฟล์จริงสำเร็จแล้ว ไม่ต้องตรวจซ้ำ) edit_intent=True (ผู้ใช้สั่งแก้ไฟล์จริงๆ — ดู
-    main.py: _query_has_edit_verb/structural_route) + มีไฟล์เปิดอยู่ + ไม่มี version ไหนเปลี่ยนเลย -> ไม่เชื่อ
-    raw_answer เลยทั้งก้อน แทนด้วยข้อความจากโค้ด ไม่ว่าในกรณีอื่น (ไม่ใช่ edit_intent หรือ version เปลี่ยนจริง) ->
-    แค่ตัดตัวเลขยอดเงินที่ไม่ตรงค่าจริงออก (ดู _strip_unverified_money_lines) เผื่อ Claude แต่งตัวเลขปนในคำตอบปกติ"""
+def truth_guard(
+    raw_answer: str, *, query: str, active_docs: list, version_before: dict, edit_intent: bool, chat_id=None,
+    strip_money_lines: bool = True,
+) -> str:
+    """edit_intent + มีไฟล์เปิด + ไม่มี version ไหนเปลี่ยนเลย -> แทน raw_answer ทั้งก้อนด้วยข้อความจากโค้ด มิฉะนั้น
+    แค่ตัดตัวเลขยอดเงินที่ไม่ตรงค่าจริงออก (ถ้า strip_money_lines — ปิดได้สำหรับ advisor ที่พูดถึงยอดประมาณการ)"""
     if not active_docs:
         return raw_answer
     if edit_intent and not _any_version_changed(active_docs, version_before):
         print(f"[Guard] truth_check_replaced chat={chat_id}")
         return _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE + _current_value_hint(active_docs, query)
-    return _strip_unverified_money_lines(raw_answer, active_docs)
+    if strip_money_lines:
+        return _strip_unverified_money_lines(raw_answer, active_docs)
+    return raw_answer

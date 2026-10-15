@@ -743,11 +743,11 @@ def test_edit_command_with_question_word_is_not_reading_question(ns):
 
 
 def test_match_and_apply_excel_edit_refuses_percent_on_formula_cell(ns, doc1):
-    """safety net: เซลล์เป้าหมายเป็นสูตร + ค่าใหม่มี "%" -> ห้ามเขียนทับ ต้องบอกให้ใช้ change_rate แทน"""
+    """safety net: เซลล์เป้าหมายเป็นสูตรอัตรา -> ห้ามเขียนทับ ต้องแนะนำคำสั่งเปลี่ยนอัตราแทน"""
     ns["_fake_client"].response_text = '{"matched": true, "label": "ภาษีมูลค่าเพิ่ม 7%", "new_value": "10%"}'
     result = ns["_match_and_apply_excel_edit"](1, 1, "เปลี่ยน VAT เป็น 10%")
     assert result["matched"] is False
-    assert "change_rate" in result["message"] or "เปลี่ยนอัตรา" in result["message"]
+    assert "เปลี่ยน VAT เป็น 10%" in result["message"]
 
     assert ns["_fake_db"].versions.get(1, []) == []
     vat_info = doc1["label_map"]["ภาษีมูลค่าเพิ่ม 7%"]
@@ -756,9 +756,21 @@ def test_match_and_apply_excel_edit_refuses_percent_on_formula_cell(ns, doc1):
     assert isinstance(cell_value, str) and cell_value.startswith("=")
 
 
-def test_match_and_apply_excel_edit_still_works_for_plain_values(ns, doc1):
-    ns["_fake_client"].response_text = '{"matched": true, "label": "รวมเงิน", "new_value": "99999"}'
-    result = ns["_match_and_apply_excel_edit"](1, 1, "เปลี่ยนรวมเงินเป็น 99999")
+def test_match_and_apply_excel_edit_still_works_for_plain_values(ns):
+    """label ที่ไม่ใช่สูตร (ทุก label ใน doc1/build_fixture_workbook เป็นสูตรหมดแล้ว) ยังแก้ตรงได้ตามปกติ"""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quotation"
+    ws["A1"] = "ชื่อลูกค้า"
+    ws["B1"] = "บริษัท เดิม จำกัด"
+    buf = io.BytesIO()
+    wb.save(buf)
+    raw = buf.getvalue()
+    label_map = ns["_extract_excel_labels"](raw)
+    ns["_fake_db"].add_document(2, "plain.xlsx", raw, label_map, chat_id=1, user_id=1)
+
+    ns["_fake_client"].response_text = '{"matched": true, "label": "ชื่อลูกค้า", "new_value": "บริษัท ใหม่ จำกัด"}'
+    result = ns["_match_and_apply_excel_edit"](2, 1, "เปลี่ยนชื่อลูกค้าเป็น บริษัท ใหม่ จำกัด")
     assert result["matched"] is True
 
 

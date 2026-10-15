@@ -1,11 +1,8 @@
-"""เรียก Claude แบบบังคับให้ใช้ tool เสมอ (tool_choice={"type":"tool",...}) ทนทานต่อรุ่นที่ไม่รองรับ tool_choice
-type "tool"/"any" เลย (เช่น claude-sonnet-5-5 — คืน 400 "tool_choice: type ... are not supported for this
-model" ทุกครั้ง ทำให้ route_intent_with_llm/_resolve_recommendation_intent_with_llm/ฯลฯ ล้มเหลวทุกข้อความ) —
-ใช้แทนการเรียก client.messages.create(..., tool_choice={"type":"tool", "name": ...}) ตรงๆ ทุกจุดในโปรเจกต์นี้"""
+"""เรียก Claude แบบบังคับให้ใช้ tool เสมอ ทนทานต่อรุ่นที่ไม่รองรับ tool_choice type "tool"/"any" (คืน 400) —
+ใช้แทนการเรียก client.messages.create(..., tool_choice={"type":"tool", "name": ...}) ตรงๆ ทุกจุด"""
 import anthropic
 
-# model ที่เคยเจอ 400 เพราะ tool_choice type "tool"/"any" แล้ว — จำไว้ต่อ process (ไม่ใช่ถาวรข้าม restart) กัน
-# เสีย 1 call เปล่าๆ ทุกครั้งถัดไปสำหรับ model เดียวกัน
+# model ที่เคยเจอ 400 เพราะ tool_choice แล้ว — จำไว้ต่อ process กันเสีย 1 call เปล่าๆ ทุกครั้งถัดไป
 _DOWNGRADED_MODELS: set = set()
 
 
@@ -22,14 +19,8 @@ def _find_tool_use(response, tool_name: str):
 
 
 def call_with_required_tool(client, model: str, max_tokens: int, system: str, messages: list, tools: list, tool_name: str):
-    """เรียก client.messages.create บังคับให้เรียก tool ชื่อ tool_name เสมอ — ลอง tool_choice={"type":"tool",...}
-    ก่อนเสมอ (เหมือนเดิมทุกจุด) ยกเว้น model นี้เคย 400 เพราะ tool_choice มาแล้วในรอบก่อนหน้า (ข้ามไปใช้ auto
-    ทันที) เจอ 400 ที่ข้อความมี "tool_choice" (ดู _is_tool_choice_unsupported_error) -> จำ model นี้ไว้ แล้ว retry
-    อีกครั้งเดียวด้วย tool_choice={"type":"auto"} พร้อมเติมประโยคบังคับต่อท้าย system เท่านั้น — exception อื่นที่
-    ไม่ใช่กรณีนี้ (rate limit/auth/network ฯลฯ) ปล่อยให้หลุดขึ้นไปให้ caller จัดการเหมือนเดิมทุกประการ ไม่ retry เอง
-
-    คืน response ของ Anthropic SDK ถ้ามี tool_use ของ tool_name จริง (ไม่ว่าจะเรียกแบบ forced หรือ auto) หรือ
-    None ถ้าเรียกสำเร็จแต่ไม่มี tool_use ของ tool นี้เลย (ให้ caller fallback ไปทางอื่นเหมือนเดิม)"""
+    """ลอง tool_choice={"type":"tool",...} ก่อนเสมอ เจอ 400 เพราะ tool_choice -> retry ด้วย "auto" + ประโยคบังคับ
+    ใน system (จำ model นี้ไว้ ครั้งถัดไปข้ามไป auto ทันที) คืน response ถ้ามี tool_use จริง หรือ None ถ้าไม่มี"""
     if model not in _DOWNGRADED_MODELS:
         try:
             response = client.messages.create(
