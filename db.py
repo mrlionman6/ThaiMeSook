@@ -1626,6 +1626,7 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
         version_id = row.id
         version_no = row.version_no
         label_map = row.label_map
+        change_summary = row.change_summary
 
         linked_log_ids = [
             v.edit_log_id
@@ -1643,7 +1644,17 @@ def delete_latest_document_version(document_id: int) -> Optional[dict]:
 
         session.delete(row)
         session.commit()
-        return {"version_no": version_no, "label_map": label_map}
+        return {"version_no": version_no, "label_map": label_map, "change_summary": change_summary}
+
+
+def update_document_version_change_summary(version_id: int, change_summary: str) -> None:
+    """อัปเดต change_summary ของเวอร์ชันที่มีอยู่แล้วตรงๆ ไม่สร้างเวอร์ชันใหม่ — ใช้ฝัง marker บอกว่าเวอร์ชันนี้
+    เป็นเวอร์ชันสุดท้ายของคำสั่งผสมหลายขั้น ให้ undo_last_edit() (main.py) อ่านแล้วย้อนทีเดียวหลายเวอร์ชัน"""
+    with SessionLocal() as session:
+        session.query(DocumentVersion).filter(DocumentVersion.id == version_id).update(
+            {"change_summary": change_summary}
+        )
+        session.commit()
 
 
 def set_chat_last_recommendations(chat_id: int, items: list[dict]) -> None:

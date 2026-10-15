@@ -12,7 +12,7 @@ from db import get_editable_document, log_document_edit, link_edit_log_to_versio
 from main import (
     get_working_copy, create_new_version, _get_single_item_table, _merged_cell_top_left,
     _coerce_value_for_cell, _document_totals_lines, _UNDO_HINT_LINE, _TABLE_FIELD_THAI_NAMES,
-    _RATE_FORMULA_PATTERNS, set_chat_document_focus,
+    _RATE_FORMULA_PATTERNS, set_chat_document_focus, _format_display_value,
 )
 
 # คอลัมน์ตารางรายการที่แก้ตรงได้ (ไม่รวม "amount" — เป็นสูตรเสมอ)
@@ -36,6 +36,20 @@ def _guess_value_type(value, number_format) -> str:
 
 def _is_rate_formula_text(formula_text: str) -> bool:
     return any(pattern.search(formula_text) for pattern, _kind in _RATE_FORMULA_PATTERNS)
+
+
+_TEXT_FIELD_LABEL_MAX_CHARS = 20
+
+
+def _short_text_field_label(value: str, cell: str) -> str:
+    """ช่องข้อความลอย (kind="text") ใช้ค่าในเซลล์เองเป็น label — ถ้ายาวเกินไป/มีตัวเลข (เช่น "โทร : 02-888-8888
+    โทรสาร : ") ใช้คำนำหน้าแรกก่อน ":" แทน (เช่น "โทร") ไม่มี ":" ให้ใช้ "ข้อความในช่อง <cell>" แทนทั้งค่า"""
+    if len(value) <= _TEXT_FIELD_LABEL_MAX_CHARS and not any(ch.isdigit() for ch in value):
+        return value
+    prefix = value.split(":", 1)[0].strip()
+    if prefix and len(prefix) <= _TEXT_FIELD_LABEL_MAX_CHARS:
+        return prefix
+    return f"ข้อความในช่อง {cell}"
 
 
 def build_editable_fields(document: dict) -> list[dict]:
@@ -144,14 +158,15 @@ def build_editable_fields(document: dict) -> list[dict]:
             value = cell.value
             if not isinstance(value, str) or not value.strip() or value.strip().startswith("="):
                 continue
+            cell_ref = f"{openpyxl.utils.get_column_letter(cell.column)}{cell.row}"
             fields.append({
                 "field_id": f"text|{sheet_name}|{cell.row}|{cell.column}",
                 "kind": "text",
                 "sheet": sheet_name,
                 "row": cell.row,
                 "col": cell.column,
-                "cell": f"{openpyxl.utils.get_column_letter(cell.column)}{cell.row}",
-                "label": value.strip()[:30],
+                "cell": cell_ref,
+                "label": _short_text_field_label(value.strip(), cell_ref),
                 "current_value": value,
                 "value_type": "text",
                 "number_format": None,
@@ -237,7 +252,10 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
     exclude_labels = set()
     for item in to_apply:
         field = item["field"]
-        success_lines.append(f"✓ แก้ '{field['label']}' จาก \"{item['old_text']}\" เป็น \"{item['new_text']}\"")
+        # แสดงวันที่แบบ วัน/เดือน/ปี แทน ISO string ดิบ (เช่น "2569-10-20T00:00:00" -> "20/10/2569")
+        old_display = _format_display_value(item["old_text"], field.get("number_format"))
+        new_display = _format_display_value(item["new_text"], field.get("number_format"))
+        success_lines.append(f"✓ แก้ '{field['label']}' จาก \"{old_display}\" เป็น \"{new_display}\"")
         exclude_labels.add(field["label"])
         if field["kind"] == "label":
             edit_log_id = log_document_edit(document_id, field["label"], item["old_text"], item["new_text"])
