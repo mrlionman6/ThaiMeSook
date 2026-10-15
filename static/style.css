@@ -87,7 +87,7 @@ body.page-admin-BG:not(.login-page-layout) {
 }
 
 body {
-    font-family: sans-serif;
+    font-family: "Anuphan", -apple-system, "Segoe UI", system-ui, sans-serif;
     /* ขยายตามความกว้างหน้าต่างจริง (width: 92%) แต่ยัง cap ไว้ที่ 900px บนจอกว้างมากๆ
        เพื่อไม่ให้บรรทัดข้อความยาวเกินไปจนอ่านยาก (แนวทางเดียวกับแชทแอปทั่วไปอย่าง ChatGPT) */
     max-width: 900px;
@@ -319,17 +319,25 @@ button {
 #answerBox h1, #answerBox h2, #answerBox h3 {
     margin-top: 16px;
     margin-bottom: 6px;
+    line-height: 1.4;
+    font-weight: 600;
+}
+
+#answerBox h1:first-child, #answerBox h2:first-child, #answerBox h3:first-child {
+    margin-top: 0;
 }
 
 #answerBox p {
     margin-top: 4px;
     margin-bottom: 10px;
+    max-width: 68ch; /* บรรทัดยาวเกินไปอ่านยาก — จำกัดความกว้างไว้แม้กล่องแชทจะกว้างกว่านี้บนจอใหญ่ */
 }
 
 #answerBox ol, #answerBox ul {
     margin-top: 4px;
     margin-bottom: 10px;
     padding-left: 25px;
+    max-width: 68ch;
 }
 
 #answerBox li {
@@ -338,12 +346,88 @@ button {
 
 #answerBox strong {
     color: #1a1a1a;
+    font-weight: 600;
 }
 
 #answerBox hr {
     margin: 20px 0;
     border: none;
     border-top: 1px solid #ddd;
+}
+
+/* ---------- ตารางใน markdown (เช่น เปรียบเทียบราคา/รายการ) — scroll แนวนอนได้โดยไม่ง้อ wrapper div
+   (display:block บน table เองทำให้ overflow-x ใช้ได้ ไม่ต้องแก้ script.js มาครอบ div เพิ่ม) ---------- */
+#answerBox table {
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+    margin: 10px 0;
+    border-collapse: collapse;
+    font-size: 14.5px;
+    white-space: nowrap;
+}
+
+#answerBox th, #answerBox td {
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    padding: 6px 10px;
+    text-align: left;
+}
+
+#answerBox th {
+    background: rgba(0, 0, 0, 0.05);
+    border-bottom: 2px solid var(--color-sky);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+#answerBox tbody tr:nth-child(even) {
+    background: rgba(0, 0, 0, 0.02);
+}
+
+/* ---------- โค้ด/ตัวเลขอ้างอิงแบบ inline กับบล็อกโค้ดยาว ---------- */
+#answerBox code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+    background: rgba(0, 0, 0, 0.06);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+
+#answerBox pre {
+    margin: 10px 0;
+    padding: 10px 12px;
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: 8px;
+    overflow-x: auto;
+    max-width: 100%;
+}
+
+#answerBox pre code {
+    background: none;
+    padding: 0;
+    font-size: 0.85em;
+}
+
+/* ---------- ลิงก์ในคำตอบ — ต้องเห็นชัดว่าคลิกได้ (รวมเคส "ลิงก์" ที่ซ่อน URL ดิบไว้ — ดู isSafeHref
+   ใน script.js) เน้นด้วยขีดเส้นใต้ + สีหลัก + เครื่องหมายเปิดแท็บใหม่สั้นๆ แทนสีน้ำเงินล้วนแบบ default ---------- */
+#answerBox a {
+    color: var(--color-primary);
+    font-weight: 500;
+    text-decoration: underline;
+    text-decoration-color: var(--color-sky);
+    text-underline-offset: 2px;
+}
+
+#answerBox a:hover, #answerBox a:focus-visible {
+    color: var(--color-primary-hover);
+    text-decoration-color: currentColor;
+}
+
+#answerBox a::after {
+    content: "↗";
+    display: inline-block;
+    margin-left: 2px;
+    font-size: 0.85em;
 }
 
 /* ---------- Admin: แท็บ ---------- */
@@ -971,20 +1055,25 @@ button {
    background: var(--color-primary-button-green-bright-hover)
 }
 
-/* ---------- แสดงประวัติทั้งแชท (ต่างจากคำตอบเดี่ยวปกติ) ---------- */
+/* ---------- แสดงประวัติทั้งแชท (ต่างจากคำตอบเดี่ยวปกติ) ----------
+   line-height 1.75: ภาษาไทยมีสระบน/ล่าง/วรรณยุกต์ซ้อนกัน ต้องเผื่อที่มากกว่าภาษาอังกฤษปกติ ไม่ให้ชนบรรทัดถัดไป */
 .chat-msg {
     margin-bottom: 16px;
-    padding: 10px 12px;
+    padding: 12px 14px;
     border-radius: 8px;
-    line-height: 1.6;
+    font-size: 16px;
+    line-height: 1.75;
     overflow-wrap: anywhere; /* กันลิงก์/คำยาวๆ ไม่มีช่องว่างล้นออกนอกกรอบกล่องข้อความ */
+    max-width: 92%;
 }
 
 .chat-msg-user {
     background: var(--color-sky-pale);
     color: var(--color-sky-pale-text);
-    font-weight: bold;
+    font-weight: 500;
     cursor: pointer;
+    max-width: 85%;
+    margin-left: auto; /* ชิดขวา แยกจากฝั่งผู้ช่วย (ซ้าย) โดยไม่ต้องเปลี่ยน display ของ #answerBox เลย */
 }
 
 .chat-msg-user.truncatable {
@@ -1002,6 +1091,17 @@ button {
 .chat-msg-assistant {
     background: var(--color-cream);
     border: 1px solid #f0e4a8;
+}
+
+@media (max-width: 480px) {
+    .chat-msg {
+        font-size: 15px;
+        max-width: 96%;
+    }
+
+    .chat-msg-user {
+        max-width: 90%;
+    }
 }
 
 /* ---------- Modal overlay (login/register/forgot-password/profile) ---------- */
