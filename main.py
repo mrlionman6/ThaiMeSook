@@ -2514,14 +2514,21 @@ def execute_add_table_item(tool_input: dict, user_id: int, chat_id: int) -> dict
     return apply_add_table_item(doc["id"], user_id, tool_input.get("fields") or {})
 
 
-_UNDO_COMMAND_TEXTS = ("ย้อนการแก้", "undo")
+_UNDO_COMMAND_TEXTS = ("ย้อนกลับ", "ย้อนการแก้", "ย้อน", "ยกเลิกการแก้", "ยกเลิกล่าสุด", "เอาคืน", "undo")
+_UNDO_COMMAND_MAX_TOKENS = 4
 
 
 def _is_undo_command(query: str) -> bool:
-    """เช็คว่าข้อความนี้เป็นคำสั่งย้อนการแก้ไฟล์ Excel ตรงๆ ไหม ("ย้อนการแก้" หรือ "undo" ไม่สนตัวพิมพ์เล็กใหญ่/
-    ช่องว่างหัวท้าย) ใช้ดักก่อนเรียก _classify_excel_editor_intent (LLM) ใน ask_question() — คำสั่งชัดเจนแบบนี้
-    ไม่ต้องเสีย API call ไปตีความ และกันความเสี่ยงที่ LLM จะตีความผิดเป็นคำสั่งแก้ค่าแทน"""
-    return query.strip().lower() in _UNDO_COMMAND_TEXTS
+    """True ถ้ามีคำสั่งย้อนการแก้ (ดู _UNDO_COMMAND_TEXTS) และข้อความสั้น (≤4 token) หรือมีคำว่า "แก้"/"ไฟล์"
+    ประกอบ — กันจับผิดข้อความยาวที่บังเอิญมีคำว่า "ย้อน" ปนอยู่ (เช่น "ย้อนกลับไปดูกฎหมายมาตรา 10")"""
+    normalized = _normalize_thai_typos(query.strip())
+    lowered = normalized.lower()
+    if not any(word in lowered for word in _UNDO_COMMAND_TEXTS):
+        return False
+    if "แก้" in lowered or "ไฟล์" in lowered:
+        return True
+    tokens = word_tokenize(normalized, engine="newmm")
+    return len(tokens) <= _UNDO_COMMAND_MAX_TOKENS
 
 
 # คำสั่ง export บทสนทนาเป็นไฟล์ — เช็คแบบ substring ไม่สนตัวพิมพ์เล็กใหญ่ (ไม่ใช่เทียบเป๊ะเหมือน
@@ -9930,7 +9937,7 @@ ROUTE_INTENT_TOOL = {
                 "enum": [
                     "edit_document", "replace_with_recommendation", "add_recommendation", "read_document",
                     "recommend_products", "library_search", "legal_question", "general_question",
-                    "ask_clarification",
+                    "ask_clarification", "undo",
                 ],
             },
             "target_item_index": {
@@ -9988,6 +9995,32 @@ ROUTE_INTENT_TOOL = {
                     "required": ["field_id", "operation", "new_value", "find_text"],
                 },
             },
+            "rate_changes": {
+                "type": ["array", "null"],
+                "description": (
+                    "ใช้เมื่อ intent เป็น edit_document และมีการเปลี่ยนอัตรา (VAT/ส่วนลด % ที่ล็อกในรายการ \"ช่อง"
+                    "ทั้งหมดที่แก้ได้\" ว่า [แก้ตรงไม่ได้: เป็นอัตรา...]) ห้ามใส่ช่องเหล่านี้ใน field_edits เด็ดขาด "
+                    "ไม่งั้นใส่ null หรือ []"
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string", "description": "ชื่อ label ของอัตรา ตรงกับที่ปรากฏในรายการช่องที่แก้ได้เป๊ะ"},
+                        "new_percent": {"type": "number", "description": "อัตราใหม่เป็นตัวเลข % เช่น 10 สำหรับ 10%"},
+                    },
+                    "required": ["label", "new_percent"],
+                },
+            },
+            "sub_commands": {
+                "type": ["array", "null"],
+                "description": (
+                    "แยกข้อความล่าสุดของผู้ใช้เป็นคำสั่งย่อยทั้งหมด (แบ่งตาม \"และ\"/\"แล้ว\"/จุลภาค) เรียงตามลำดับ "
+                    "เดียวกับที่นำไปใส่ field_edits แล้วตามด้วย rate_changes แล้วตามด้วยส่วนที่เหลือใน "
+                    "edit_instruction — ใช้ตรวจว่าทำครบทุกคำสั่งย่อยไหม มีคำสั่งเดียวก็ยังต้องใส่ (list ความยาว 1) "
+                    "ใส่ null เฉพาะ intent อื่นที่ไม่ใช่ edit_document"
+                ),
+                "items": {"type": "string"},
+            },
             "library_query": {
                 "type": ["string", "null"],
                 "description": "ใช้เมื่อ intent เป็น library_search เท่านั้น — คำค้นหาเอกสารในคลัง ไม่งั้นใส่ null",
@@ -10016,8 +10049,8 @@ ROUTE_INTENT_TOOL = {
         },
         "required": [
             "intent", "target_item_index", "recommendation_index", "quantity", "price_mode", "explicit_price",
-            "markup_percent", "edit_instruction", "field_edits", "library_query", "library_filters",
-            "clarification_question", "confidence",
+            "markup_percent", "edit_instruction", "field_edits", "rate_changes", "sub_commands", "library_query",
+            "library_filters", "clarification_question", "confidence",
         ],
     },
 }
@@ -10032,17 +10065,22 @@ ROUTER_SYSTEM_PROMPT = (
     "recommend_products เสมอ (ไปค้นหาใหม่ ห้ามถามกลับ) เช่น แนะนำ HDD -> ได้รายการแนะนำแค่รุ่น 4TB กับ 8TB -> ผู้ใช้"
     "พิมพ์ \"อยากได้ 16tb 2 ตัว\" (ไม่มีรุ่น 16TB ในรายการที่แนะนำไปเลย) -> recommend_products ไม่ใช่ ask_clarification\n\n"
     "ความหมายของแต่ละ intent พร้อมตัวอย่างจริงจากโปรเจกต์นี้:\n"
-    "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ แบ่งเป็นสองแบบ: (ก) เปลี่ยนอัตรา (VAT/เปอร์เซ็นต์ในสูตร)/ลบ-เพิ่ม-"
-    "แก้รายการในตาราง เช่น \"เปลี่ยน VAT เป็น 10%\", \"ลบรายการที่ 3\", \"เปลี่ยนจำนวน Box 4x4 เป็น 30\" — เขียน "
-    "edit_instruction เป็นประโยคคำสั่งที่ชัดเจนขึ้น (แก้คำสรรพนาม/อ้างอิงให้เป็นชื่อ-เลขที่ชัดเจน) ปล่อย field_edits "
-    "เป็น null เสมอ (ข) แก้ช่องอื่นในเอกสาร (label ใดๆ ที่ไม่ใช่สูตร/ข้อความที่ไม่มีป้าย เช่น ที่อยู่บริษัทเรา/ชื่อ"
-    "ผู้เซ็น/หมายเหตุ — ดูรายการ \"ช่องทั้งหมดที่แก้ได้\" ในบริบทไฟล์ที่เปิดอยู่) ให้ใส่ field_edits แทน เลือก "
-    "field_id จากรายการนั้นเท่านั้น (ห้ามเดา field_id เอง) operation: \"set\" (ตั้งค่าใหม่ทั้งหมด) ใช้เมื่อผู้ใช้ "
-    "บอกค่าใหม่ทั้งหมด, \"replace_text\" (แทนที่บางส่วน) ใช้เมื่อผู้ใช้แก้แค่บางส่วนของข้อความเดิม เช่น \"ตรงที่อยู่"
-    " แก้เลขที่เป็น 32/14\" (ที่อยู่เดิมมี \"เลขที่ 61\" อยู่) -> field_edits=[{\"field_id\": <field_id ของที่อยู่>, "
-    "\"operation\": \"replace_text\", \"find_text\": \"61\", \"new_value\": \"32/14\"}], \"clear\" (ล้างเป็นค่าว่าง) "
-    "หลายช่องในข้อความเดียวได้ ช่องที่ \"แก้ตรงไม่ได้\" ในรายการ (เช่นอัตรา VAT/ยอดรวม) ห้ามใส่ใน field_edits "
-    "เด็ดขาด ให้ใช้ edit_instruction แทน\n"
+    "- edit_document: คำสั่งแก้ไฟล์ที่เปิดอยู่ — ข้อความเดียวอาจมีคำสั่งย่อยหลายอย่างผสมกัน (เช่น \"แก้ชื่อโปรเจกต์"
+    "เป็น X และเปลี่ยน VAT เป็น 10%\") ใส่ได้ทุก slot ที่เกี่ยวข้องพร้อมกันในการเรียกครั้งเดียว ไม่ exclusive กัน "
+    "แบ่งเป็นสามแบบ: (ก) เปลี่ยนอัตรา (VAT/ส่วนลด % ที่ล็อกในรายการ \"ช่องทั้งหมดที่แก้ได้\" ว่า [แก้ตรงไม่ได้: "
+    "เป็นอัตรา...]) เช่น \"เปลี่ยน VAT เป็น 10%\" -> ใส่ rate_changes=[{\"label\": <label ของอัตรานั้นเป๊ะ>, "
+    "\"new_percent\": 10}] ห้ามใส่ใน field_edits เด็ดขาด (ข) ลบ-เพิ่ม-แก้รายการในตาราง เช่น \"ลบรายการที่ 3\", "
+    "\"เปลี่ยนจำนวน Box 4x4 เป็น 30\" -> เขียน edit_instruction เป็นประโยคคำสั่งที่ชัดเจนขึ้น (แก้คำสรรพนาม/อ้างอิง"
+    "ให้เป็นชื่อ-เลขที่ชัดเจน) ไม่ใช่เรื่องอัตรา/ช่องอื่นเลย -> ปล่อย edit_instruction เป็น null (ค) แก้ช่องอื่นใน"
+    "เอกสาร (label ใดๆ ที่ไม่ใช่สูตร/ข้อความที่ไม่มีป้าย เช่น ที่อยู่บริษัทเรา/ชื่อผู้เซ็น/หมายเหตุ — ดูรายการ \"ช่อง"
+    "ทั้งหมดที่แก้ได้\" ในบริบทไฟล์ที่เปิดอยู่) ให้ใส่ field_edits แทน เลือก field_id จากรายการนั้นเท่านั้น (ห้ามเดา "
+    "field_id เอง) operation: \"set\" (ตั้งค่าใหม่ทั้งหมด) ใช้เมื่อผู้ใช้บอกค่าใหม่ทั้งหมด, \"replace_text\" "
+    "(แทนที่บางส่วน) ใช้เมื่อผู้ใช้แก้แค่บางส่วนของข้อความเดิม เช่น \"ตรงที่อยู่ แก้เลขที่เป็น 32/14\" (ที่อยู่เดิมมี "
+    "\"เลขที่ 61\" อยู่) -> field_edits=[{\"field_id\": <field_id ของที่อยู่>, \"operation\": \"replace_text\", "
+    "\"find_text\": \"61\", \"new_value\": \"32/14\"}], \"clear\" (ล้างเป็นค่าว่าง) หลายช่องในข้อความเดียวได้ "
+    "ช่องที่ \"แก้ตรงไม่ได้\" ในรายการ (เช่นอัตรา VAT/ยอดรวม) ห้ามใส่ใน field_edits เด็ดขาด ให้ใช้ rate_changes "
+    "แทน — ใส่ sub_commands แยกคำสั่งย่อยทุกอันในข้อความนี้ (แม้มีคำสั่งเดียวก็ใส่ list ความยาว 1) เรียงตามลำดับที่"
+    "นำไปใช้ field_edits แล้ว rate_changes แล้ว edit_instruction (ใช้ตรวจว่าทำครบทุกส่วนไหม)\n"
     "- replace_with_recommendation: ขอให้เอารุ่นสินค้าที่เพิ่งแนะนำไปแทนรายการเดิมในตาราง (ไม่ใช่แค่พูดถึงรุ่น"
     "เฉยๆ) เช่น แนะนำ HDD -> \"อยากได้ 16tb 2 ตัว\" -> ได้รายการแนะนำ -> \"เอา Seagate SkyHawk เเทน HDD เก่าเลย\" "
     "-> เจตนานี้ ต้องดูบริบทบทสนทนาทั้งหมดเพื่อหา target_item_index (แถวในตารางที่เป็นอุปกรณ์ประเภทเดียวกับที่จะ"
@@ -10058,6 +10096,8 @@ ROUTER_SYSTEM_PROMPT = (
     "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
     "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
     "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
+    "- undo: ขอยกเลิก/ย้อนการแก้ไฟล์ครั้งล่าสุด เช่น \"ย้อนกลับ\", \"ยกเลิกการแก้ล่าสุด\", \"เอาคืน\" (คำสั้นๆ แบบนี้"
+    "ปกติถูกจับด้วยโค้ดก่อนถึงตานี้อยู่แล้ว — ใช้ intent นี้เป็นทางสำรองสำหรับคำพูดแบบอื่นที่สื่อความหมายเดียวกัน)\n"
     "- ask_clarification: สถานการณ์กำกวมจริงๆ (ดูหลักตัดสินด้านบน) จนตัดสิน intent อื่นไม่ได้อย่างมั่นใจ (เช่นมี"
     "อุปกรณ์ประเภทเดียวกันหลายรายการในตารางไม่รู้ว่าหมายถึงอันไหน) — ใส่ confidence เป็น low และเขียน clarification_"
     "question พูดกับผู้ใช้โดยตรงเหมือนคุยกันเอง ห้ามใช้คำว่า \"ผู้ใช้\"/\"ท่าน\" เรียกผู้ใช้ ห้ามเล่าว่าผู้ใช้พิมพ์"
@@ -10193,7 +10233,9 @@ def route_intent_with_llm(
 # เส้นทางที่ต้องล็อกอิน + มีไฟล์เปิดอยู่ (ผูกกับ EditableDocument ของ user คนนั้นจริงๆ) — guest ไม่มีทางมี
 # active_docs อยู่แล้ว (ไม่เคยสร้าง EditableDocument ได้เลยถ้าไม่ล็อกอิน) แต่กันไว้ชัดเจนตรงนี้เผื่อ router ตัดสิน
 # intent เหล่านี้มาทั้งที่ context จริงไม่รองรับ (เช่น parse ผิดพลาด)
-_ROUTER_FILE_INTENTS = {"edit_document", "replace_with_recommendation", "add_recommendation", "read_document"}
+_ROUTER_FILE_INTENTS = {
+    "edit_document", "replace_with_recommendation", "add_recommendation", "read_document", "undo",
+}
 _ROUTER_VALID_INTENTS = _ROUTER_FILE_INTENTS | {
     "recommend_products", "library_search", "legal_question", "general_question", "ask_clarification",
 }
@@ -10201,35 +10243,9 @@ _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระ�
 
 
 def _dispatch_router_edit_document(route: dict, target_doc: dict, query: str, user_id: int, chat_id: int) -> dict:
-    """มี field_edits (feat/edit-any-field — แก้ช่องใดก็ได้ในเอกสาร ไม่ใช่แค่รายการ/อัตรา) -> apply_field_edits
-    ก่อนเสมอ คืนผลนั้นตรงๆ ไม่ลองทางอื่นต่อ (router เลือก field_id จากรายการช่องที่แก้ได้มาแล้ว ไม่ใช่ข้อความดิบที่
-    ต้อง parse เดาอีกที) ไม่มี field_edits -> ทางเดิม: ลอง _resolve_direct_structural_dispatch กับ edit_instruction
-    (ประโยคคำสั่งที่ router เขียนให้ชัดเจนขึ้นแล้ว — ไม่ใช่ query ดิบของผู้ใช้) ก่อนเสมอ — parse ได้และ apply จริง
-    ไปแล้ว คืนผลนั้นตรงๆ ไม่ได้ (คำสั่งซับซ้อนเกิน regex ตรงนี้จะ parse ได้) -> ลอง _match_and_apply_excel_edit
-    (ตัวจับคู่ label เดี่ยวเดิม ใช้ LLM แค่จับคู่ label แต่ apply/เขียนข้อความยืนยันด้วยโค้ด ไม่ให้ LLM เขียนคำตอบ
-    เอง) ก่อนเสมอด้วย ยังไม่ match อีก -> ส่งเส้นทาง structural/agent เดิมต่อ (reuse rag_answer(structural_route=
-    True) ตัวเดียวกับที่ legacy cascade ใช้ทุกจุด) พร้อม edit_instruction แทน query เดิม (ให้ agent เห็นคำสั่งที่
-    ชัดเจนกว่า)"""
-    field_edits = route.get("field_edits")
-    if isinstance(field_edits, list) and field_edits:
-        result = apply_field_edits(target_doc["id"], user_id, field_edits)
-        return {"document_id": target_doc["id"], "answer": result["message"]}
-
-    edit_instruction = route.get("edit_instruction")
-    if not isinstance(edit_instruction, str) or not edit_instruction.strip():
-        edit_instruction = query
-    direct = _resolve_direct_structural_dispatch(edit_instruction, [target_doc], chat_id, user_id)
-    if direct is not None:
-        return direct
-    matcher_result = _match_and_apply_excel_edit(target_doc["id"], user_id, edit_instruction)
-    if matcher_result.get("matched"):
-        return {"document_id": target_doc["id"], "answer": matcher_result["message"]}
-    history = get_chat_messages(chat_id) if chat_id else []
-    answer, _sources = rag_answer(
-        edit_instruction, history=history, image_data=None, user_id=user_id, chat_id=chat_id,
-        structural_route=True, skip_legal_context=False,
-    )
-    return {"document_id": target_doc["id"], "answer": answer}
+    """field_edits/rate_changes/edit_instruction ผสมกันได้ในคำสั่งเดียว (compound edit) — logic จริงอยู่ใน
+    compound_edits.apply_compound_edit (ไฟล์แยก เพราะต้องใช้ชื่อที่นิยามหลังจุด import นี้ในไฟล์นี้เอง)"""
+    return apply_compound_edit(route, target_doc, query, user_id, chat_id)
 
 
 _EDIT_INTENT_FILE_REFERENCE_WORDS = (
@@ -10485,6 +10501,9 @@ def _resolve_llm_router_dispatch(
     if intent == "read_document":
         answer, used_doc_id = _answer_document_reading_question(query, active_docs, user_id, chat_id)
         return {"document_id": used_doc_id, "answer": answer}
+    if intent == "undo":
+        result = undo_last_edit(target_doc["id"], user_id)
+        return {"document_id": target_doc["id"], "answer": result["message"]}
     if intent in ("recommend_products", "general_question"):
         return _dispatch_router_advisor(query, user_id, chat_id, active_docs)
     if intent == "library_search":
@@ -10625,6 +10644,11 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
         "was_formula": was_formula,
         "message": message,
     }
+
+
+# compound_edits.py import ที่นี่ (หลังนิยาม apply_change_rate/_resolve_direct_structural_dispatch/
+# _match_and_apply_excel_edit/rag_answer ที่มันต้องใช้ทั้งหมดแล้ว) เหตุผล circular import เดียวกับ document_fields
+from compound_edits import apply_compound_edit
 
 
 @app.post("/api/excel-editor/upload")

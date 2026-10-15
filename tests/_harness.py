@@ -37,6 +37,7 @@ DB_PY = Path(__file__).parent.parent / "db.py"
 DOCUMENT_FIELDS_PY = Path(__file__).parent.parent / "document_fields.py"
 LLM_TOOLS_PY = Path(__file__).parent.parent / "llm_tools.py"
 ANSWER_GUARD_PY = Path(__file__).parent.parent / "answer_guard.py"
+COMPOUND_EDITS_PY = Path(__file__).parent.parent / "compound_edits.py"
 
 WANTED_MAIN_FUNCS = {
     "_json_safe_cell_value", "_parse_iso_datetime_like",
@@ -48,6 +49,7 @@ WANTED_MAIN_FUNCS = {
     "_compute_table_amount_values", "read_document_values", "_format_document_values_text", "_is_label_cell_formula",
     "_suggest_similar_labels", "_normalize_label",
     "_format_rate_number", "_rewrite_percent_text", "_rewrite_rate_formula", "_resolve_rate_formula",
+    "_format_display_value",
     "_split_rate_label_base_and_percent", "_format_money_value",
     "_build_rate_change_mutate_fn", "_label_side_effects", "_format_side_effect_lines",
     "_get_single_item_table",
@@ -129,7 +131,7 @@ WANTED_MAIN_CONSTS = {
     "_CANCEL_LATEST_TEXTS", "_CANCEL_ALL_TEXTS",
     "_PENDING_QUEUE_COMMAND_TRAILING_WORDS", "_PENDING_QUEUE_NEGATION_RE",
     "_OPEN_COMMAND_QUESTION_WORDS",
-    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE", "_UNDO_COMMAND_TEXTS",
+    "_TABLE_FIELD_THAI_NAMES", "_UNDO_HINT_LINE", "_UNDO_COMMAND_TEXTS", "_UNDO_COMMAND_MAX_TOKENS",
     "_STRUCTURAL_DIRECT_DELETE_RE", "_STRUCTURAL_DIRECT_RATE_RE",
     "_STRUCTURAL_CLAUSE_SPLIT_RE", "_STRUCTURAL_ITEM_NO_TARGET_RE",
     "_STRUCTURAL_DIRECT_FIELD_RE", "_STRUCTURAL_FIELD_NAME_MAP", "_STRUCTURAL_DIRECT_DESCRIPTION_RE",
@@ -764,12 +766,15 @@ def build_namespace() -> dict:
     document_fields_tree = ast.parse(DOCUMENT_FIELDS_PY.read_text(encoding="utf-8"))
     llm_tools_tree = ast.parse(LLM_TOOLS_PY.read_text(encoding="utf-8"))
     answer_guard_tree = ast.parse(ANSWER_GUARD_PY.read_text(encoding="utf-8"))
+    compound_edits_tree = ast.parse(COMPOUND_EDITS_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
     _extract_all(document_fields_tree, ns, "document_fields.py")
-    # llm_tools.py/answer_guard.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย _extract_all "หลัง" main.py เสมอ
+    # llm_tools.py/answer_guard.py/compound_edits.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย _extract_all
+    # "หลัง" main.py เสมอ
     _extract_all(llm_tools_tree, ns, "llm_tools.py")
     _extract_all(answer_guard_tree, ns, "answer_guard.py")
+    _extract_all(compound_edits_tree, ns, "compound_edits.py")
 
     # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
     # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง
