@@ -5421,36 +5421,41 @@ def _resolve_library_exact_match_dispatch(query: str, user_id: int, chat_id: int
     return None
 
 
-# คำอ้างถึงคลัง (คลัง/คลังไฟล์/คลังเอกสาร ล้วนมี "คลัง" เป็น substring อยู่แล้ว) + คำที่สื่อว่าขอ "ทั้งหมด" ไม่ใช่
-# ค้นเจาะจง — เช็คแยกสองชุดแทนวลีเต็มตายตัว (เดิมพลาด "ในคลังไฟล์มีอะไรบ้าง" เพราะไม่ตรงวลีไหนในชุดคำเป๊ะๆ เลย)
-_LIBRARY_FULL_LISTING_INTENT_WORDS = ("อะไรบ้าง", "ทั้งหมด", "ดูหน่อย", "ดูทั้งหมด")
 # คลังใหญ่เกินจำนวนนี้ -> แสดงจำนวนเอกสารแยกตามบริษัทแทนการแจกแจงทีละไฟล์ (กันข้อความยาวเกินไป) — ดู
 # _build_full_library_listing_answer
 _LIBRARY_FULL_LISTING_SIZE_CUTOFF = 30
 
 
 def _looks_like_full_library_listing_query(query: str) -> bool:
-    """เช็คด้วยโค้ดล้วนๆ ว่าข้อความนี้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" ไหม — ต้องมีคำว่า "คลัง" (ครอบคลุม
-    คลัง/คลังไฟล์/คลังเอกสารในตัว) และคำที่สื่อว่าขอทั้งหมด (ดู _LIBRARY_FULL_LISTING_INTENT_WORDS) ไม่ใช่คำสั่ง
-    แก้ไฟล์ปนมา (กันคำสั่งลบ/แก้ที่บังเอิญมีคำว่า "ทั้งหมด" ติดมาด้วย)"""
-    normalized = _normalize_thai_typos(query.strip()).lower()
-    if "คลัง" not in normalized:
+    """เช็คด้วยโค้ดล้วนๆ ว่าข้อความนี้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" ไหม — ต้องมีคำว่า "คลัง" ไม่มีคำสั่งแก้ไฟล์
+    ปนมา และทั้งข้อความเป็นคำทั่วไปล้วน (ดู _library_query_is_generic) มีคำเจาะจงปนมาแม้คำเดียว (เช่น
+    "ใบเสนอราคา"/ชื่อลูกค้า) -> False ให้ router ค้นแบบมีเงื่อนไขแทน"""
+    normalized = _normalize_thai_typos(query.strip())
+    if "คลัง" not in normalized.lower():
         return False
     if _query_has_edit_verb(normalized):
         return False
-    return any(word in normalized for word in _LIBRARY_FULL_LISTING_INTENT_WORDS)
+    return _library_query_is_generic(normalized)
 
 
-_LIBRARY_GENERIC_QUERY_TOKENS = {"ไฟล์", "เอกสาร", "ทั้งหมด", "คลัง", "ใน", "มี", "อะไร", "บ้าง", "ดู", "หน่อย"}
+_LIBRARY_GENERIC_QUERY_TOKENS = {
+    "ไฟล์", "เอกสาร", "ทั้งหมด", "คลัง", "ใน", "มี", "อะไร", "บ้าง", "อะไรบ้าง", "ดู", "หน่อย",
+    "ครับ", "ค่ะ", "คะ", "ขอ", "ให้", "แสดง", "รายการ",
+}
+# token ที่เป็นช่องว่าง/เครื่องหมายวรรคตอนล้วนๆ (ไม่มีตัวอักษร/ตัวเลขเลย) ไม่นับเป็นคำเจาะจง — ดู _library_query_is_generic
+_LIBRARY_GENERIC_TOKEN_PUNCT_RE = re.compile(r"^[\s\W_]+$")
 
 
 def _library_query_is_generic(library_query: Optional[str]) -> bool:
-    """True ถ้า library_query ว่างเปล่า หรือเหลือแค่คำทั่วไป (ไฟล์/เอกสาร/ทั้งหมด/คลัง/...) หลัง tokenize — ไม่มี
-    คำค้นเฉพาะเจาะจงจริงๆ ให้ใช้ full listing แทนการค้นแบบให้คะแนน (ดู _dispatch_router_library_search)"""
+    """True ถ้า library_query ว่างเปล่า หรือเหลือแค่คำทั่วไป/ช่องว่าง/เครื่องหมาย (ดู _LIBRARY_GENERIC_QUERY_TOKENS)
+    หลัง tokenize — ไม่มีคำค้นเฉพาะเจาะจงจริงๆ ให้ใช้ full listing แทนการค้นแบบให้คะแนน"""
     if not isinstance(library_query, str) or not library_query.strip():
         return True
     tokens = word_tokenize(_normalize_thai_typos(library_query.strip()), engine="newmm")
-    return not any(t.strip() and t not in _LIBRARY_GENERIC_QUERY_TOKENS for t in tokens)
+    return not any(
+        t.strip() and t not in _LIBRARY_GENERIC_QUERY_TOKENS and not _LIBRARY_GENERIC_TOKEN_PUNCT_RE.match(t)
+        for t in tokens
+    )
 
 
 def _build_full_library_listing_answer(chat_id: int) -> dict:
