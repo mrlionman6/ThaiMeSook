@@ -1245,7 +1245,7 @@ def _library_search_matched_on_text(exact_fields: list[str], candidate: dict, qu
 
 def _score_library_search_candidates(
     query: str, candidates: list[dict], bm25_scores: dict[int, float], embedding_scores: dict[int, float],
-    keyword_overlap: Optional[dict[int, bool]] = None,
+    keyword_overlap: Optional[dict[int, bool]] = None, limit: Optional[int] = _LIBRARY_SEARCH_MAX_RESULTS,
 ) -> list[dict]:
     """ให้คะแนนและเรียงไฟล์ในคลัง (candidates ผ่านการกรองด้วย filters มาแล้วจาก caller — ดู search_library)
     คะแนน = ตรงเป๊ะ (document_no/customer_code/project_code/customer_name — ดู _library_search_exact_match_
@@ -1262,7 +1262,8 @@ def _score_library_search_candidates(
     keyword_overlap ที่ caller ส่งมา) / "semantic" (ได้คะแนนจาก embedding ล้วนๆ ไม่มีคำตรงกันเลย) ผลอันดับ 1 เป็น
     "exact"/"keyword" -> ตัดผล "semantic" ล้วนๆ ทิ้งทั้งหมด (มีผลตรงคำจริงแล้ว ไม่ต้องเติมผลที่แค่หัวข้อคล้ายกัน)
 
-    คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS รายการ เรียงคะแนนมากไปน้อย แยกฟังก์ชันนี้ออกมาจาก search_library เพื่อให้
+    คืนสูงสุด limit รายการ (ค่าเริ่มต้น _LIBRARY_SEARCH_MAX_RESULTS — ใส่ None เพื่อเอาทุกรายการที่ผ่านเกณฑ์ ใช้
+    นับจำนวนจริงก่อนตัด — ดู search_library) เรียงคะแนนมากไปน้อย แยกฟังก์ชันนี้ออกมาจาก search_library เพื่อให้
     ทดสอบตรรกะให้คะแนน/กรองได้โดยไม่ต้องพึ่ง BM25Okapi/embed_model จริง (เทสต์ส่ง bm25_scores/embedding_scores/
     keyword_overlap มาตรงๆ ได้เลย)"""
     keyword_overlap = keyword_overlap or {}
@@ -1309,7 +1310,7 @@ def _score_library_search_candidates(
     scored.sort(key=lambda item: item["score"], reverse=True)
     if scored and scored[0]["match_type"] in ("exact", "keyword"):
         scored = [item for item in scored if item["match_type"] != "semantic"]
-    return scored[:_LIBRARY_SEARCH_MAX_RESULTS]
+    return scored[:limit] if limit is not None else scored
 
 
 def _library_search_build_candidates(enriched: list[dict], cards: dict, filters: Optional[dict]) -> list[dict]:
@@ -1330,7 +1331,9 @@ def _library_search_build_candidates(enriched: list[dict], cards: dict, filters:
     return candidates
 
 
-def search_library(query: str, user_id: Optional[int], filters: Optional[dict] = None) -> list[dict]:
+def search_library(
+    query: str, user_id: Optional[int], filters: Optional[dict] = None, return_total: bool = False,
+):
     """เครื่องมือค้นหาคลังเอกสารจากทุกข้อมูลที่ผู้ใช้อาจจำได้ (เลขที่เอกสาร/รหัส-ชื่อลูกค้า/รหัส-ชื่อโปรเจกต์/
     ชื่อไฟล์/รายการสินค้าในไฟล์/วันที่/ยอดเงิน/ความหมายใกล้เคียง) ด้วยเครื่องมือเดียว (ดู build_library_search_
     card ที่สร้าง "บัตรค้นหา" ของแต่ละไฟล์ไว้ล่วงหน้า) เคารพสิทธิ์การเห็นไฟล์แบบเดียวกับฟังก์ชันคลังเดิมทั้งหมด
@@ -1341,9 +1344,16 @@ def search_library(query: str, user_id: Optional[int], filters: Optional[dict] =
     ไฟล์ที่ยังไม่มีบัตรค้นหาเลย (รอ backfill ตอน startup อยู่ — ดู backfill_library_search_cards) ถูกข้ามไปก่อน
     ไม่ error คืนสูงสุด _LIBRARY_SEARCH_MAX_RESULTS ไฟล์เรียงคะแนน แต่ละไฟล์มี file_id/filename/customer_name/
     document_no/matched_on/exact/score log [LibrarySearch] hits=<n> top_score=<x> exact=<bool> เสมอ (ห้าม log
-    เนื้อหาไฟล์/คำค้นของผู้ใช้)"""
+    เนื้อหาไฟล์/คำค้นของผู้ใช้)
+
+    return_total=True: คืน (results, total_matched) แทน — total_matched คือจำนวนไฟล์ที่ผ่านเกณฑ์ทั้งหมด "ก่อน"
+    ตัดเหลือ _LIBRARY_SEARCH_MAX_RESULTS ใช้บอกผู้ใช้ว่าแสดงไม่ครบ (ดู _dispatch_router_library_search) ค่า
+    เริ่มต้น False คืน results เฉยๆ เหมือนเดิมทุกจุด ไม่กระทบ caller เดิม"""
     enriched = _get_enriched_library_files()
     cards = get_all_library_search_cards()
+
+    def _done(results: list[dict], total_matched: int):
+        return (results, total_matched) if return_total else results
 
     candidates = _library_search_build_candidates(enriched, cards, filters)
     if not candidates and filters and filters.get("document_type"):
@@ -1357,7 +1367,7 @@ def search_library(query: str, user_id: Optional[int], filters: Optional[dict] =
 
     if not candidates:
         print("[LibrarySearch] hits=0 top_score=0.000 exact=False")
-        return []
+        return _done([], 0)
 
     # ใช้ _tokenize_library_query (ไม่ใช่ word_tokenize ตรงๆ) ทั้งฝั่ง query และ corpus เสมอ — ตัดทิ้งโทเคน
     # ช่องว่าง/สั้นเกินไป/คำทั่วไปที่ไม่ช่วยแยกไฟล์ (ดู _LIBRARY_QUERY_STOPWORDS) เหตุการณ์จริงที่แก้ตอนพัฒนา:
@@ -1379,12 +1389,16 @@ def search_library(query: str, user_id: Optional[int], filters: Optional[dict] =
     query_embedding = embed_model.encode(query).tolist()
     embedding_scores = get_library_search_vector_scores_for_all(query_embedding)
 
-    results = _score_library_search_candidates(query, candidates, bm25_scores, embedding_scores, keyword_overlap)
+    all_results = _score_library_search_candidates(
+        query, candidates, bm25_scores, embedding_scores, keyword_overlap, limit=None,
+    )
+    total_matched = len(all_results)
+    results = all_results[:_LIBRARY_SEARCH_MAX_RESULTS]
 
     top_score = results[0]["score"] if results else 0.0
     exact = bool(results) and results[0]["exact"]
-    print(f"[LibrarySearch] hits={len(results)} top_score={top_score:.3f} exact={exact}")
-    return results
+    print(f"[LibrarySearch] hits={len(results)} total_matched={total_matched} top_score={top_score:.3f} exact={exact}")
+    return _done(results, total_matched)
 
 
 def execute_search_library(tool_input: dict, user_id: Optional[int]) -> dict:
@@ -5407,42 +5421,47 @@ def _resolve_library_exact_match_dispatch(query: str, user_id: int, chat_id: int
     return None
 
 
-# คำที่บ่งบอกว่าผู้ใช้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" (ไม่ใช่ของบริษัท/โปรเจกต์ใดบริษัทหนึ่งโดยเฉพาะ) — ดู
-# _looks_like_full_library_listing_query เหตุการณ์จริงที่แก้: "ในคลังมีเอกสารอะไรบ้าง" เคยถูก AI ตีความว่าต้อง
-# เรียก find_customers (เพราะ LIBRARY_LOGGED_IN_RULES เดิมพูดถึงแค่ "ถ้าผู้ใช้พูดถึงบริษัท") แล้วตอบรายชื่อบริษัท
-# กลับมาแทนรายชื่อเอกสารจริงๆ
-_LIBRARY_FULL_LISTING_KEYWORDS = (
-    "ในคลังมีเอกสารอะไรบ้าง", "คลังมีเอกสารอะไรบ้าง", "คลังมีไฟล์อะไรบ้าง", "ในคลังมีไฟล์อะไรบ้าง",
-    "เอกสารทั้งหมดในคลัง", "ไฟล์ทั้งหมดในคลัง", "มีเอกสารอะไรบ้างในคลัง", "มีไฟล์อะไรบ้างในคลัง",
-    "เอกสารในคลังมีอะไรบ้าง", "ไฟล์ในคลังมีอะไรบ้าง",
-)
+# คำอ้างถึงคลัง (คลัง/คลังไฟล์/คลังเอกสาร ล้วนมี "คลัง" เป็น substring อยู่แล้ว) + คำที่สื่อว่าขอ "ทั้งหมด" ไม่ใช่
+# ค้นเจาะจง — เช็คแยกสองชุดแทนวลีเต็มตายตัว (เดิมพลาด "ในคลังไฟล์มีอะไรบ้าง" เพราะไม่ตรงวลีไหนในชุดคำเป๊ะๆ เลย)
+_LIBRARY_FULL_LISTING_INTENT_WORDS = ("อะไรบ้าง", "ทั้งหมด", "ดูหน่อย", "ดูทั้งหมด")
 # คลังใหญ่เกินจำนวนนี้ -> แสดงจำนวนเอกสารแยกตามบริษัทแทนการแจกแจงทีละไฟล์ (กันข้อความยาวเกินไป) — ดู
-# _resolve_library_full_listing_dispatch
+# _build_full_library_listing_answer
 _LIBRARY_FULL_LISTING_SIZE_CUTOFF = 30
 
 
 def _looks_like_full_library_listing_query(query: str) -> bool:
-    """เช็คด้วยโค้ดล้วนๆ ว่าข้อความนี้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" ไหม (normalize เเ→แ ก่อนเช็ค เหตุการณ์จริง
-    เดียวกับ _looks_like_library_query — ผู้ใช้พิมพ์สระเอซ้ำบ่อย)"""
-    normalized = query.replace("เเ", "แ").lower()
-    return any(keyword.lower() in normalized for keyword in _LIBRARY_FULL_LISTING_KEYWORDS)
+    """เช็คด้วยโค้ดล้วนๆ ว่าข้อความนี้ขอ "รายชื่อเอกสารทั้งหมดในคลัง" ไหม — ต้องมีคำว่า "คลัง" (ครอบคลุม
+    คลัง/คลังไฟล์/คลังเอกสารในตัว) และคำที่สื่อว่าขอทั้งหมด (ดู _LIBRARY_FULL_LISTING_INTENT_WORDS) ไม่ใช่คำสั่ง
+    แก้ไฟล์ปนมา (กันคำสั่งลบ/แก้ที่บังเอิญมีคำว่า "ทั้งหมด" ติดมาด้วย)"""
+    normalized = _normalize_thai_typos(query.strip()).lower()
+    if "คลัง" not in normalized:
+        return False
+    if _query_has_edit_verb(normalized):
+        return False
+    return any(word in normalized for word in _LIBRARY_FULL_LISTING_INTENT_WORDS)
 
 
-def _resolve_library_full_listing_dispatch(query: str, chat_id: int) -> Optional[dict]:
-    """ตอบ "ในคลังมีเอกสารอะไรบ้าง" (และคำถามขอรายชื่อเอกสารทั้งหมดแบบเดียวกัน) ด้วยโค้ดล้วนๆ แทนที่จะปล่อยให้ AI
-    เดาว่าควรเรียกเครื่องมือไหน (ดู _looks_like_full_library_listing_query) จัดกลุ่มเอกสารตามลูกค้า (ไม่ใช่ตาม
-    โฟลเดอร์เหมือนรายการอื่นๆ — ดู _order_library_documents_by_customer) ไฟล์แม่แบบแยกไปต่อท้ายเป็นหัวข้อของ
-    ตัวเอง ใช้ _get_enriched_library_files ตรงๆ แล้วส่งต่อให้ _format_library_document_list/
-    _record_chat_document_listing เดิมจัดรูปแบบ+บันทึกเลขข้อ (ให้ select_list_item ใช้ต่อได้ปกติ) เหมือนรายการ
-    คลังตัวอื่นๆ ทุกจุด
+_LIBRARY_GENERIC_QUERY_TOKENS = {"ไฟล์", "เอกสาร", "ทั้งหมด", "คลัง", "ใน", "มี", "อะไร", "บ้าง", "ดู", "หน่อย"}
+
+
+def _library_query_is_generic(library_query: Optional[str]) -> bool:
+    """True ถ้า library_query ว่างเปล่า หรือเหลือแค่คำทั่วไป (ไฟล์/เอกสาร/ทั้งหมด/คลัง/...) หลัง tokenize — ไม่มี
+    คำค้นเฉพาะเจาะจงจริงๆ ให้ใช้ full listing แทนการค้นแบบให้คะแนน (ดู _dispatch_router_library_search)"""
+    if not isinstance(library_query, str) or not library_query.strip():
+        return True
+    tokens = word_tokenize(_normalize_thai_typos(library_query.strip()), engine="newmm")
+    return not any(t.strip() and t not in _LIBRARY_GENERIC_QUERY_TOKENS for t in tokens)
+
+
+def _build_full_library_listing_answer(chat_id: int) -> dict:
+    """จัดกลุ่มเอกสารตามลูกค้า (ไม่ใช่ตามโฟลเดอร์เหมือนรายการอื่นๆ — ดู _order_library_documents_by_customer)
+    ไฟล์แม่แบบแยกไปต่อท้ายเป็นหัวข้อของตัวเอง ใช้ _get_enriched_library_files ตรงๆ แล้วส่งต่อให้
+    _format_library_document_list/_record_chat_document_listing เดิมจัดรูปแบบ+บันทึกเลขข้อ (ให้ select_list_item
+    ใช้ต่อได้ปกติ) เหมือนรายการคลังตัวอื่นๆ ทุกจุด
 
     คลังมีเอกสาร (ไม่รวมแม่แบบ) เกิน _LIBRARY_FULL_LISTING_SIZE_CUTOFF ไฟล์ -> ไม่แจกแจงทีละไฟล์ (ข้อความจะยาว
     เกินไป) แสดงจำนวนเอกสารแยกตามบริษัทแทน (เหมือน find_customers) พร้อมขอให้ระบุชื่อบริษัทต่อ บันทึกเป็นรายการ
-    บริษัท (kind="customers") แทนรายการเอกสาร เพื่อให้เลือกข้อต่อได้เหมือน find_customers คืน None ถ้าข้อความนี้
-    ไม่ใช่คำถามแบบนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)"""
-    if not _looks_like_full_library_listing_query(query):
-        return None
-
+    บริษัท (kind="customers") แทนรายการเอกสาร เพื่อให้เลือกข้อต่อได้เหมือน find_customers"""
     enriched = _get_enriched_library_files()
     non_templates = [doc for doc in enriched if not doc["is_template"]]
     templates = [doc for doc in enriched if doc["is_template"]]
@@ -5475,6 +5494,15 @@ def _resolve_library_full_listing_dispatch(query: str, chat_id: int) -> Optional
     if templates:
         answer += "\n\n" + _format_library_document_list("**ไฟล์แม่แบบ**", templates)
     return {"document_id": None, "answer": answer}
+
+
+def _resolve_library_full_listing_dispatch(query: str, chat_id: int) -> Optional[dict]:
+    """ตอบ "ในคลังมีเอกสารอะไรบ้าง" (และคำถามขอรายชื่อเอกสารทั้งหมดแบบเดียวกัน) ด้วยโค้ดล้วนๆ แทนที่จะปล่อยให้ AI
+    เดาว่าควรเรียกเครื่องมือไหน คืน None ถ้าข้อความนี้ไม่ใช่คำถามแบบนี้เลย (ปล่อยให้ ask_question() ตรวจทางอื่นต่อ)
+    — ดู _looks_like_full_library_listing_query/_build_full_library_listing_answer"""
+    if not _looks_like_full_library_listing_query(query):
+        return None
+    return _build_full_library_listing_answer(chat_id)
 
 
 @app.post("/ask")
@@ -10396,24 +10424,26 @@ def _dispatch_router_legal(query: str, user_id: Optional[int], chat_id: Optional
 
 
 def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[int], chat_id: Optional[int]) -> dict:
-    """ลอง _resolve_library_full_listing_dispatch ก่อนเสมอ (ของเดิมจาก fix/library-search-precision — จับคำถามขอ
-    รายชื่อเอกสารทั้งหมดในคลัง เช่น "ในคลังมีเอกสารอะไรบ้าง" จัดกลุ่มตามลูกค้า+แม่แบบแยกท้าย คลังใหญ่เกิน 30 ไฟล์
-    แสดงจำนวนต่อบริษัทแทน — คืน None เองถ้าไม่ใช่คำถามแบบนี้) ไม่ใช่ค่อยค้นแบบมีคะแนนด้วย search_library(library_
-    query, library_filters) แล้วจัดรายการด้วยโค้ด (_format_library_document_list + บันทึก listing ให้ตอบเลขข้อ
-    เปิดได้ต่อ — เหมือนทางลัด _resolve_library_exact_match_dispatch เดิม) ไม่มีผลเลยสักไฟล์ -> ส่งต่อให้
-    rag_answer(skip_legal_context=True) ให้ agent คลังเดิม (find_customers/list_customer_documents/ฯลฯ) ลองทางอื่น
-    ต่อ แทนที่จะตอบ "ไม่พบ" ทันที"""
+    """ลอง _resolve_library_full_listing_dispatch ก่อนเสมอ (จับคำถามขอรายชื่อเอกสารทั้งหมดในคลังด้วยคำตรงๆ — คืน
+    None เองถ้าไม่ใช่) ไม่ใช่แล้วดู library_query ของ router เอง: ว่าง/เป็นคำทั่วไปไม่มี filter (ดู
+    _library_query_is_generic) -> ก็ยังถือเป็นคำขอรายชื่อทั้งหมดเหมือนกัน (ครอบเคสคำถามที่ไม่ตรงคำตายตัวแต่
+    router ตีความถูกแล้ว) ไม่งั้นค่อยค้นแบบมีคะแนนด้วย search_library(library_query, library_filters) แล้วจัด
+    รายการด้วยโค้ด ผลถูกตัดเหลือ _LIBRARY_SEARCH_MAX_RESULTS -> บอกจำนวนจริงไว้ด้วย ไม่ตัดเงียบ ไม่มีผลเลยสักไฟล์
+    -> ส่งต่อให้ rag_answer(skip_legal_context=True) ให้ agent คลังเดิมลองทางอื่นต่อแทนที่จะตอบ "ไม่พบ" ทันที"""
     full_listing = _resolve_library_full_listing_dispatch(query, chat_id)
     if full_listing is not None:
         return full_listing
 
-    library_query = route.get("library_query")
-    if not isinstance(library_query, str) or not library_query.strip():
-        library_query = query
+    raw_library_query = route.get("library_query")
     raw_filters = route.get("library_filters")
     filters = raw_filters if isinstance(raw_filters, dict) and raw_filters else None
 
-    results = search_library(library_query, user_id, filters=filters)
+    if filters is None and _library_query_is_generic(raw_library_query):
+        return _build_full_library_listing_answer(chat_id)
+
+    library_query = raw_library_query if isinstance(raw_library_query, str) and raw_library_query.strip() else query
+
+    results, total_matched = search_library(library_query, user_id, filters=filters, return_total=True)
     enriched_by_id = {f["file_id"]: f for f in _get_enriched_library_files()} if results else {}
     listing_files = [enriched_by_id[r["file_id"]] for r in results if r["file_id"] in enriched_by_id]
 
@@ -10427,6 +10457,11 @@ def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[i
 
     _record_chat_document_listing(chat_id, listing_files)
     listing_text = _format_library_document_list("พบเอกสารที่ตรงกับคำค้นนี้:", listing_files)
+    if total_matched > len(listing_files):
+        listing_text += (
+            f"\n\n(แสดง {len(listing_files)} จาก {total_matched} รายการ — "
+            "พิมพ์ \"ในคลังมีอะไรบ้าง\" เพื่อดูทั้งหมด)"
+        )
     return {"document_id": None, "answer": listing_text + "\n\nต้องการเปิดข้อไหนครับ"}
 
 
