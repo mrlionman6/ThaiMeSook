@@ -1544,10 +1544,13 @@ def _resolve_flat_document_labels(documents: list[dict]) -> list[str]:
     return labels
 
 
-def _format_document_line_flat(n: int, doc: dict, label: str) -> str:
-    """สร้างบรรทัดเดียวของรายการเอกสารแบบแบน: "N. <label> (<โฟลเดอร์> · เลขเอกสาร <document_no> · มีมาโคร)"
-    ข้ามส่วนที่ไม่มีข้อมูลในวงเล็บ ไม่มีวงเล็บเลยถ้าไม่มีข้อมูลสักส่วนเดียว"""
+def _format_document_line_flat(n: int, doc: dict, label: str, show_customer: bool = True) -> str:
+    """สร้างบรรทัดเดียวของรายการเอกสารแบบแบน: "N. <label> (<ลูกค้า> · <โฟลเดอร์> · เลขเอกสาร <document_no> ·
+    มีมาโคร)" ข้ามส่วนที่ไม่มีข้อมูลในวงเล็บ ไม่มีวงเล็บเลยถ้าไม่มีข้อมูลสักส่วนเดียว show_customer=False (ใช้ตอน
+    title ของรายการมีชื่อบริษัทอยู่แล้ว — ดู execute_list_customer_documents) หรือไฟล์แม่แบบ -> ไม่ใส่ชื่อบริษัท"""
     paren_parts = []
+    if show_customer and not doc.get("is_template") and doc.get("customer_name"):
+        paren_parts.append(_escape_markdown_text(doc["customer_name"]))
     if doc.get("folder"):
         paren_parts.append(_escape_markdown_text(doc["folder"]))
     if doc.get("document_no"):
@@ -1562,7 +1565,7 @@ def _format_document_line_flat(n: int, doc: dict, label: str) -> str:
 
 
 def _format_library_document_list(
-    title: str, documents: list[dict], order_fn=_order_library_documents_by_folder,
+    title: str, documents: list[dict], order_fn=_order_library_documents_by_folder, show_customer: bool = True,
 ) -> str:
     """สร้างรายการเอกสารแบบ markdown ด้วยโค้ดล้วนๆ แบบแบน (ไม่มีหัวกลุ่มโฟลเดอร์แล้ว) เรียงตาม order_fn (default
     จัดกลุ่มตามโฟลเดอร์ — ดู _order_library_documents_by_folder) แล้วตามลำดับเดิม ลำดับนี้ต้องตรงกับที่บันทึกใน
@@ -1570,7 +1573,8 @@ def _format_library_document_list(
     เดียวกันทั้ง list_customer_documents, list_project_documents, list_templates (title ต่างกันไปตามบริบท) และ
     _resolve_library_full_listing_dispatch (ส่ง order_fn=_order_library_documents_by_customer แทน default) ห้าม
     แสดง customer_code/project_code เลย (ใช้ project_name หรือชื่อไฟล์แทน) เลขเอกสาร (document_no) แสดงได้ในวงเล็บ
-    ท้ายบรรทัด ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู LIBRARY_LOGGED_IN_RULES)"""
+    ท้ายบรรทัด show_customer=False ตัดชื่อบริษัทออกจากวงเล็บทุกบรรทัด (ใช้ตอน title มีชื่อบริษัทอยู่แล้ว — ดู
+    _format_document_line_flat) ห้าม Claude จัดรูปแบบรายการนี้ใหม่เอง (ดู LIBRARY_LOGGED_IN_RULES)"""
     if not documents:
         return f"{title}\n\n(ไม่มีเอกสาร)"
 
@@ -1579,7 +1583,7 @@ def _format_library_document_list(
 
     lines = [title, ""]
     for n, (doc, label) in enumerate(zip(ordered, labels), start=1):
-        lines.append(_format_document_line_flat(n, doc, label))
+        lines.append(_format_document_line_flat(n, doc, label, show_customer=show_customer))
 
     return "\n".join(lines)
 
@@ -1787,7 +1791,7 @@ def execute_list_customer_documents(tool_input: dict, chat_id: int) -> dict:
     documents = result["documents"]
     _record_chat_document_listing(chat_id, documents)
     title = f"**{customer_row.get('customer_name') or customer_row['customer_code']}** มี {len(documents)} เอกสาร"
-    formatted = _format_library_document_list(title, documents)
+    formatted = _format_library_document_list(title, documents, show_customer=False)
     return {"count": len(documents), "formatted": formatted}
 
 
