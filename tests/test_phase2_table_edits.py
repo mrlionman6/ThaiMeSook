@@ -2473,7 +2473,7 @@ def test_resolve_library_full_listing_dispatch_shows_customer_counts_when_librar
     result = ns["_resolve_library_full_listing_dispatch"]("ในคลังมีเอกสารอะไรบ้าง", chat_id=1)
     assert result is not None
     assert result["document_id"] is None
-    assert "31 ไฟล์" in result["answer"]
+    assert "เอกสาร 31" in result["answer"]
     assert "ระบุชื่อบริษัท" in result["answer"]
 
     listing = fake_db.get_chat_last_listing(1)

@@ -13,6 +13,7 @@ import time
 import re
 import html
 import json
+import types
 import zipfile
 import difflib
 import datetime
@@ -38,6 +39,7 @@ DOCUMENT_FIELDS_PY = Path(__file__).parent.parent / "document_fields.py"
 LLM_TOOLS_PY = Path(__file__).parent.parent / "llm_tools.py"
 ANSWER_GUARD_PY = Path(__file__).parent.parent / "answer_guard.py"
 COMPOUND_EDITS_PY = Path(__file__).parent.parent / "compound_edits.py"
+MULTI_DOCS_PY = Path(__file__).parent.parent / "multi_docs.py"
 
 WANTED_MAIN_FUNCS = {
     "_json_safe_cell_value", "_parse_iso_datetime_like",
@@ -111,12 +113,15 @@ WANTED_MAIN_FUNCS = {
     "_list_preview_sheet_summaries", "_render_sheet_window", "_merge_preview_highlight",
     "_resolve_preview_mode_bytes", "_preview_cache_get", "_preview_cache_set",
     "_build_router_document_context", "_format_router_editable_fields_text",
+    "_build_router_open_documents_context", "_enrich_chat_documents",
     "_build_router_recommendations_context", "_build_router_history_context",
     "_resolve_router_target_document", "route_intent_with_llm",
     "_dispatch_router_edit_document", "_dispatch_router_recommendation_action", "_dispatch_router_advisor",
     "_dispatch_router_legal", "_dispatch_router_library_search", "_dispatch_router_clarification",
     "_is_router_clarification_fresh",
     "_resolve_llm_router_dispatch",
+    "execute_compare_chat_documents", "_compare_editable_documents", "_build_comparison_table",
+    "_label_group_and_display", "_format_number_diff",
     "_normalize_thai_typos", "_query_has_edit_verb", "_force_structural_edit_dispatch",
     "_query_references_open_file", "_resolve_fallback_edit_intent", "_query_has_edit_command_form",
 }
@@ -136,6 +141,7 @@ WANTED_MAIN_CONSTS = {
     "_UNDO_QUESTION_MARKERS", "_COMPOUND_GROUP_MARKER_RE",
     "_STRUCTURAL_DIRECT_DELETE_RE", "_STRUCTURAL_DIRECT_RATE_RE",
     "_STRUCTURAL_CLAUSE_SPLIT_RE", "_STRUCTURAL_ITEM_NO_TARGET_RE",
+    "_LABEL_HEADING_SUFFIX_RE", "_OPEN_COMMAND_MULTI_STEP_WORDS",
     "_STRUCTURAL_DIRECT_FIELD_RE", "_STRUCTURAL_FIELD_NAME_MAP", "_STRUCTURAL_DIRECT_DESCRIPTION_RE",
     "_LABEL_TRAILING_PUNCTUATION", "_TABLE_NON_FORMULA_AMOUNT_ERROR",
     "EXCEL_EDITOR_SYSTEM_PROMPT", "FORMULA_EDIT_WARNING_NOTICE",
@@ -782,14 +788,22 @@ def build_namespace() -> dict:
     llm_tools_tree = ast.parse(LLM_TOOLS_PY.read_text(encoding="utf-8"))
     answer_guard_tree = ast.parse(ANSWER_GUARD_PY.read_text(encoding="utf-8"))
     compound_edits_tree = ast.parse(COMPOUND_EDITS_PY.read_text(encoding="utf-8"))
+    multi_docs_tree = ast.parse(MULTI_DOCS_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
     _extract_all(document_fields_tree, ns, "document_fields.py")
-    # llm_tools.py/answer_guard.py/compound_edits.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย _extract_all
-    # "หลัง" main.py เสมอ
+    # llm_tools.py/answer_guard.py/compound_edits.py/multi_docs.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย
+    # _extract_all "หลัง" main.py เสมอ
     _extract_all(llm_tools_tree, ns, "llm_tools.py")
     _extract_all(answer_guard_tree, ns, "answer_guard.py")
     _extract_all(compound_edits_tree, ns, "compound_edits.py")
+    _extract_all(multi_docs_tree, ns, "multi_docs.py")
+    # main.py เรียกผ่าน "multi_docs.ชื่อฟังก์ชัน(...)" ไม่ใช่ import ตรงๆ (ต่างจาก document_fields.py/compound_
+    # edits.py) ต้องมี ns["multi_docs"] เป็นอ็อบเจ็กต์ที่มี attribute นี้จริงๆ ด้วย ไม่ใช่แค่ชื่อแบนใน ns เฉยๆ
+    ns["multi_docs"] = types.SimpleNamespace(
+        dispatch_compare_documents=ns["dispatch_compare_documents"],
+        _resolve_compare_target_ids=ns["_resolve_compare_target_ids"],
+    )
 
     # run_agentic_tool_loop อยู่ใน WANTED_MAIN_FUNCS (ดึงของจริงมาเพื่อทดสอบ pause_turn/citation joining โดยตรง
     # — ดู _FakeAgenticResponse/_FakeAnthropicClient.response_queue) แต่ rag_answer/advisor_answer (ดึงของจริง
