@@ -6695,7 +6695,10 @@ def run_legal_retrieval_eval_endpoint(_: bool = Depends(require_login)):
     ดู legal_retrieval.run_eval"""
     if not os.path.exists(legal_retrieval.DEFAULT_EVAL_PATH):
         raise HTTPException(status_code=404, detail=f"ไม่พบไฟล์ {legal_retrieval.DEFAULT_EVAL_PATH}")
-    return legal_retrieval.run_eval()
+    try:
+        return legal_retrieval.run_eval()
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/admin/api/agent/run")
 def run_agent_job(body: AgentJobStart, _: bool = Depends(require_login)):

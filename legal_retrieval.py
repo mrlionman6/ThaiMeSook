@@ -123,10 +123,10 @@ def legal_search(
 DEFAULT_EVAL_PATH = "eval/legal_eval_v1.json"
 
 
-def _case_match_rank(case: dict, results: list[dict], limit: int = 3) -> Optional[int]:
-    """คืนอันดับ (1-indexed) ของผลลัพธ์แรกที่ content มี chunk_keys ของ case นี้ปนอยู่ (substring ไม่สนตัวพิมพ์เล็ก-
+def _case_match_rank(expected_substrings: list[str], results: list[dict], limit: int = 3) -> Optional[int]:
+    """คืนอันดับ (1-indexed) ของผลลัพธ์แรกที่ content มี substring ใน expected_substrings ปนอยู่ (ไม่สนตัวพิมพ์เล็ก-
     ใหญ่) คืน None ถ้าไม่เจอ"""
-    keys = [k.lower() for k in (case.get("chunk_keys") or [])]
+    keys = [k.lower() for k in expected_substrings]
     if not keys:
         return None
     for rank, r in enumerate(results[:limit], start=1):
@@ -136,18 +136,18 @@ def _case_match_rank(case: dict, results: list[dict], limit: int = 3) -> Optiona
     return None
 
 
-def _score_case(case: dict, results: list[dict]) -> dict:
-    """ให้คะแนน 1 คำถาม 1 รอบ (baseline หรือ tag+vector) — type ปกติ: hit@1/hit@3/mrr จาก _case_match_rank type=
-    "out_of_kb": out_of_kb_pass แทน (ผ่านเมื่อคะแนน rerank อันดับ 1 ต่ำกว่า OUT_OF_KB_SCORE_THRESHOLD)"""
+def _score_case(question: dict, results: list[dict], expected_substrings: list[str]) -> dict:
+    """ให้คะแนน 1 คำถาม 1 รอบ (baseline หรือ tag+vector) — type ปกติ: hit@1/hit@3/mrr type="out_of_kb":
+    out_of_kb_pass แทน (ไม่นับ hit@k — ผ่านเมื่อคะแนน rerank อันดับ 1 ต่ำกว่า OUT_OF_KB_SCORE_THRESHOLD)"""
     top_score = results[0]["score"] if results else float("-inf")
     found_ids = [r["id"] for r in results[:3]]
-    if case.get("type") == "out_of_kb":
+    if question.get("type") == "out_of_kb":
         return {
             "rank": None, "hit_at_1": False, "hit_at_3": False, "mrr": 0.0,
             "out_of_kb_pass": top_score < OUT_OF_KB_SCORE_THRESHOLD,
             "top_score": top_score, "found_ids": found_ids,
         }
-    rank = _case_match_rank(case, results, limit=3)
+    rank = _case_match_rank(expected_substrings, results, limit=3)
     return {
         "rank": rank, "hit_at_1": rank == 1, "hit_at_3": rank is not None,
         "mrr": (1.0 / rank) if rank else 0.0, "out_of_kb_pass": None,
@@ -190,31 +190,43 @@ def _aggregate(cases: list[dict], scores: list[dict]) -> dict:
 
 
 def run_eval(eval_path: str = DEFAULT_EVAL_PATH) -> dict:
-    """รันทุกคำถามใน eval_path 2 แบบ (baseline: beta=0, tag_vector: beta=DEFAULT_BETA) ไม่เรียก LLM เลย คืน
-    {"baseline":{...}, "tag_vector":{...}, "cases":[...]} ให้หน้า admin render ตาราง"""
+    """รันทุกคำถามใน eval_path (schema: version/chunk_keys/questions) 2 แบบ ไม่เรียก LLM เลย คืน
+    {"baseline":{...}, "tag_vector":{...}, "cases":[...], "threshold":...} ให้หน้า admin render ตาราง"""
     with open(eval_path, encoding="utf-8") as f:
-        cases = json.load(f)["cases"]
+        data = json.load(f)
+
+    if "questions" not in data or "chunk_keys" not in data:
+        # ห้าม fallback ไปอ่าน schema เก่า ("cases") เงียบๆ — ไฟล์ผิด schema ต้องแก้ไฟล์ ไม่ใช่เดาโครงสร้างแทน
+        raise ValueError(
+            f"{eval_path} ไม่ตรง schema ที่ต้องการ (ต้องมี \"chunk_keys\" และ \"questions\" — "
+            "ไฟล์นี้อาจยังเป็น schema เก่าที่มีแค่ \"cases\")"
+        )
+
+    chunk_keys_map = data["chunk_keys"]
+    questions = data["questions"]
 
     baseline_scores, tag_vector_scores, rows = [], [], []
-    for case in cases:
-        query = case["query"]
+    for q in questions:
+        query = q["question"]
+        expected_substrings = [chunk_keys_map[cid] for cid in (q.get("expected") or []) if cid in chunk_keys_map]
+
         baseline_results = legal_search(query, beta=0)
         tag_vector_results = legal_search(query, beta=DEFAULT_BETA)
 
-        baseline_score = _score_case(case, baseline_results)
-        tag_vector_score = _score_case(case, tag_vector_results)
+        baseline_score = _score_case(q, baseline_results, expected_substrings)
+        tag_vector_score = _score_case(q, tag_vector_results, expected_substrings)
         baseline_scores.append(baseline_score)
         tag_vector_scores.append(tag_vector_score)
 
         rows.append({
-            "id": case["id"], "type": case.get("type"), "query": query,
-            "chunk_keys": case.get("chunk_keys") or [],
+            "id": q["id"], "type": q.get("type"), "query": query,
+            "chunk_keys": expected_substrings,
             "baseline": baseline_score, "tag_vector": tag_vector_score,
         })
 
     return {
-        "baseline": _aggregate(cases, baseline_scores),
-        "tag_vector": _aggregate(cases, tag_vector_scores),
+        "baseline": _aggregate(questions, baseline_scores),
+        "tag_vector": _aggregate(questions, tag_vector_scores),
         "cases": rows,
         "threshold": OUT_OF_KB_SCORE_THRESHOLD,  # ค่าจริงที่ production ใช้ตัดสิน 📚/💡 — ให้หน้า admin ใช้เป็นค่าเริ่มต้น
     }
