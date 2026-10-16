@@ -2374,6 +2374,9 @@ def execute_compare_chat_documents(tool_input: dict, user_id: int, chat_id: int)
     set_chat_document_focus(chat_id, doc_b["id"])
     return {"compared": True, "result": diff_text}
 
+# deferred import (หลังนิยาม execute_compare_chat_documents ที่ multi_docs.py ต้องใช้) — ดู docstring ของไฟล์นั้น
+import multi_docs
+
 
 def execute_edit_chat_document(tool_input: dict, user_id: int, chat_id: int) -> dict:
     doc = _get_active_chat_document(tool_input.get("document_id"), user_id, chat_id)
@@ -3158,7 +3161,7 @@ def _get_document_version_marker(document: dict) -> Optional[int]:
 
 
 _OPEN_COMMAND_PREFIXES = ("เปิดไฟล์", "เปิด")  # "เปิดไฟล์" ก่อนเสมอ (ยาวกว่า เฉพาะเจาะจงกว่า) ค่อย "เปิด" เฉยๆ
-_OPEN_COMMAND_MULTI_STEP_WORDS = ("แล้ว", "และ", "กับ", "เปรียบเทียบ", "แก้", "ด้วย")
+_OPEN_COMMAND_MULTI_STEP_WORDS = ("แล้ว", "และ", "กับ", "เปรียบเทียบ", "แก้")
 # คำ/เครื่องหมายที่บ่งบอกว่าข้อความนี้เป็น "คำถาม" ไม่ใช่คำสั่งเปิดไฟล์ — เหตุการณ์จริงที่แก้: "เปิดบริษัทต่างชาติ
 # ในไทยต้องทำอะไรบ้าง" ขึ้นต้นด้วย "เปิด" (พูดถึงการเปิดบริษัท ไม่ใช่เปิดไฟล์) แต่ถูกทางลัดนี้ดักไปค้นคลังเอกสาร
 # แล้วได้รายการไฟล์มาแทนที่จะตอบคำถามจริงๆ
@@ -5443,7 +5446,7 @@ def _looks_like_full_library_listing_query(query: str) -> bool:
 
 
 _LIBRARY_GENERIC_QUERY_TOKENS = {
-    "ไฟล์", "เอกสาร", "ทั้งหมด", "คลัง", "ใน", "มี", "อะไร", "บ้าง", "อะไรบ้าง", "ดู", "หน่อย",
+    "ไฟล์", "เอกสาร", "ทั้งหมด", "คลัง", "ใน", "มี", "อะไร", "บ้าง", "อะไรบ้าง", "ดู", "หน่อย", "กี่",
     "ครับ", "ค่ะ", "คะ", "ขอ", "ให้", "แสดง", "รายการ",
 }
 # token ที่เป็นช่องว่าง/เครื่องหมายวรรคตอนล้วนๆ (ไม่มีตัวอักษร/ตัวเลขเลย) ไม่นับเป็นคำเจาะจง — ดู _library_query_is_generic
@@ -5474,6 +5477,8 @@ def _build_full_library_listing_answer(chat_id: int) -> dict:
     enriched = _get_enriched_library_files()
     non_templates = [doc for doc in enriched if not doc["is_template"]]
     templates = [doc for doc in enriched if doc["is_template"]]
+    # บรรทัดแรกของทุกคำตอบแบบ full listing — จำนวนมาจากโค้ดเสมอ ไม่ใช่ให้ LLM เล่า/นับเอง
+    count_line = f"ในคลังมีทั้งหมด {len(enriched)} รายการ (เอกสาร {len(non_templates)} · แม่แบบ {len(templates)})"
 
     if len(non_templates) > _LIBRARY_FULL_LISTING_SIZE_CUTOFF:
         counts_by_code: dict[str, dict] = {}
@@ -5490,14 +5495,14 @@ def _build_full_library_listing_answer(chat_id: int) -> dict:
         )
         _record_chat_customer_listing(chat_id, customers)
         answer = _format_customer_list(
-            f"คลังมีเอกสารทั้งหมด {len(non_templates)} ไฟล์ มากกว่า {_LIBRARY_FULL_LISTING_SIZE_CUTOFF} ไฟล์ "
-            "ขอแสดงจำนวนเอกสารแยกตามบริษัทแทน ระบุชื่อบริษัทที่ต้องการดูได้เลยครับ:",
+            f"{count_line}\n\nมากกว่า {_LIBRARY_FULL_LISTING_SIZE_CUTOFF} ไฟล์ ขอแสดงจำนวนเอกสารแยกตามบริษัทแทน "
+            "ระบุชื่อบริษัทที่ต้องการดูได้เลยครับ:",
             customers,
         )
         return {"document_id": None, "answer": answer}
 
     _record_chat_document_listing(chat_id, non_templates, order_fn=_order_library_documents_by_customer)
-    answer = _format_library_document_list(
+    answer = count_line + "\n\n" + _format_library_document_list(
         "**เอกสารทั้งหมดในคลัง**", non_templates, order_fn=_order_library_documents_by_customer,
     )
     if templates:
@@ -9997,7 +10002,7 @@ ROUTE_INTENT_TOOL = {
                 "enum": [
                     "edit_document", "replace_with_recommendation", "add_recommendation", "read_document",
                     "recommend_products", "library_search", "legal_question", "general_question",
-                    "ask_clarification", "undo",
+                    "ask_clarification", "undo", "compare_documents",
                 ],
             },
             "target_item_index": {
@@ -10098,6 +10103,21 @@ ROUTE_INTENT_TOOL = {
                     "contains_item": {"type": ["string", "null"]},
                 },
             },
+            "library_open_requested": {
+                "type": ["boolean", "null"],
+                "description": (
+                    "ใช้เมื่อ intent เป็น library_search เท่านั้น — true ถ้าผู้ใช้สั่งให้เปิดไฟล์ตรงๆ (เช่น \"เปิด "
+                    "X ด้วย\") ไม่ใช่แค่ถามหา/ค้นหาเฉยๆ (เช่น \"มีไฟล์ X ไหม\") ไม่แน่ใจใส่ null"
+                ),
+            },
+            "compare_document_ids": {
+                "type": ["array", "null"],
+                "description": (
+                    "ใช้เมื่อ intent เป็น compare_documents เท่านั้น — document_id (จาก \"ไฟล์ที่เปิดอยู่ทั้งหมด\") "
+                    "ที่ผู้ใช้ต้องการเทียบ ไม่แน่ใจครบทุกตัวก็ใส่เท่าที่มั่นใจ ไม่งั้นใส่ null"
+                ),
+                "items": {"type": "integer"},
+            },
             "clarification_question": {
                 "type": ["string", "null"],
                 "description": "ใช้เมื่อ intent เป็น ask_clarification เท่านั้น — คำถามเฉพาะเจาะจงที่จะถามกลับผู้ใช้ ไม่งั้นใส่ null",
@@ -10110,7 +10130,8 @@ ROUTE_INTENT_TOOL = {
         "required": [
             "intent", "target_item_index", "recommendation_index", "quantity", "price_mode", "explicit_price",
             "markup_percent", "edit_instruction", "field_edits", "rate_changes", "sub_commands", "library_query",
-            "library_filters", "clarification_question", "confidence",
+            "library_filters", "library_open_requested", "compare_document_ids", "clarification_question",
+            "confidence",
         ],
     },
 }
@@ -10149,10 +10170,14 @@ ROUTER_SYSTEM_PROMPT = (
     "- add_recommendation: ขอให้เพิ่มรุ่นแนะนำเป็นรายการใหม่ในตาราง (ไม่ใช่แทนของเดิม) เช่น \"เพิ่มรุ่นที่ 1 อีก 1 "
     "ชิ้น\"\n"
     "- read_document: ถามค่า/เนื้อหาในไฟล์ที่เปิดอยู่ ไม่ได้ขอให้แก้อะไร เช่น \"ยอดรวมเท่าไร\", \"มีรายการอะไรบ้าง\"\n"
+    "- compare_documents: ขอเปรียบเทียบ/ดูความต่างระหว่างไฟล์ที่เปิดอยู่ตั้งแต่ 2 ไฟล์ขึ้นไป เช่น \"เปรียบเทียบ"
+    "เอกสารสองอันนี้สิ\", \"สองอันนี้ต่างกันยังไง\" — ดู \"ไฟล์ที่เปิดอยู่ทั้งหมด\" ด้านล่าง ใส่ compare_document_ids "
+    "เป็น document_id ที่ผู้ใช้หมายถึง (พูดกว้างๆ ว่า \"สองอันนี้\"/\"ไฟล์พวกนี้\" ก็ใส่ทุกไฟล์ที่เปิดอยู่ตอนนี้ไปได้)\n"
     "- recommend_products: ขอคำแนะนำสินค้า/เปรียบเทียบรุ่น/ราคา เช่น \"แนะนำสาย CAT-6\", \"ตู้ Rack 9U รุ่นไหนดี\"\n"
     "- library_search: ถามหาเอกสารในคลัง (ไม่ใช่ไฟล์ที่เปิดอยู่ตอนนี้) ด้วยข้อมูลอะไรก็ได้ (เลขที่เอกสาร/ชื่อลูกค้า/"
     "รายการสินค้า/วันที่/ยอดเงิน) เช่น \"ในคลังมีเอกสารอะไรบ้าง\", \"ใบเสนอราคาที่ยอดเกิน 60,000\" — แตก "
-    "library_query + library_filters ให้เจาะจงที่สุดจากสิ่งที่ผู้ใช้พูด\n"
+    "library_query + library_filters ให้เจาะจงที่สุดจากสิ่งที่ผู้ใช้พูด ใส่ library_open_requested=true ถ้าผู้ใช้"
+    "สั่งให้ \"เปิด\" ไฟล์นั้นตรงๆ (เช่น \"เปิด X ด้วย\") ไม่ใช่แค่ถามหา/ค้นหาเฉยๆ\n"
     "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
     "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
     "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
@@ -10214,6 +10239,23 @@ def _build_router_document_context(target_doc: Optional[dict]) -> str:
     )
 
 
+def _build_router_open_documents_context(active_docs: list[dict], focus_doc_id: Optional[int]) -> str:
+    """รายชื่อไฟล์ที่เปิดอยู่ "ทุกไฟล์" (document_id/ชื่อไฟล์/ลูกค้า/ประเภทเอกสาร/เลขเอกสาร/focus) ให้ router เห็น
+    ครบ — ใช้เฉพาะเลือก compare_document_ids เท่านั้น ไม่กระทบวิธีเลือก target_doc ของ intent อื่น (ยังใช้ focus/
+    ไฟล์เดียวเหมือนเดิมทุกจุด — ดู _resolve_router_target_document)"""
+    if not active_docs:
+        return "ไม่มีไฟล์เปิดอยู่"
+    enriched = _enrich_chat_documents(active_docs)
+    lines = []
+    for doc in enriched:
+        focus_tag = " (focus)" if doc["id"] == focus_doc_id else ""
+        lines.append(
+            f"document_id={doc['id']} ชื่อไฟล์={doc['filename']} ลูกค้า={doc.get('customer_name') or '-'} "
+            f"ประเภทเอกสาร={doc.get('folder') or '-'} เลขเอกสาร={doc.get('document_no') or '-'}{focus_tag}"
+        )
+    return "\n".join(lines)
+
+
 def _build_router_recommendations_context(recommendations: list[dict]) -> str:
     """สร้างข้อความบริบท "รายการแนะนำล่าสุด" (เลขรุ่น/ชื่อ/ราคา/หน่วย) ให้ route_intent_with_llm — ไม่มีรายการ
     แนะนำเลย -> คืนข้อความคงที่ตรงๆ"""
@@ -10252,6 +10294,7 @@ def route_intent_with_llm(
 ) -> Optional[dict]:
     """เรียก Claude (model=ROUTER_MODEL, max_tokens=800, tool_choice บังคับ tool route_intent) ให้ตัดสิน intent +
     ดึงค่าที่เกี่ยวข้องออกมาเป็น JSON จากบริบททั้งหมด (ประวัติแชทล่าสุด 6 ข้อความ, ไฟล์ที่เปิดอยู่ + ตารางรายการ,
+    ไฟล์ที่เปิดอยู่ "ทุกไฟล์" (ดู _build_router_open_documents_context — ใช้เฉพาะ compare_documents),
     รายการแนะนำล่าสุด, สถานะล็อกอิน — ดู _build_router_*_context) ไม่ตรวจค่าอะไรเลยในนี้ (หน้าที่ของ
     _resolve_llm_router_dispatch) คืน dict ดิบจาก tool_use_block.input ตรงๆ หรือ None ถ้า LLM call ล้ม (API error/
     อื่นๆ)/ไม่เรียก tool เลย/parse ไม่ได้ (ปล่อยให้ caller fallback ไปใช้ routing เดิมทั้งหมด) ROUTER_MODE != "llm"
@@ -10260,11 +10303,14 @@ def route_intent_with_llm(
     if ROUTER_MODE != "llm":
         return None
     target_doc = _resolve_router_target_document(active_docs, user_id, chat_id)
+    focus_doc_id = get_chat_document_focus(chat_id, user_id) if (user_id and chat_id) else None
     recommendations = (get_chat_last_recommendations(chat_id) or []) if chat_id else []
 
     prompt = (
         f"ประวัติการสนทนาล่าสุด:\n{_build_router_history_context(chat_id)}\n\n"
         f"ไฟล์ที่เปิดอยู่:\n{_build_router_document_context(target_doc)}\n\n"
+        f"ไฟล์ที่เปิดอยู่ทั้งหมด (ใช้เลือก compare_document_ids เท่านั้น):\n"
+        f"{_build_router_open_documents_context(active_docs, focus_doc_id)}\n\n"
         f"รายการแนะนำล่าสุด:\n{_build_router_recommendations_context(recommendations)}\n\n"
         f"สถานะผู้ใช้: {'ล็อกอินอยู่' if user_id else 'ยังไม่ได้ล็อกอิน (guest)'}\n\n"
         f"ข้อความล่าสุดจากผู้ใช้: {query}"
@@ -10300,6 +10346,7 @@ _ROUTER_FILE_INTENTS = {
 }
 _ROUTER_VALID_INTENTS = _ROUTER_FILE_INTENTS | {
     "recommend_products", "library_search", "legal_question", "general_question", "ask_clarification",
+    "compare_documents",
 }
 _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระบบและเปิดไฟล์ในคลังเอกสารก่อนถึงจะแก้ไข/อ่านค่าในเอกสารได้ครับ"
 
@@ -10438,7 +10485,8 @@ def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[i
     _library_query_is_generic) -> ก็ยังถือเป็นคำขอรายชื่อทั้งหมดเหมือนกัน (ครอบเคสคำถามที่ไม่ตรงคำตายตัวแต่
     router ตีความถูกแล้ว) ไม่งั้นค่อยค้นแบบมีคะแนนด้วย search_library(library_query, library_filters) แล้วจัด
     รายการด้วยโค้ด ผลถูกตัดเหลือ _LIBRARY_SEARCH_MAX_RESULTS -> บอกจำนวนจริงไว้ด้วย ไม่ตัดเงียบ ไม่มีผลเลยสักไฟล์
-    -> ส่งต่อให้ rag_answer(skip_legal_context=True) ให้ agent คลังเดิมลองทางอื่นต่อแทนที่จะตอบ "ไม่พบ" ทันที"""
+    -> ส่งต่อให้ rag_answer(skip_legal_context=True) ให้ agent คลังเดิมลองทางอื่นต่อแทนที่จะตอบ "ไม่พบ" ทันที
+    เจอไฟล์เดียว+เปิดอยู่แล้ว/router สั่งเปิด -> เรียก execute_open_library_file ตรงๆ แทนการถามข้อ"""
     full_listing = _resolve_library_full_listing_dispatch(query, chat_id)
     if full_listing is not None:
         return full_listing
@@ -10463,6 +10511,21 @@ def _dispatch_router_library_search(route: dict, query: str, user_id: Optional[i
             structural_route=False, skip_legal_context=True, edit_intent=False,
         )
         return {"document_id": None, "answer": answer}
+
+    # เจอไฟล์เดียว + (เปิดอยู่ในแชทนี้แล้ว หรือ router บอกว่าเป็นคำสั่งเปิดจริงๆ) -> เปิด/ยืนยันสถานะด้วยโค้ดเลย
+    # (execute_open_library_file เช็ค already_open เองอยู่แล้ว) ไม่ถาม "ต้องการเปิดข้อไหน" ทั้งที่มีแค่ข้อเดียว
+    if len(listing_files) == 1:
+        target = listing_files[0]
+        already_open = any(
+            _normalize_filename_for_matching(d["filename"]) == _normalize_filename_for_matching(target["filename"])
+            for d in list_active_editable_documents_by_chat(chat_id, user_id)
+        )
+        if already_open or route.get("library_open_requested"):
+            tool_result = _safe_execute_tool(
+                "open_library_file", execute_open_library_file, {"file_id": target["file_id"]}, user_id, chat_id,
+            )
+            answer = tool_result.get("message") or tool_result.get("error") or "เปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
+            return {"document_id": tool_result.get("document_id"), "answer": answer}
 
     _record_chat_document_listing(chat_id, listing_files)
     listing_text = _format_library_document_list("พบเอกสารที่ตรงกับคำค้นนี้:", listing_files)
@@ -10548,6 +10611,8 @@ def _resolve_llm_router_dispatch(
 
     if intent in _ROUTER_FILE_INTENTS and not (user_id and chat_id):
         return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
+    if intent == "compare_documents" and not (user_id and chat_id):
+        return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
     if intent == "library_search" and not user_id:
         return {"document_id": None, "answer": _LIBRARY_LOGIN_REQUIRED_MESSAGE}
 
@@ -10573,6 +10638,8 @@ def _resolve_llm_router_dispatch(
     if intent == "undo":
         result = undo_last_edit(target_doc["id"], user_id)
         return {"document_id": target_doc["id"], "answer": result["message"]}
+    if intent == "compare_documents":
+        return multi_docs.dispatch_compare_documents(route, active_docs, chat_id, user_id)
     if intent in ("recommend_products", "general_question"):
         return _dispatch_router_advisor(query, user_id, chat_id, active_docs)
     if intent == "library_search":
