@@ -8,6 +8,9 @@ let pendingPageSize = 10;
 let kbPage = 1;
 let kbPageSize = 10;
 let kbSelectedTagIds = new Set(); // เก็บ tag id ที่กำลังกรองอยู่ (เลือกได้หลายอัน พร้อมกัน = OR)
+let kbSortMode = "id_asc"; // เรียงฝั่ง client จาก chunk ที่โหลดมาแล้วของหน้าปัจจุบัน ไม่ขอข้อมูลใหม่จาก server
+let kbLastChunks = []; // chunk ดิบของหน้าปัจจุบัน (ก่อนเรียง) เก็บไว้ให้ onKbSortChange เรียงใหม่โดยไม่ fetch ซ้ำ
+let kbLastTotal = 0; // จำนวนรวมจริงของตัวกรองปัจจุบัน (ไม่ใช่แค่จำนวนในหน้านี้) ไว้โชว์ตอน sort ซ้ำไม่ fetch ใหม่
 
 let userRequestsPage = 1;
 let userRequestsPageSize = 10;
@@ -154,34 +157,63 @@ async function loadKb(page = 1) {
             loadKb(1);
         });
 
-        if (data.chunks.length === 0) {
-            container.innerHTML = page === 1
-                ? "<p>ไม่มีข้อมูลตรงกับตัวกรองนี้</p>"
-                : "<p>ไม่มีรายการในหน้านี้</p>";
-            return;
-        }
-
-        container.innerHTML = `<p style="color:#666; font-size:14px;">ทั้งหมด ${data.total} รายการ</p>`;
-        data.chunks.forEach(chunk => {
-            const div = document.createElement("div");
-            div.className = "card";
-            div.id = "kb-" + chunk.id;
-            const tagsValue = (chunk.tags || []).join(", ");
-            const tagBadges = (chunk.tags || []).map(t => `<span class="kb-tag-badge">${escapeHtml(t)}</span>`).join(" ");
-            div.innerHTML = `
-                <p style="color:#888; font-size:12px; margin-bottom:4px;">#${chunk.id} ${tagBadges}</p>
-                <textarea id="kb-textarea-${chunk.id}" class="kb-textarea">${escapeHtml(chunk.content)}</textarea>
-                <input type="text" id="kb-tags-${chunk.id}" class="kb-tag-input" value="${escapeHtml(tagsValue)}" placeholder="Tag (คั่นด้วย ,)">
-                <div style="margin-top:8px;">
-                    <button onclick="saveKb(${chunk.id})">💾 บันทึก</button>
-                    <button onclick="deleteKb(${chunk.id})">🗑️ ลบ</button>
-                </div>
-            `;
-            container.appendChild(div);
-        });
+        kbLastChunks = data.chunks;
+        kbLastTotal = data.total;
+        renderKbList();
     } catch (error) {
         container.innerHTML = "<p style='color:red;'>โหลด Knowledge Base ไม่สำเร็จ: " + escapeHtml(String(error)) + "</p>";
     }
+}
+
+// เรียงฝั่ง client ล้วนๆ จาก chunk ของหน้าปัจจุบัน (ไม่ครอบคลุมทั้งคลัง) — พอสำหรับดูลำดับคร่าวๆ ในหน้าที่เปิดอยู่
+function sortKbChunks(chunks) {
+    const sorted = chunks.slice();
+    if (kbSortMode === "id_desc") {
+        sorted.sort((a, b) => b.id - a.id);
+    } else if (kbSortMode === "created_at") {
+        sorted.sort((a, b) => (a.created_at || "").localeCompare(b.created_at || ""));
+    } else if (kbSortMode === "tag") {
+        sorted.sort((a, b) => ((a.tags || [])[0] || "").localeCompare((b.tags || [])[0] || ""));
+    } else {
+        sorted.sort((a, b) => a.id - b.id); // id_asc (ค่าเริ่มต้น)
+    }
+    return sorted;
+}
+
+function onKbSortChange(mode) {
+    kbSortMode = mode;
+    renderKbList();
+}
+
+function renderKbList() {
+    const container = document.getElementById("kbContainer");
+    if (kbLastChunks.length === 0) {
+        container.innerHTML = kbPage === 1
+            ? "<p>ไม่มีข้อมูลตรงกับตัวกรองนี้</p>"
+            : "<p>ไม่มีรายการในหน้านี้</p>";
+        return;
+    }
+
+    const ordered = sortKbChunks(kbLastChunks);
+    container.innerHTML = `<p style="color:#666; font-size:14px;">ทั้งหมด ${kbLastTotal} รายการ</p>`;
+    ordered.forEach((chunk, i) => {
+        const ordinal = (kbPage - 1) * kbPageSize + i + 1; // ลำดับตามที่แสดงอยู่จริงหลังกรอง/เรียง ไม่ใช่ id ใน DB
+        const div = document.createElement("div");
+        div.className = "card";
+        div.id = "kb-" + chunk.id;
+        const tagsValue = (chunk.tags || []).join(", ");
+        const tagBadges = (chunk.tags || []).map(t => `<span class="kb-tag-badge">${escapeHtml(t)}</span>`).join(" ");
+        div.innerHTML = `
+            <p style="color:#888; font-size:12px; margin-bottom:4px;">ลำดับที่ ${ordinal} <span style="font-size:10px;">(#${chunk.id})</span> ${tagBadges}</p>
+            <textarea id="kb-textarea-${chunk.id}" class="kb-textarea">${escapeHtml(chunk.content)}</textarea>
+            <input type="text" id="kb-tags-${chunk.id}" class="kb-tag-input" value="${escapeHtml(tagsValue)}" placeholder="Tag (คั่นด้วย ,)">
+            <div style="margin-top:8px;">
+                <button onclick="saveKb(${chunk.id})">💾 บันทึก</button>
+                <button onclick="deleteKb(${chunk.id})">🗑️ ลบ</button>
+            </div>
+        `;
+        container.appendChild(div);
+    });
 }
 
 // ---------- ตัวกรอง tag ----------
@@ -687,6 +719,34 @@ async function deleteTagEntirely(tagId) {
     } catch (error) {
         alert("ลบไม่สำเร็จ: " + error);
     }
+}
+
+async function deleteUnusedTags() {
+    let data;
+    try {
+        const res = await fetch("/admin/api/tags");
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        data = await res.json();
+    } catch (error) {
+        alert("โหลดรายการ tag ไม่สำเร็จ: " + error);
+        return;
+    }
+
+    const unused = data.tags.filter(t => t.count === 0);
+    if (unused.length === 0) {
+        alert("ไม่มี tag ที่ไม่ได้ใช้งานเลย");
+        return;
+    }
+    const names = unused.map(t => t.name).join(", ");
+    if (!confirm(`ลบ tag ที่ไม่มี chunk ใช้ ${unused.length} ตัว: ${names} — ยืนยัน?`)) return;
+
+    const results = await Promise.allSettled(unused.map(t => fetch(`/admin/api/tags/${t.id}`, { method: "DELETE" })));
+    const failed = results.filter(r => r.status === "rejected" || !r.value.ok).length;
+    if (failed > 0) alert(`ลบไม่สำเร็จ ${failed} ตัวจากทั้งหมด ${unused.length} ตัว`);
+
+    loadTagManagerList();
+    loadKbTagFilterList();
+    loadScopeTagList();
 }
 
 async function loadIdRangeHint() {

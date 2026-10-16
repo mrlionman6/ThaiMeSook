@@ -81,6 +81,13 @@
                 <label class="kb-filter-label">กรองตาม tag:</label>
                 <div id="kbTagFilterList" class="kb-tag-filter-list">กำลังโหลด tag...</div>
                 <button type="button" onclick="clearKbTagFilter()" class="kb-filter-clear-btn">ล้างตัวกรอง</button>
+                <label class="kb-filter-label">เรียงตาม:</label>
+                <select id="kbSortSelect" onchange="onKbSortChange(this.value)">
+                    <option value="id_asc">ID น้อย→มาก</option>
+                    <option value="id_desc">ID มาก→น้อย</option>
+                    <option value="created_at">วันที่เพิ่ม</option>
+                    <option value="tag">ตามชื่อ tag แรก</option>
+                </select>
                 <button type="button" onclick="exportKb()" class="kb-export-btn">📤 Export</button>
             </div>
     
@@ -104,6 +111,7 @@
             <details class="kb-toolbar-section" open>
                 <summary> Tag ทั้งหมดในระบบ</summary>
                 <div class="kb-toolbar-body">
+                    <button type="button" onclick="deleteUnusedTags()" class="danger-btn">🧹 ลบ tag ที่ไม่มี chunk ใช้</button>
                     <div id="tagManagerList">กำลังโหลด...</div>
                 </div>
             </details>
