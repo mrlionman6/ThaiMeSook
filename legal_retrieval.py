@@ -216,4 +216,5 @@ def run_eval(eval_path: str = DEFAULT_EVAL_PATH) -> dict:
         "baseline": _aggregate(cases, baseline_scores),
         "tag_vector": _aggregate(cases, tag_vector_scores),
         "cases": rows,
+        "threshold": OUT_OF_KB_SCORE_THRESHOLD,  # ค่าจริงที่ production ใช้ตัดสิน 📚/💡 — ให้หน้า admin ใช้เป็นค่าเริ่มต้น
     }

@@ -1791,6 +1791,8 @@ function _legalEvalPct(x) {
     return (x * 100).toFixed(0) + "%";
 }
 
+let legalEvalLastCases = []; // เก็บผลล่าสุดไว้ ให้ปรับ threshold ชั่วคราวแล้ว render ใหม่ได้โดยไม่ fetch ซ้ำ
+
 async function runLegalEval() {
     const statusEl = document.getElementById("legalEvalStatus");
     const summaryEl = document.getElementById("legalEvalSummary");
@@ -1806,12 +1808,18 @@ async function runLegalEval() {
         if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
 
         statusEl.textContent = "";
+        document.getElementById("legalEvalThresholdInput").value = data.threshold;
+        legalEvalLastCases = data.cases;
         renderLegalEvalSummary(data.baseline, data.tag_vector);
-        renderLegalEvalCases(data.cases);
+        renderLegalEvalCases(legalEvalLastCases);
     } catch (error) {
         statusEl.textContent = "รันไม่สำเร็จ: " + error;
         statusEl.style.color = "red";
     }
+}
+
+function onLegalEvalThresholdChange() {
+    if (legalEvalLastCases.length > 0) renderLegalEvalCases(legalEvalLastCases);
 }
 
 function renderLegalEvalSummary(baseline, tagVector) {
@@ -1856,6 +1864,9 @@ function renderLegalEvalSummary(baseline, tagVector) {
 }
 
 function renderLegalEvalCases(cases) {
+    const threshold = parseFloat(document.getElementById("legalEvalThresholdInput").value);
+    const modeLabel = (topScore) => (topScore >= threshold ? "📚" : "💡");
+
     let rows = "";
     for (const c of cases) {
         const passLabel = (score) => {
@@ -1868,8 +1879,12 @@ function renderLegalEvalCases(cases) {
             <td>${escapeHtml(c.query)}</td>
             <td>${expected}</td>
             <td>${c.baseline.found_ids.map(id => "#" + id).join(", ")}</td>
+            <td>${c.baseline.top_score.toFixed(3)}</td>
+            <td>${modeLabel(c.baseline.top_score)}</td>
             <td>${passLabel(c.baseline)}</td>
             <td>${c.tag_vector.found_ids.map(id => "#" + id).join(", ")}</td>
+            <td>${c.tag_vector.top_score.toFixed(3)}</td>
+            <td>${modeLabel(c.tag_vector.top_score)}</td>
             <td>${passLabel(c.tag_vector)}</td>
         </tr>`;
     }
@@ -1878,7 +1893,8 @@ function renderLegalEvalCases(cases) {
             <thead>
                 <tr>
                     <th>ID</th><th>คำถาม</th><th>ที่ควรเจอ</th>
-                    <th>Baseline top3</th><th>Baseline</th><th>Tag+Vector top3</th><th>Tag+Vector</th>
+                    <th>Baseline top3</th><th>Baseline score</th><th>ป้าย</th><th>Baseline</th>
+                    <th>Tag+Vector top3</th><th>Tag+Vector score</th><th>ป้าย</th><th>Tag+Vector</th>
                 </tr>
             </thead>
             <tbody>${rows}</tbody>

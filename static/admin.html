@@ -341,6 +341,9 @@
                 วัดแค่ retrieval ไม่เรียก LLM เลย
             </p>
             <button type="button" onclick="runLegalEval()">▶️ รันการวัดผล</button>
+            <label>threshold ชั่วคราว (ไม่บันทึก):
+                <input type="number" id="legalEvalThresholdInput" step="0.1" value="-3.0" onchange="onLegalEvalThresholdChange()">
+            </label>
             <span id="legalEvalStatus" class="kb-toolbar-status"></span>
             <div id="legalEvalSummary"></div>
             <div id="legalEvalCasesContainer"></div>
