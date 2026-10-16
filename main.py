@@ -10,6 +10,7 @@ from db import (
     set_tags_for_chunk,
     get_tags_for_chunk,
     get_all_tags,
+    get_all_chunk_tags_map,
     knowledge_chunk_exists,
     add_knowledge_chunk_at_id,
     create_kb_snapshot,
@@ -326,6 +327,7 @@ def rebuild_index():
     knowledge_base_ids = [r["id"] for r in rows]
     knowledge_base_texts = [r["content"] for r in rows]
     build_index()
+    legal_retrieval.refresh_tag_embeddings()  # tag อาจถูกเพิ่ม/ลบ/เปลี่ยนชื่อไปแล้ว — ต้อง embed ใหม่คู่กับ KB เสมอ
 
 # ---------- RAG Pipeline ----------
 def hybrid_search(query, k=5, alpha=0.5):
@@ -354,6 +356,9 @@ def rerank_with_scores(query, candidates, top_k=3):
     top_texts = [text for text, score in ranked[:top_k]]
     top_scores = [float(score) for text, score in ranked[:top_k]]
     return top_texts, top_scores
+
+# deferred import (หลังนิยาม rerank_with_scores ที่ legal_retrieval.py ต้องใช้) — ดู docstring ของไฟล์นั้น
+import legal_retrieval
 
 def rewrite_query_for_retrieval(query: str, history: list) -> str:
     """ใช้ Claude Haiku เขียนคำถามที่กำกวม/อ้างอิงบริบทก่อนหน้า (เช่น 'แล้วอันนี้ล่ะ')
@@ -4373,6 +4378,41 @@ LIBRARY_ROUTE_SYSTEM_PROMPT = (
     "แล้วต่อท้ายด้วยข้อสังเกตสำคัญไม่เกิน 3 ข้อ"
 )
 
+# ส่วน "ความเชี่ยวชาญกฎหมาย" ของ system prompt สลับกันตาม kb_grounded (ดู _prepare_rag_context) — อันดับ 1 ผ่าน
+# เกณฑ์ (OUT_OF_KB_SCORE_THRESHOLD) ใช้ชุดนี้ (ของเดิมก่อนแยกเป็น 2 โหมด ไม่เปลี่ยนเนื้อหาเลย)
+_LEGAL_GROUNDED_PROMPT_BLOCK = (
+    "มีความเชี่ยวชาญพิเศษเจาะลึกด้าน: กฎหมายการลงทุนต่างชาติ, BOI, ภาษีนิติบุคคล, Work Permit, ที่ดิน "
+    "— ถ้าคำถามตรงหมวดนี้ ให้อ้างอิงข้อมูลที่ให้มาอย่างละเอียด แม่นยำ\n"
+    "สำหรับคำถามธุรกิจทั่วไปนอกเหนือจากนี้ ตอบด้วยความรู้ทั่วไปตามปกติ ไม่ต้องบอกว่า \"นอกเหนือความเชี่ยวชาญ\"\n"
+    "- เจาะลึกเป็นพิเศษด้าน: พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว, BOI, การจดทะเบียนธุรกิจ, ภาษีนิติบุคคล, "
+    "Work Permit/วีซ่านักลงทุน, การถือครองที่ดิน/อสังหาริมทรัพย์โดยชาวต่างชาติ\n"
+    "- ถ้าข้อมูลอ้างอิงที่ให้มาตรงกับคำถาม ให้ใช้ข้อมูลนั้นเป็นหลัก อ้างอิงชื่อกฎหมาย/มาตราให้ชัดเจนเมื่อทำได้ "
+    "(เช่น \"ตาม พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว มาตรา...\") ห้ามอ้างคำว่า \"ข้อมูลอ้างอิง\"/\"ข้อมูลที่ให้มา\" "
+    "ลอยๆ โดยไม่ระบุชื่อกฎหมาย/แหล่งที่มาจริงเด็ดขาด — ผู้ใช้ไม่รู้ว่า \"ข้อมูลอ้างอิง\" ของระบบคืออะไร "
+    "ชื่อกฎหมาย/มาตราต่างหากที่มีความหมายกับผู้ใช้\n"
+    "- ถ้าข้อมูลอ้างอิงที่ให้มาเป็นแค่ \"ตัวอย่างบางส่วน\" ของรายการที่มีทั้งหมด (เช่น รายชื่อธุรกิจในบัญชี "
+    "พ.ร.บ.ต่างด้าว) ไม่ใช่รายการครบถ้วนทั้งหมด ห้ามเขียนราวกับว่าเป็นรายการทั้งหมด ให้ใช้คำว่า \"ตัวอย่างเช่น\"/"
+    "\"ได้แก่ (ตัวอย่าง)\" กำกับไว้เสมอ และบอกผู้ใช้ว่ายังมีรายการอื่นอีกถ้าข้อมูลที่ให้มาไม่ครบ\n"
+    "- ข้อเท็จจริงทางกฎหมายและราชการ ได้แก่ ชื่อหน่วยงาน ตัวเลข อัตรา เกณฑ์ ระยะเวลา ค่าธรรมเนียม "
+    "และการจัดธุรกิจใดธุรกิจหนึ่งเข้าบัญชีของ พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว ให้ใช้จากข้อมูลอ้างอิงเท่านั้น\n"
+    "- ถ้าข้อมูลอ้างอิงไม่มีข้อเท็จจริงที่ต้องใช้ ให้ค้นด้วย web_search จากเว็บราชการก่อน "
+    "และระบุแหล่งที่มาในคำตอบ\n"
+    "- ถ้ายังไม่พบ ให้บอกตรงๆ ว่าข้อมูลอ้างอิงของระบบไม่ครอบคลุมเรื่องนี้ แนะนำหน่วยงานที่ควรสอบถามได้เฉพาะ "
+    "เมื่อมีชื่อในข้อมูลอ้างอิงหรือผลค้นเว็บ ห้ามแต่งชื่อหน่วยงานหรือตัวเลข\n"
+    "- คำอธิบายแนวคิดทั่วไปที่ไม่ใช่ข้อเท็จจริงข้างต้นใช้ความรู้ทั่วไปได้\n"
+    "- ถ้าข้อมูลอ้างอิงในคำถามนี้ขัดกับสิ่งที่คุณจำได้ ให้ใช้ข้อมูลอ้างอิง\n"
+)
+# chunk ที่ค้นเจอคะแนนต่ำกว่าเกณฑ์ (หรือไม่มีเลย) -> ตอบจากความรู้ทั่วไปของโมเดลตามปกติ ครอบคลุมกฎหมายไทยทุกหมวด
+# ห้ามปฏิเสธหรือชวนกลับไปเรื่อง BOI/FBA (context_block ถูกเว้นว่างไว้แล้วในโหมดนี้ — ดู _prepare_rag_context)
+_LEGAL_GENERAL_KNOWLEDGE_PROMPT_BLOCK = (
+    "ไม่มีข้อมูลอ้างอิงจากฐานความรู้ที่เกี่ยวข้องกับคำถามนี้พอ ตอบจากความรู้ทั่วไปของคุณเกี่ยวกับกฎหมายไทยได้ "
+    "ตามปกติ ครอบคลุมกฎหมายไทยทุกหมวด ไม่จำกัดแค่การลงทุนต่างชาติ/BOI/ภาษี ห้ามบอกว่า \"ข้อมูลอ้างอิงไม่ครอบคลุม\"/"
+    "\"ไม่ตรงกับข้อมูลอ้างอิง\" หรือชวนกลับไปถามเรื่อง BOI/พ.ร.บ.ต่างด้าวทั้งที่ผู้ใช้ไม่ได้ถามเรื่องนั้นเด็ดขาด "
+    "ตอบคำถามที่ถูกถามจริงๆ ตรงๆ\n"
+    "- ตอบเฉพาะส่วนที่มั่นใจ ระบุชื่อหน่วยงาน/ชื่อกฎหมายให้ถูกต้องเท่าที่แน่ใจ ถ้าไม่แน่ใจตัวเลข/อัตรา/มาตราที่ "
+    "แน่นอน ให้ตอบเป็นภาพรวมแทนการระบุตัวเลขที่ไม่แน่ใจ ห้ามแต่งตัวเลข/มาตราขึ้นมาเด็ดขาด\n"
+)
+
 
 def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None, skip_legal_context=False):
     """ขั้นตอนเตรียมข้อมูลทั้งหมดก่อนเรียก Claude ตัวตอบจริง — ใช้ร่วมกันทั้งโหมด
@@ -4389,13 +4429,15 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
     กันสับสนกับเลขข้อในรายการ (เช่น "ข้อ 2" ในผลค้น KB ปนกับ "ข้อ 2" ในรายการไฟล์)
 
     skip_legal_context: ใช้โดยเส้นทาง library เท่านั้น (ดู _classify_question_route/rag_answer) — ข้ามการค้น KB
-    กฎหมาย (hybrid_search/rerank_with_scores) ทั้งหมด และไม่ต่อท้าย "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง..." เข้าไปใน
+    กฎหมาย (legal_retrieval.legal_search) ทั้งหมด และไม่ต่อท้าย "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง..." เข้าไปใน
     system prompt เลย (คำถามคลังเอกสาร/ลูกค้า/โปรเจกต์ไม่เกี่ยวกับฐานความรู้กฎหมายเลย เสียเวลาค้นฟรีๆ และอาจ
     ปนข้อมูลกฎหมายที่ไม่เกี่ยวข้องเข้าไปในคำตอบโดยไม่ตั้งใจ) ไม่กระทบเส้นทาง legal เลย (ค่าเริ่มต้น False)
 
     คืนค่า dict เสมอ:
     - ถ้าภาพไม่เกี่ยวข้อง: {"early_exit": True, "message": ...}
-    - ถ้าพร้อมส่ง Claude: {"early_exit": False, "system_prompt":..., "messages":..., "top_chunks":..., "scores":...}"""
+    - ถ้าพร้อมส่ง Claude: {"early_exit": False, "system_prompt":..., "messages":..., "top_chunks":..., "scores":...,
+      "legal_results":... (list ของ {id,content,tags,score} จาก legal_retrieval), "kb_grounded":... (อันดับ 1 ผ่าน
+      เกณฑ์ไหม — เลือก system prompt/ป้ายบรรทัดแรกของ rag_answer ด้วยค่านี้), "has_pending_listing":...}"""
     # ถ้ามีภาพแนบมา: ให้ Haiku เช็คความเกี่ยวข้อง + อ่านภาพสรุปเป็นข้อความก่อน เอาไปรวมกับคำถาม (ถ้ามี)
     # เพื่อใช้เป็น query สำหรับค้นหาใน KB — จำเป็นเพราะ embedding model อ่านภาพตรงๆ ไม่ได้
     if image_data:
@@ -4413,45 +4455,27 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
         query_for_search = query
 
     if skip_legal_context:
-        top_chunks, scores, context = [], [], ""
+        legal_results, top_chunks, scores, context, kb_grounded = [], [], [], "", False
     else:
         search_query = rewrite_query_for_retrieval(query_for_search, history)
-        candidates = hybrid_search(search_query, k=5)
-        top_chunks, scores = rerank_with_scores(search_query, candidates, top_k=5)
+        legal_results = legal_retrieval.legal_search(search_query, k=5, rerank_top_k=5)
+        top_chunks = [r["content"] for r in legal_results]
+        scores = [r["score"] for r in legal_results]
         context = "\n".join([f"- {c}" for c in top_chunks])
+        # อันดับ 1 ผ่านเกณฑ์ -> ให้ Claude ใช้ข้อมูลอ้างอิงเป็นหลักเหมือนเดิม ไม่ผ่าน (หรือไม่มี chunk เลย) -> สลับ
+        # เป็นโหมดความรู้ทั่วไป (ดู _LEGAL_GENERAL_KNOWLEDGE_PROMPT_BLOCK) ไม่ใช่ตอบ "ไม่พบ" เฉยๆ
+        kb_grounded = bool(legal_results) and legal_results[0]["score"] >= legal_retrieval.OUT_OF_KB_SCORE_THRESHOLD
 
     if skip_legal_context:
         system_prompt = LIBRARY_ROUTE_SYSTEM_PROMPT
     else:
+        legal_prompt_block = _LEGAL_GROUNDED_PROMPT_BLOCK if kb_grounded else _LEGAL_GENERAL_KNOWLEDGE_PROMPT_BLOCK
         system_prompt = (
         "คุณเป็นผู้ช่วยธุรกิจทั่วไปสำหรับผู้ประกอบการในประเทศไทย ตอบคำถามธุรกิจได้กว้าง "
         "รวมถึงการเลือกอุปกรณ์/ประเมินความคุ้มค่าการลงทุนในอุปกรณ์ (เช่น CCTV, OLT/ONT/ONU, ระบบเครือข่าย ฯลฯ) "
         "และยังช่วยตอบคำถามหรืออธิบายเนื้อหาเอกสารธุรกิจทั่วไปที่ผู้ใช้ถามหรือแนบมาได้ "
         "(เช่น สัญญาบริการ, ข้อเสนอราคา, เอกสารโครงการ)\n"
-        "มีความเชี่ยวชาญพิเศษเจาะลึกด้าน: กฎหมายการลงทุนต่างชาติ, BOI, ภาษีนิติบุคคล, Work Permit, ที่ดิน "
-        "— ถ้าคำถามตรงหมวดนี้ ให้อ้างอิงข้อมูลที่ให้มาอย่างละเอียด แม่นยำ\n"
-        "สำหรับคำถามธุรกิจทั่วไปนอกเหนือจากนี้ ตอบด้วยความรู้ทั่วไปตามปกติ ไม่ต้องบอกว่า \"นอกเหนือความเชี่ยวชาญ\"\n"
-        "- เจาะลึกเป็นพิเศษด้าน: พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว, BOI, การจดทะเบียนธุรกิจ, ภาษีนิติบุคคล, "
-        "Work Permit/วีซ่านักลงทุน, การถือครองที่ดิน/อสังหาริมทรัพย์โดยชาวต่างชาติ\n"
-        "- ถ้าข้อมูลอ้างอิงที่ให้มาตรงกับคำถาม ให้ใช้ข้อมูลนั้นเป็นหลัก อ้างอิงชื่อกฎหมาย/มาตราให้ชัดเจนเมื่อทำได้ "
-        "(เช่น \"ตาม พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว มาตรา...\") ห้ามอ้างคำว่า \"ข้อมูลอ้างอิง\"/\"ข้อมูลที่ให้มา\" "
-        "ลอยๆ โดยไม่ระบุชื่อกฎหมาย/แหล่งที่มาจริงเด็ดขาด — ผู้ใช้ไม่รู้ว่า \"ข้อมูลอ้างอิง\" ของระบบคืออะไร "
-        "ชื่อกฎหมาย/มาตราต่างหากที่มีความหมายกับผู้ใช้\n"
-        "- ถ้าข้อมูลอ้างอิงที่ให้มาเป็นแค่ \"ตัวอย่างบางส่วน\" ของรายการที่มีทั้งหมด (เช่น รายชื่อธุรกิจในบัญชี "
-        "พ.ร.บ.ต่างด้าว) ไม่ใช่รายการครบถ้วนทั้งหมด ห้ามเขียนราวกับว่าเป็นรายการทั้งหมด ให้ใช้คำว่า \"ตัวอย่างเช่น\"/"
-        "\"ได้แก่ (ตัวอย่าง)\" กำกับไว้เสมอ และบอกผู้ใช้ว่ายังมีรายการอื่นอีกถ้าข้อมูลที่ให้มาไม่ครบ\n"
-        # เดิม 2 บรรทัด (ลบทั้งคู่ — ต้นเหตุคำตอบกฎหมายผิด/แต่งข้อมูลจากผลทดสอบจริง 12 ข้อ: AI เติมรายละเอียด
-        # ที่ KB ไม่ครอบคลุมเองทั้งหมดโดยไม่บอก แต่งชื่อหน่วยงานที่ไม่มีจริง และตอบขัดกันเองระหว่างคำถาม):
-        # "- ถ้าข้อมูลอ้างอิงไม่ครอบคลุมหรือไม่มีรายละเอียดพอ ให้ใช้ความรู้ทั่วไปของคุณตอบเสริมให้ครบถ้วนที่สุด "
-        # "โดยไม่ต้องบอกผู้ใช้ว่าข้อมูลอ้างอิงไม่พอ\n"
-        "- ข้อเท็จจริงทางกฎหมายและราชการ ได้แก่ ชื่อหน่วยงาน ตัวเลข อัตรา เกณฑ์ ระยะเวลา ค่าธรรมเนียม "
-        "และการจัดธุรกิจใดธุรกิจหนึ่งเข้าบัญชีของ พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว ให้ใช้จากข้อมูลอ้างอิงเท่านั้น\n"
-        "- ถ้าข้อมูลอ้างอิงไม่มีข้อเท็จจริงที่ต้องใช้ ให้ค้นด้วย web_search จากเว็บราชการก่อน "
-        "และระบุแหล่งที่มาในคำตอบ\n"
-        "- ถ้ายังไม่พบ ให้บอกตรงๆ ว่าข้อมูลอ้างอิงของระบบไม่ครอบคลุมเรื่องนี้ แนะนำหน่วยงานที่ควรสอบถามได้เฉพาะ "
-        "เมื่อมีชื่อในข้อมูลอ้างอิงหรือผลค้นเว็บ ห้ามแต่งชื่อหน่วยงานหรือตัวเลข\n"
-        "- คำอธิบายแนวคิดทั่วไปที่ไม่ใช่ข้อเท็จจริงข้างต้นใช้ความรู้ทั่วไปได้\n"
-        "- ถ้าข้อมูลอ้างอิงในคำถามนี้ขัดกับสิ่งที่คุณจำได้ ให้ใช้ข้อมูลอ้างอิง\n"
+        + legal_prompt_block +
         "- ตอบด้วยโทนทางการ แม่นยำ เหมาะกับนักลงทุน/ผู้ประกอบการ ไม่ใช่โทนเป็นกันเองแบบพูดกับประชาชนทั่วไป\n"
         # เดิม: "ใช้คำลงท้ายประโยคว่า \"ครับ\" เท่านั้นเสมอ ห้ามใช้ \"ค่ะ\" หรือเขียน \"ครับ/ค่ะ\" คู่กันเด็ดขาด"
         # แก้เป็นข้อนี้แทน — เคยเจอ Claude ใส่ "ครับ" ท้ายทุกย่อหน้า/เป็นบรรทัดเดี่ยวทั้งที่ยังไม่จบคำตอบ
@@ -4534,6 +4558,8 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
         context_block = "ข้อมูลอ้างอิงจากฐานความรู้ด้านกฎหมาย/การลงทุน (อาจไม่เกี่ยวกับคำถามนี้):\n" + context + "\n\n"
     elif skip_legal_context:
         context_block = ""  # เส้นทาง library ไม่ค้น KB กฎหมายเลย (context ว่างเปล่าอยู่แล้ว) ไม่ต้องมีหัวข้อนี้เลย
+    elif not kb_grounded:
+        context_block = ""  # คะแนน rerank ต่ำกว่าเกณฑ์ -> ไม่ส่ง context ที่ไม่น่าเชื่อถือเข้าไปให้สับสน (โหมดความรู้ทั่วไป)
     else:
         context_block = "ข้อมูลอ้างอิงที่อาจเกี่ยวข้อง (ใช้ประกอบถ้าตรงกับคำถาม):\n" + context + "\n\n"
     current_turn_text = (
@@ -4569,6 +4595,9 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
         "messages": messages,
         "top_chunks": top_chunks,
         "scores": scores,
+        "legal_results": legal_results,  # {id, content, tags, score} ของแต่ละ chunk — ดู rag_answer (ป้ายบรรทัดแรก
+        "kb_grounded": kb_grounded,  # มาจากโค้ดโดยตรง ไม่ใช่ให้ LLM เขียนเอง)
+        "has_pending_listing": has_pending_listing,
     }
 
 
@@ -4607,6 +4636,16 @@ def _normalize_polite_particles(text: str) -> str:
     text = "\n".join(lines)
     text = re.sub(r"\n{4,}", "\n\n\n", text)
     return text
+
+
+def _build_legal_mode_label(kb_grounded: bool, legal_results: list[dict]) -> str:
+    """ป้ายบรรทัดแรกที่โค้ดใส่เอง (ไม่ใช่ LLM เขียน) บอกว่าคำตอบนี้อ้างอิงฐานความรู้จริง (เฉพาะ chunk อันดับ 1 ที่
+    ผ่านเกณฑ์ — ดู kb_grounded ใน _prepare_rag_context) หรือเป็นความรู้ทั่วไปของโมเดลเอง"""
+    if kb_grounded and legal_results:
+        top = legal_results[0]
+        tag_part = f" {'/'.join(top['tags'])}" if top.get("tags") else ""
+        return f"📚 อ้างอิงฐานความรู้ (#{top['id']}{tag_part})\n\n"
+    return "💡 ความรู้ทั่วไป\n\n"
 
 
 def rag_answer(
@@ -4677,6 +4716,8 @@ def rag_answer(
         # ต่อท้ายด้วยใบยืนยันจากโค้ด (ดู run_agentic_tool_loop/_build_action_receipt) — ไม่ใช่สิ่งที่ Claude
         # เขียนเอง กันเหตุการณ์จริงที่เคยเจอ: Claude บอกว่าเปิดไฟล์สำเร็จทั้งที่ไม่ได้เรียก tool เลย
         answer = answer + "\n\n" + "\n".join(action_receipts)
+    elif not edit_intent and not skip_legal_context and not ctx.get("has_pending_listing"):
+        answer = _build_legal_mode_label(ctx.get("kb_grounded", False), ctx.get("legal_results") or []) + answer
     return answer, ctx["top_chunks"]
 
 
@@ -5168,7 +5209,9 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
         yield {"type": "done", "sources": [], "full_answer": ctx["message"]}
         return
 
-    full_answer = ""
+    label = _build_legal_mode_label(ctx.get("kb_grounded", False), ctx.get("legal_results") or [])
+    yield {"type": "delta", "text": label}
+    full_answer = label
     with client.messages.stream(
         model="claude-haiku-4-5-20251001",
         max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
@@ -6645,6 +6688,14 @@ def rollback_kb_snapshot_endpoint(snapshot_id: int, _: bool = Depends(require_lo
         raise HTTPException(status_code=404, detail="ไม่พบ snapshot นี้")
     rebuild_index()  # ข้อมูลเปลี่ยนไปทั้งชุด ต้องคำนวณ BM25/vector cache ใหม่ทั้งหมด
     return {"status": "rolled_back"}
+
+@app.post("/admin/api/legal-eval/run")
+def run_legal_retrieval_eval_endpoint(_: bool = Depends(require_login)):
+    """รันชุดทดสอบ eval/legal_eval_v1.json ทั้งหมด 2 แบบ (baseline/tag+vector) ด้วยโค้ดล้วนๆ ไม่เรียก LLM เลย —
+    ดู legal_retrieval.run_eval"""
+    if not os.path.exists(legal_retrieval.DEFAULT_EVAL_PATH):
+        raise HTTPException(status_code=404, detail=f"ไม่พบไฟล์ {legal_retrieval.DEFAULT_EVAL_PATH}")
+    return legal_retrieval.run_eval()
 
 @app.post("/admin/api/agent/run")
 def run_agent_job(body: AgentJobStart, _: bool = Depends(require_login)):

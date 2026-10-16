@@ -40,6 +40,9 @@
                 <button id="tabBtnFileLibrary" class="tab-btn" onclick="switchTab('fileLibrary')">
                      คลังไฟล์
                 </button>
+                <button id="tabBtnLegalEval" class="tab-btn" onclick="switchTab('legalEval')">
+                     วัดผลระบบค้นกฎหมาย
+                </button>
             </div>
 
             <a href="/admin/logout" class="admin-sidebar-logout">🚪 Logout</a>
@@ -330,6 +333,17 @@
                     <div id="fileLibraryFileList">เลือกโฟลเดอร์ทางซ้ายเพื่อดูไฟล์</div>
                 </div>
             </div>
+        </div>
+
+        <div id="tabLegalEval" class="tab-panel" style="display:none;">
+            <p class="ts-note">
+                รันชุดทดสอบ eval/legal_eval_v1.json ทั้งหมด 2 แบบ (baseline beta=0 vs tag+vector) ในคลิกเดียว —
+                วัดแค่ retrieval ไม่เรียก LLM เลย
+            </p>
+            <button type="button" onclick="runLegalEval()">▶️ รันการวัดผล</button>
+            <span id="legalEvalStatus" class="kb-toolbar-status"></span>
+            <div id="legalEvalSummary"></div>
+            <div id="legalEvalCasesContainer"></div>
         </div>
         </div>
         </main>
