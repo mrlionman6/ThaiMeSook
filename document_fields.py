@@ -182,7 +182,8 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
     value, find_text}] operation: "set" (ตั้งค่าใหม่ทั้งหมด) / "replace_text" (แทนที่บางส่วนของค่าปัจจุบัน —
     ต้องมี find_text ตรงกับค่าปัจจุบันจริง) / "clear" (ล้างเป็นค่าว่าง) เขียนทุกช่องที่ถูกต้องผ่าน create_new_
     version ครั้งเดียว (ย้อนกลับได้ด้วย undo เดิม) ช่องที่ field_id ไม่มีจริง/editable=False/find_text ไม่เจอ ->
-    ข้าม ไม่แก้ พร้อมบรรทัด "✗ ..." อธิบาย ไม่มีช่องไหนแก้ได้จริงเลย -> matched=False ไม่สร้างเวอร์ชันเปล่าๆ"""
+    ข้าม ไม่แก้ พร้อมบรรทัด "[[FAIL]] ..." อธิบาย (marker ภายใน — ดู main._render_receipt_markers) ไม่มีช่องไหน
+    แก้ได้จริงเลย -> matched=False ไม่สร้างเวอร์ชันเปล่าๆ"""
     doc = get_editable_document(document_id, user_id)
     if doc is None:
         return {"matched": False, "message": "ไม่พบเอกสารนี้ อาจหมดอายุหรือถูกลบไปแล้ว"}
@@ -197,10 +198,10 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
         field_id = edit.get("field_id")
         field = fields_by_id.get(field_id)
         if field is None:
-            receipt_lines.append("✗ ไม่พบช่องนี้ในเอกสารแล้ว (อาจถูกแก้โครงสร้างไปก่อนหน้า)")
+            receipt_lines.append("[[FAIL]] ไม่พบช่องนี้ในเอกสารแล้ว (อาจถูกแก้โครงสร้างไปก่อนหน้า)")
             continue
         if not field["editable"]:
-            receipt_lines.append(f"✗ '{field['label']}' เป็นช่องคำนวณอัตโนมัติจาก{field['reason']} แก้ตรงไม่ได้")
+            receipt_lines.append(f"[[FAIL]] '{field['label']}' เป็นช่องคำนวณอัตโนมัติจาก{field['reason']} แก้ตรงไม่ได้")
             continue
 
         current_text = "" if field["current_value"] is None else str(field["current_value"])
@@ -212,7 +213,7 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
             find_text = edit.get("find_text")
             if not find_text or find_text not in current_text:
                 receipt_lines.append(
-                    f"✗ ไม่พบข้อความ \"{find_text}\" ในค่าปัจจุบันของ '{field['label']}' ({current_text}) แก้ไม่ได้"
+                    f"[[FAIL]] ไม่พบข้อความ \"{find_text}\" ในค่าปัจจุบันของ '{field['label']}' ({current_text}) แก้ไม่ได้"
                 )
                 continue
             new_value = edit.get("new_value")
@@ -221,7 +222,7 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
             new_value = edit.get("new_value")
             new_text = "" if new_value is None else str(new_value)
         else:
-            receipt_lines.append(f"✗ ไม่รู้จักวิธีแก้ '{operation}' สำหรับ '{field['label']}'")
+            receipt_lines.append(f"[[FAIL]] ไม่รู้จักวิธีแก้ '{operation}' สำหรับ '{field['label']}'")
             continue
 
         if new_text == current_text:
@@ -255,7 +256,7 @@ def apply_field_edits(document_id: int, user_id: int, field_edits: list[dict]) -
         # แสดงวันที่แบบ วัน/เดือน/ปี แทน ISO string ดิบ (เช่น "2569-10-20T00:00:00" -> "20/10/2569")
         old_display = _format_display_value(item["old_text"], field.get("number_format"))
         new_display = _format_display_value(item["new_text"], field.get("number_format"))
-        success_lines.append(f"✓ แก้ '{field['label']}' จาก \"{old_display}\" เป็น \"{new_display}\"")
+        success_lines.append(f"[[OK]] แก้ '{field['label']}' จาก \"{old_display}\" เป็น \"{new_display}\"")
         exclude_labels.add(field["label"])
         if field["kind"] == "label":
             edit_log_id = log_document_edit(document_id, field["label"], item["old_text"], item["new_text"])

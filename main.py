@@ -195,7 +195,7 @@ REWRITER_HISTORY_MESSAGES = 6  # 3 คู่ล่าสุด ที่ส่�
 MAX_IMAGE_SIZE_BYTES = 5 * 1024 * 1024  # 5MB
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 IMAGE_ANSWER_DISCLAIMER = (
-    "\n\n⚠️ คำตอบนี้อ้างอิงจากการอ่านภาพที่แนบมา ตัวเลข/ชื่อเฉพาะอาจคลาดเคลื่อนได้ "
+    "\n\nคำตอบนี้อ้างอิงจากการอ่านภาพที่แนบมา ตัวเลข/ชื่อเฉพาะอาจคลาดเคลื่อนได้ "
     "ควรตรวจสอบกับเอกสารต้นฉบับก่อนนำไปใช้งานจริง"
 )
 
@@ -379,7 +379,7 @@ def rewrite_query_for_retrieval(query: str, history: list) -> str:
 
     recent = history[-REWRITER_HISTORY_MESSAGES:]
     history_text = "\n".join(
-        f"{'ผู้ใช้' if m['role'] == 'user' else 'ผู้ช่วย'}: {m['content']}" for m in recent
+        f"{'ผู้ใช้' if m['role'] == 'user' else 'ผู้ช่วย'}: {_strip_legacy_mode_labels(m['content'])}" for m in recent
     )
 
     rewrite_prompt = (
@@ -2602,7 +2602,7 @@ def _is_chat_export_command(query: str) -> bool:
 def _build_chat_export_answer(chat_id: int) -> str:
     """ข้อความตอบกลับคำสั่ง export บทสนทนา — ลิงก์ดาวน์โหลดตรงๆ ไม่ผ่าน LLM เลย (ดู export_chat_transcript)"""
     download_url = f"/api/chat/{chat_id}/export.txt"
-    return f"ดาวน์โหลดบทสนทนานี้ได้ที่ [📥 ดาวน์โหลดบทสนทนา]({download_url})"
+    return f"ดาวน์โหลดบทสนทนานี้ได้ที่ [ลิงก์]({download_url})"
 
 
 # คำ/วลีที่บ่งบอกว่าข้อความนี้อ้างถึงเนื้อหา/ค่าของไฟล์ที่เปิดอยู่จริงๆ — ใช้ดักก่อนส่งเข้า
@@ -2937,7 +2937,7 @@ _FABRICATED_EDIT_CLAIM_RE = re.compile(
 # คำ/สัญลักษณ์ที่เช็คเฉพาะตอน structural_route=True เท่านั้น (ข้อความทั่วไปที่ไม่ได้อ้างว่าแก้สำเร็จโดยตรง แต่เกิด
 # ขึ้นบ่อยในคำตอบกฎหมายปกติที่ไม่เกี่ยวกับการแก้ไฟล์เลย เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี" — เช็คเฉพาะตอนรู้แน่ชัด
 # แล้วว่าข้อความนี้ถูกจัดเป็นคำสั่งแก้โครงสร้างเท่านั้น กันเหมาเข่งผิดในเส้นทางทั่วไป)
-_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS = ("ยืนยัน", "preview", "✓")
+_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS = ("ยืนยัน", "preview", "[[OK]]")
 
 # คำอ้างว่า "แก้/บันทึกสำเร็จแล้ว" แบบลอยๆ ไม่มีคำนามของสิ่งที่ถูกแก้ติดกัน (ไม่เข้า _FABRICATED_EDIT_CLAIM_RE ข้างบน
 # ซึ่งต้องมีคำนามประกบ) — เช็คทุกเส้นทางเสมอ ไม่ต้องรอ structural_route (feat/edit-any-field: Claude เลียนแบบใบ
@@ -2950,7 +2950,7 @@ def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = 
     _FABRICATED_EDIT_CLAIM_RE/_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS — เช็คทุกเส้นทางเสมอ) ใช้ร่วมกับเช็คว่า
     "ไม่มี receipt จาก tool ในเทิร์นนี้เลย" (ดู rag_answer/run_agentic_tool_loop) เพื่อจับเคส Claude เขียน preview/
     คำยืนยันปลอมขึ้นเองโดยไม่ได้เรียก tool จริงสักครั้ง — structural_route=True เพิ่มเงื่อนไข "ยืนยัน"/"preview"/
-    "✓" เข้ามาด้วย (ใช้ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำพวกนี้ที่เป็นคำปกติในคำตอบ
+    "[[OK]]" เข้ามาด้วย (ใช้ได้เฉพาะตอนรู้แล้วว่าข้อความนี้เป็นคำสั่งแก้โครงสร้างจริง กันคำพวกนี้ที่เป็นคำปกติในคำตอบ
     กฎหมายทั่วไปโดนบล็อกผิด — ดู rag_answer สำหรับการข้าม guard นี้ไปเลยตอนเป็นคำถามเชิงกฎหมาย/คำตอบมาจาก RAG จริง
     ซึ่งเป็นอีกชั้นที่ไม่ได้อยู่ในฟังก์ชันนี้)"""
     if _FABRICATED_EDIT_CLAIM_RE.search(raw_answer):
@@ -2963,13 +2963,17 @@ def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = 
     return False
 
 
-_RECEIPT_LINE_RE = re.compile(r"(?m)^[✓✗][^\n]*\n?")
+_RECEIPT_LINE_RE = re.compile(
+    r"(?m)^(?:\[\[OK\]\]|\[\[FAIL\]\]|เรียบร้อย:|ไม่สำเร็จ:|แก้แล้ว:|ยังไม่ได้แก้:)[^\n]*\n?"
+)
 
 
 def _strip_fabricated_receipt_lines(text: str) -> str:
-    """ตัดบรรทัดที่ขึ้นต้น "✓"/"✗" ออกจาก text — ใบยืนยันจริงของระบบนี้มาจากโค้ดเสมอ ต่อท้ายแยกต่างหากหลัง Claude
-    ตอบจบแล้ว ไม่เคยปนอยู่ในข้อความที่ Claude เขียนเอง (ดู run_agentic_tool_loop/_dispatch_router_clarification/
-    _answer_document_reading_question) เจอแปลว่า Claude เลียนแบบ/แต่งใบยืนยันขึ้นเอง"""
+    """ตัดบรรทัดที่ขึ้นต้นด้วย marker ภายใน ([[OK]]/[[FAIL]]) หรือข้อความแปลงแล้ว (เรียบร้อย:/ไม่สำเร็จ: ปัจจุบัน
+    หรือ แก้แล้ว:/ยังไม่ได้แก้: ของเดิมที่อาจยังค้างอยู่ในแชทเก่า) ออกจาก text — ใบยืนยันจริงของระบบนี้มาจากโค้ด
+    เสมอ ต่อท้ายแยกต่างหากหลัง Claude ตอบจบแล้ว ไม่เคยปนอยู่ในข้อความที่ Claude เขียนเอง (ดู
+    run_agentic_tool_loop/_dispatch_router_clarification/_answer_document_reading_question) เจอแปลว่า Claude
+    เลียนแบบ/แต่งใบยืนยันขึ้นเอง"""
     return _RECEIPT_LINE_RE.sub("", text).strip()
 
 
@@ -2996,7 +3000,7 @@ def _answer_document_reading_question(query: str, active_docs: list, user_id: in
     tool_text = _format_document_values_text(data)
 
     recent_history = get_chat_messages(chat_id)[-6:]
-    messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    messages = [{"role": m["role"], "content": _strip_legacy_mode_labels(m["content"])} for m in recent_history]
     messages.append({"role": "user", "content": f"ข้อมูลในไฟล์:\n{tool_text}\n\nคำถาม: {query}"})
 
     # ถ้าเรียก Claude จัดรูปคำตอบล้ม (เช่น API ล่ม/timeout) ให้ตอบ tool_text ที่โค้ดจัดไว้แล้วตรงๆ แทน — ข้อมูล
@@ -3377,7 +3381,7 @@ def _estimate_investment_cost(inputs: dict) -> dict:
         })
     elif foreign_pct > 49 and capital < FBA_MIN_CAPITAL_GENERAL:
         items.append({
-            "item": "⚠️ ทุนจดทะเบียนอาจต่ำกว่าเกณฑ์ทั่วไปสำหรับธุรกิจต่างชาติ",
+            "item": "ทุนจดทะเบียนอาจต่ำกว่าเกณฑ์ทั่วไปสำหรับธุรกิจต่างชาติ",
             "note": f"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าว กำหนดทุนขั้นต่ำทั่วไปไว้ที่ {FBA_MIN_CAPITAL_GENERAL:,.0f} บาท",
             "severity": "warning",
         })
@@ -3466,7 +3470,8 @@ def _safe_execute_tool(tool_name: str, fn, *args) -> dict:
 
 
 def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
-    """สร้างบรรทัดใบยืนยันจากโค้ด ("✓ "/"✗ " + ข้อความ) จากผลของเครื่องมือที่ "เปลี่ยนข้อมูลจริง" เท่านั้น —
+    """สร้างบรรทัดใบยืนยันจากโค้ด ("[[OK]] "/"[[FAIL]] " + ข้อความ — marker ภายใน แปลงเป็นข้อความธรรมดาก่อนถึงผู้ใช้
+    เสมอ ดู _render_receipt_markers) จากผลของเครื่องมือที่ "เปลี่ยนข้อมูลจริง" เท่านั้น —
     ให้ผู้ใช้เห็นเองว่าเกิดอะไรขึ้นจริง แทนที่จะพึ่งคำบรรยายของ Claude (เหตุการณ์จริงที่แก้: Claude บอกว่าเปิด
     เอกสารสำเร็จทั้งที่ไม่ได้เรียก tool เลย) คืน None ถ้าผลลัพธ์นี้ยังไม่ถือเป็น "การกระทำ" ที่ควรมีใบยืนยัน
     (เช่น open_library_file เจอหลายไฟล์ ยังไม่ได้เปิดไฟล์ไหนเลย แค่ถามกลับ)
@@ -3484,17 +3489,17 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
             if result.get("already_open"):
                 return None  # no-op (ไฟล์เปิดอยู่แล้ว) ไม่ต้องออกใบยืนยัน — กันปนกับคำตอบของการกระทำหลักในเทิร์นนี้ (เช่น แก้ไฟล์)
             message = result.get("message") or ""
-            return f"✓ {message.splitlines()[0]}" if message else None
+            return f"[[OK]] {message.splitlines()[0]}" if message else None
         if "error" in result:
-            return f"✗ {result['error']}"
+            return f"[[FAIL]] {result['error']}"
         return None  # เช่น matched_multiple — ยังไม่เกิดการกระทำจริง ไม่ต้องออกใบยืนยัน
 
     if tool_name == "close_chat_document":
         if result.get("closed") is True:
             message = result.get("message") or ""
-            return f"✓ {message.splitlines()[0]}" if message else None
+            return f"[[OK]] {message.splitlines()[0]}" if message else None
         if "error" in result:
-            return f"✗ {result['error']}"
+            return f"[[FAIL]] {result['error']}"
         return None
 
     if tool_name in (
@@ -3504,10 +3509,10 @@ def _build_action_receipt(tool_name: str, result: dict) -> Optional[str]:
         message = result.get("message") or ""
         first_line = message.splitlines()[0] if message else ""
         if result.get("matched") is True:
-            return f"✓ {first_line}" if first_line else None
+            return f"[[OK]] {first_line}" if first_line else None
         if "error" in result:
-            return f"✗ {result['error']}"
-        return f"✗ {first_line}" if first_line else None
+            return f"[[FAIL]] {result['error']}"
+        return f"[[FAIL]] {first_line}" if first_line else None
 
     return None
 
@@ -4596,7 +4601,7 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
     # ต่อประวัติสนทนาเดิม (ถ้ามี) เข้าเป็น multi-turn messages ก่อนคำถามล่าสุด
     # ใช้แค่ query ต้นฉบับ (ไม่ใช่ search_query ที่ rewrite แล้ว) เพราะนี่คือสิ่งที่ user พิมพ์จริง
     recent_history = history[-MAX_HISTORY_MESSAGES:] if history else []
-    messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    messages = [{"role": m["role"], "content": _strip_legacy_mode_labels(m["content"])} for m in recent_history]
     messages.append({"role": "user", "content": current_turn_content})
 
     return {
@@ -4648,14 +4653,23 @@ def _normalize_polite_particles(text: str) -> str:
     return text
 
 
-def _build_legal_mode_label(kb_grounded: bool, legal_results: list[dict]) -> str:
-    """ป้ายบรรทัดแรกที่โค้ดใส่เอง (ไม่ใช่ LLM เขียน) บอกว่าคำตอบนี้อ้างอิงฐานความรู้จริง (เฉพาะ chunk อันดับ 1 ที่
-    ผ่านเกณฑ์ — ดู kb_grounded ใน _prepare_rag_context) หรือเป็นความรู้ทั่วไปของโมเดลเอง"""
-    if kb_grounded and legal_results:
-        top = legal_results[0]
-        tag_part = f" {'/'.join(top['tags'])}" if top.get("tags") else ""
-        return f"📚 อ้างอิงฐานความรู้ (#{top['id']}{tag_part})\n\n"
-    return "💡 ความรู้ทั่วไป\n\n"
+_LEGACY_MODE_LABEL_RE = re.compile(r"(?m)^(?:📚|💡)[^\n]*\n*")
+
+
+def _strip_legacy_mode_labels(text: str) -> str:
+    """ตัดบรรทัดป้าย 📚/💡 เก่าที่ยังติดอยู่ในแชทเก่าใน DB (ก่อนเลิกใช้ป้ายนี้) ออกก่อนป้อนเป็นประวัติให้ LLM —
+    กัน AI เลียนแบบป้ายที่เลิกใช้แล้วต่อ"""
+    return _LEGACY_MODE_LABEL_RE.sub("", text or "")
+
+
+_RECEIPT_MARKER_TO_PLAIN = (("[[OK]] ", "เรียบร้อย: "), ("[[FAIL]] ", "ไม่สำเร็จ: "))
+
+
+def _render_receipt_markers(text: str) -> str:
+    """แปลง marker ภายใน [[OK]]/[[FAIL]] เป็นข้อความธรรมดา — จุดสุดท้ายก่อนส่งผู้ใช้/บันทึก DB เสมอ"""
+    for marker, plain in _RECEIPT_MARKER_TO_PLAIN:
+        text = text.replace(marker, plain)
+    return text
 
 
 def rag_answer(
@@ -4727,9 +4741,8 @@ def rag_answer(
         # ต่อท้ายด้วยใบยืนยันจากโค้ด (ดู run_agentic_tool_loop/_build_action_receipt) — ไม่ใช่สิ่งที่ Claude
         # เขียนเอง กันเหตุการณ์จริงที่เคยเจอ: Claude บอกว่าเปิดไฟล์สำเร็จทั้งที่ไม่ได้เรียก tool เลย
         answer = answer + "\n\n" + "\n".join(action_receipts)
-    elif not edit_intent and not skip_legal_context and not ctx.get("has_pending_listing"):
-        answer = _build_legal_mode_label(ctx.get("kb_grounded", False), ctx.get("legal_results") or []) + answer
-    return answer, ctx["top_chunks"]
+    # แปลง marker [[OK]]/[[FAIL]] เป็นข้อความธรรมดาจุดเดียวสุดท้าย หลัง guard ทำงานเสร็จแล้ว (ดู _render_receipt_markers)
+    return _render_receipt_markers(answer), ctx["top_chunks"]
 
 
 # ---------- เส้นทาง advisor (คำถามทั่วไป/แนะนำสินค้า ไม่ใช่กฎหมาย/เนื้อหาไฟล์ที่เปิดอยู่) ----------
@@ -5167,7 +5180,7 @@ def advisor_answer(
     active_docs = active_docs or []
     document_context = _advisor_document_context(active_docs, chat_id, user_id)
     recent_history = history[-MAX_HISTORY_MESSAGES:] if history else []
-    messages = [{"role": m["role"], "content": m["content"]} for m in recent_history]
+    messages = [{"role": m["role"], "content": _strip_legacy_mode_labels(m["content"])} for m in recent_history]
     messages.append({"role": "user", "content": query})
 
     # search_library เข้าถึงข้อมูลส่วนตัวของ user เหมือน LIBRARY_TOOLS ทุกตัว (ดู comment ของ LIBRARY_TOOLS) —
@@ -5197,7 +5210,7 @@ def advisor_answer(
     offer_line = _advisor_offer_line(active_docs, chat_id, user_id, query)
     if offer_line and _ADVISOR_REPLACEMENT_OFFER_LINE not in answer:
         answer += offer_line
-    return answer, []
+    return _render_receipt_markers(answer), []
 
 
 def rag_answer_stream(query, history=None, image_data=None, user_id=None):
@@ -5220,9 +5233,7 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
         yield {"type": "done", "sources": [], "full_answer": ctx["message"]}
         return
 
-    label = _build_legal_mode_label(ctx.get("kb_grounded", False), ctx.get("legal_results") or [])
-    yield {"type": "delta", "text": label}
-    full_answer = label
+    full_answer = ""
     with client.messages.stream(
         model="claude-haiku-4-5-20251001",
         max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
@@ -5406,7 +5417,7 @@ def _build_saved_query(query: str, image_data: Optional[dict]) -> str:
     """ไม่เก็บภาพจริงลง DB เลย (กัน DB บวมจาก base64) แต่ยังเก็บข้อความไว้ให้ดูย้อนได้เสมอ
     ถ้ามีภาพแนบมาด้วย ใส่ marker ให้รู้ตอนดูย้อนว่าเทิร์นนี้เคยมีภาพประกอบ (ตัวภาพเองไม่ได้ถูกเก็บไว้)"""
     if image_data is not None:
-        return f"📎 [แนบภาพ] {query}".strip() if query else "📎 [แนบภาพ] (ไม่มีข้อความ)"
+        return f"[แนบภาพ] {query}".strip() if query else "[แนบภาพ] (ไม่มีข้อความ)"
     return query
 
 
@@ -5755,7 +5766,7 @@ async def ask_question(
                     answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
                     if get_document_edit_count(target_doc["id"]) > 0:
                         download_url = f"/api/excel-editor/{target_doc['id']}/download"
-                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [ลิงก์]({download_url})"
                 else:
                     answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
             elif no_name_given:
@@ -5970,7 +5981,7 @@ async def ask_question(
                 else:
                     set_chat_document_focus(chat_id, editable_doc["id"])
                     download_url = f"/api/excel-editor/{editable_doc['id']}/download"
-                    answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
+                    answer = f"ไฟล์พร้อมดาวน์โหลดแล้วครับ [ลิงก์]({download_url})"
                 add_chat_message(chat_id, "user", query)
                 add_chat_message(chat_id, "assistant", answer)
                 touch_chat_session(chat_id)
@@ -5994,7 +6005,7 @@ async def ask_question(
                     answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
                     if get_document_edit_count(editable_doc["id"]) > 0:
                         download_url = f"/api/excel-editor/{editable_doc['id']}/download"
-                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                        answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [ลิงก์]({download_url})"
                 else:
                     answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
                 add_chat_message(chat_id, "user", query)
@@ -6064,7 +6075,7 @@ async def ask_question(
                     set_chat_document_focus(chat_id, target_id)
                     download_url = f"/api/excel-editor/{target_id}/download"
                     filename = docs_by_id[target_id]["filename"]
-                    answer = f"ไฟล์ '{filename}' พร้อมดาวน์โหลดแล้วครับ [📥 ดาวน์โหลดไฟล์ที่แก้แล้ว]({download_url})"
+                    answer = f"ไฟล์ '{filename}' พร้อมดาวน์โหลดแล้วครับ [ลิงก์]({download_url})"
                 else:
                     names = ", ".join(f"'{doc['filename']}'" for doc in active_docs)
                     answer = f"ตอนนี้มี {len(active_docs)} ไฟล์ในแชทนี้ ({names}) กรุณาระบุว่าต้องการดาวน์โหลดไฟล์ไหนครับ"
@@ -6081,7 +6092,7 @@ async def ask_question(
                         answer = f"ปิดไฟล์ {result['filename']} แล้วครับ"
                         if get_document_edit_count(target_id) > 0:
                             download_url = f"/api/excel-editor/{target_id}/download"
-                            answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [📥 ดาวน์โหลด]({download_url})"
+                            answer += f"\n\nไฟล์ฉบับที่แก้ล่าสุดยังดาวน์โหลดได้ที่ [ลิงก์]({download_url})"
                     else:
                         answer = result.get("error") or "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"
                 else:
@@ -7334,22 +7345,22 @@ async def upload_deal_screening_for_user(
             emoji = flag_emoji.get(r["flag"], "")
             lines.append(f"{emoji} {r['project_name']} — ค่าใช้จ่ายเบื้องต้นโดยประมาณ {r['total_cost_thb']:,.0f} บาท")
         else:
-            lines.append(f"❌ แถวที่ {r['row_number']} ({r['project_name']}) — ข้อผิดพลาด: {r['error']}")
+            lines.append(f"แถวที่ {r['row_number']} ({r['project_name']}) — ข้อผิดพลาด: {r['error']}")
 
     summary_text = "\n".join(lines)
     filename = file.filename or "upload.xlsx"
-    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename}")
-    _save_attachment_result_to_chat(final_chat_id, f"📎 [แนบเอกสาร] {filename}", summary_text)
+    final_chat_id = _resolve_chat_id(user_id, chat_id, f"[แนบเอกสาร] {filename}")
+    _save_attachment_result_to_chat(final_chat_id, f"[แนบเอกสาร] {filename}", summary_text)
     return {"summary_text": summary_text, "chat_id": final_chat_id}
 
 
 # ---------- Feasibility Summarizer ----------
 FEASIBILITY_MAX_CHARS = 15000  # จำกัดความยาวข้อความดิบที่ส่งเข้า Claude กันกิน token เกินจำเป็น
 FEASIBILITY_TRUNCATION_NOTICE = (
-    "⚠️ สรุปนี้อ้างอิงจากบางส่วนของไฟล์เท่านั้น (ตัดที่ 15,000 ตัวอักษรแรก) อาจไม่ครบทุกหมวด\n\n"
+    "สรุปนี้อ้างอิงจากบางส่วนของไฟล์เท่านั้น (ตัดที่ 15,000 ตัวอักษรแรก) อาจไม่ครบทุกหมวด\n\n"
 )
 FEASIBILITY_DISCLAIMER_NOTICE = (
-    "\n\n⚠️ นี่คือสรุปที่ AI ช่วยอ่านให้ ควรตรวจสอบตัวเลข วันที่ และเงื่อนไขสำคัญกับไฟล์ต้นฉบับก่อนนำไปใช้งานจริง"
+    "\n\nนี่คือสรุปที่ AI ช่วยอ่านให้ ควรตรวจสอบตัวเลข วันที่ และเงื่อนไขสำคัญกับไฟล์ต้นฉบับก่อนนำไปใช้งานจริง"
 )
 FEASIBILITY_SYSTEM_PROMPT = (
     "คุณเป็นผู้ช่วยสรุปเอกสาร feasibility study ของโครงการ สรุปให้ครอบคลุม (ถ้ามีในเอกสาร): "
@@ -7622,8 +7633,8 @@ async def upload_user_document(
         summary_text=summary_text,
         structured_fields=structured_fields,
     )
-    final_chat_id = _resolve_chat_id(user_id, chat_id, f"📎 [แนบเอกสาร] {filename}")
-    _save_attachment_result_to_chat(final_chat_id, f"📎 [แนบเอกสาร] {filename}", summary_text)
+    final_chat_id = _resolve_chat_id(user_id, chat_id, f"[แนบเอกสาร] {filename}")
+    _save_attachment_result_to_chat(final_chat_id, f"[แนบเอกสาร] {filename}", summary_text)
 
     return {"summary_text": summary_text, "chat_id": final_chat_id}
 
@@ -8231,7 +8242,7 @@ def _route_multi_file_instruction(
 
     history_text = ""
     if recent_history:
-        history_lines = [f"{m['role']}: {m['content']}" for m in recent_history]
+        history_lines = [f"{m['role']}: {_strip_legacy_mode_labels(m['content'])}" for m in recent_history]
         history_text = "\n\nบทสนทนาล่าสุด (4 ข้อความสุดท้าย):\n" + "\n".join(history_lines)
 
     code_match_text = (
@@ -9456,7 +9467,7 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
         new_rate_text = _format_rate_number(action.get("new_rate"))
         rate_change_text = f"จาก {old_rate_text}% เป็น {new_rate_text}%" if old_rate_text is not None else f"เป็น {new_rate_text}%"
         message = (
-            f"✓ เปลี่ยน '{base_label}' {rate_change_text} — ค่าเปลี่ยนจาก "
+            f"[[OK]] เปลี่ยน '{base_label}' {rate_change_text} — ค่าเปลี่ยนจาก "
             f"{_format_money_value(old_value)} เป็น {_format_money_value(new_value)}"
         )
         if new_info is not None:
@@ -9467,18 +9478,18 @@ def _apply_single_queue_item(action: dict, user_id: int) -> dict:
             f"{_TABLE_FIELD_THAI_NAMES.get(k, k)} เปลี่ยนเป็น {_format_money_value(v)}"
             for k, v in (action.get("fields") or {}).items()
         ]
-        message = f"✓ แก้รายการ '{desc}' แล้ว: " + " / ".join(changed_fields)
+        message = f"[[OK]] แก้รายการ '{desc}' แล้ว: " + " / ".join(changed_fields)
     elif action_type == "delete_table_item":
         desc = (action.get("identity") or {}).get("description")
-        message = f"✓ ลบรายการ '{desc}' แล้ว"
+        message = f"[[OK]] ลบรายการ '{desc}' แล้ว"
     elif action_type == "add_table_item":
         field_summary = ", ".join(
             f"{_TABLE_FIELD_THAI_NAMES.get(k, k)}={_format_money_value(v)}"
             for k, v in (action.get("fields") or {}).items()
         )
-        message = f"✓ เพิ่มรายการใหม่ ({field_summary}) แล้ว"
+        message = f"[[OK]] เพิ่มรายการใหม่ ({field_summary}) แล้ว"
     else:
-        message = "✓ ทำรายการนี้เรียบร้อยแล้ว"
+        message = "[[OK]] ทำรายการนี้เรียบร้อยแล้ว"
 
     message += _format_side_effect_lines(side_effects, "เปลี่ยน")
 
@@ -9538,18 +9549,19 @@ def _apply_structural_commands(document_id: int, user_id: int, parsed_commands: 
         else:
             result = {"matched": False, "message": "คำสั่งนี้ไม่รองรับ"}
         first_line = (result.get("message") or "").splitlines()[0] if result.get("message") else ""
-        # first_line อาจมี "✓ "/"✗ " นำหน้ามาแล้วจาก _apply_single_queue_item เอง (ทุกข้อความสำเร็จตอนนี้มี "✓ "
-        # นำหน้าเสมอ) ไม่เติมซ้ำอีกชั้นถ้ามีอยู่แล้ว กันกลายเป็น "✓ ✓ ..."
-        if first_line.startswith(("✓ ", "✗ ")):
+        # first_line อาจมี "[[OK]] "/"[[FAIL]] " นำหน้ามาแล้วจาก _apply_single_queue_item เอง (ทุกข้อความสำเร็จ
+        # ตอนนี้มี "[[OK]] " นำหน้าเสมอ) ไม่เติมซ้ำอีกชั้นถ้ามีอยู่แล้ว กันกลายเป็น "[[OK]] [[OK]] ..."
+        if first_line.startswith(("[[OK]] ", "[[FAIL]] ")):
             lines.append(first_line)
         else:
-            mark = "✓" if result.get("matched") else "✗"
+            mark = "[[OK]]" if result.get("matched") else "[[FAIL]]"
             lines.append(f"{mark} {first_line}")
 
     lines.extend(_document_totals_lines(document_id))
     lines.append("")
     lines.append(_UNDO_HINT_LINE)
-    return "\n".join(lines)
+    # แปลง marker เป็นข้อความธรรมดาก่อนคืนผู้ใช้ — จุดเดียวสุดท้ายของเส้นทาง direct dispatch นี้ (ดู _render_receipt_markers)
+    return _render_receipt_markers("\n".join(lines))
 
 
 # ---------- เชื่อมรายการแนะนำสินค้าล่าสุด (จาก present_recommendations) เข้ากับใบเสนอราคา ----------
@@ -9630,7 +9642,7 @@ def _apply_recommendation_replace(
                 f"\n\nยังไม่ได้เปลี่ยนราคา ({model.get('price_note') or 'ไม่พบราคาที่ชัดเจน'}) "
                 "พิมพ์ราคาที่ต้องการได้เลยครับ"
             )
-        base_line = f"✓ แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']}"
+        base_line = f"[[OK]] แทนรายการที่ {target['item_no']} ({target['description']}) ด้วย {model['name']}"
         if price_changed:
             # ราคาถูกกำหนดจริง (explicit/markup/none ที่ใช้ price_thb ของรุ่นตรงๆ) ถึงจะมี "→" + วงเล็บที่มา —
             # เหตุการณ์จริงที่แก้: ไม่ได้เปลี่ยนราคาเลย (null/ราคาเดิม) แต่ยังโชว์ "X → X (ราคาอ้างอิงจาก ...)"
@@ -9895,7 +9907,7 @@ def _resolve_recommendation_intent_with_llm(
         for i, rec in enumerate(recommendations, start=1)
     ]
     recent_history = get_chat_messages(chat_id)[-6:]
-    history_lines = [f"{m['role']}: {(m['content'] or '')[:600]}" for m in recent_history]
+    history_lines = [f"{m['role']}: {_strip_legacy_mode_labels(m['content'] or '')[:600]}" for m in recent_history]
 
     prompt = (
         "ตารางรายการปัจจุบันในใบเสนอราคา:\n" + "\n".join(table_lines) + "\n\n"
@@ -10045,7 +10057,8 @@ def _resolve_recommendation_command_dispatch(
         )
     if result is None:
         return None
-    return {"document_id": target_doc["id"], "answer": result["message"]}
+    # จุดเดียวสุดท้ายของเส้นทางนี้ก่อนคืนผู้ใช้ — แปลง marker [[OK]]/[[FAIL]] เป็นข้อความธรรมดา
+    return {"document_id": target_doc["id"], "answer": _render_receipt_markers(result["message"])}
 
 
 def _resolve_direct_structural_dispatch(
@@ -10386,7 +10399,7 @@ def _build_router_history_context(chat_id: Optional[int]) -> str:
     recent_history = get_chat_messages(chat_id)[-6:]
     if not recent_history:
         return "ไม่มีประวัติการสนทนา"
-    return "\n".join(f"{m['role']}: {(m['content'] or '')[:500]}" for m in recent_history)
+    return "\n".join(f"{m['role']}: {_strip_legacy_mode_labels(m['content'] or '')[:500]}" for m in recent_history)
 
 
 def _resolve_router_target_document(active_docs: list[dict], user_id: Optional[int], chat_id: Optional[int]) -> Optional[dict]:
@@ -10565,7 +10578,8 @@ def _dispatch_router_recommendation_action(
     )
     if result is None:
         return None
-    return {"document_id": target_doc["id"], "answer": result["message"]}
+    # จุดเดียวสุดท้ายของเส้นทางนี้ก่อนคืนผู้ใช้ — แปลง marker [[OK]]/[[FAIL]] เป็นข้อความธรรมดา
+    return {"document_id": target_doc["id"], "answer": _render_receipt_markers(result["message"])}
 
 
 def _dispatch_router_advisor(query: str, user_id: Optional[int], chat_id: Optional[int], active_docs: list[dict]) -> dict:
@@ -10845,7 +10859,7 @@ def _match_and_apply_excel_edit(document_id: int, user_id: int, instruction: str
             reason = 'เป็นอัตราที่คำนวณในสูตร ใช้คำสั่งแก้อัตราตรงๆ เช่น "เปลี่ยน VAT เป็น 10%" แทน'
         else:
             reason = "คำนวณอัตโนมัติจากสูตรในไฟล์"
-        return {"matched": False, "message": f"✗ '{label}' {reason} แก้ตรงไม่ได้ครับ"}
+        return {"matched": False, "message": f"'{label}' {reason} แก้ตรงไม่ได้ครับ"}
 
     old_value = target_info["current_value"]
 
@@ -10942,7 +10956,7 @@ async def upload_excel_editor_document(
             detail="ไม่พบแถวรูปแบบ label:value (เซลล์ไม่ว่างพอดี 2 เซลล์ต่อแถว) ในไฟล์นี้",
         )
 
-    user_message = f"📎 [แนบเอกสาร] {filename} — {instruction}" if instruction else f"📎 [แนบเอกสาร] {filename}"
+    user_message = f"[แนบเอกสาร] {filename} — {instruction}" if instruction else f"[แนบเอกสาร] {filename}"
     final_chat_id = _resolve_chat_id(user_id, chat_id, user_message)
     # สร้าง EditableDocument ผูกกับแชทนี้เสมอไม่ว่า intent จะเป็นอะไร (parse label_map ทำไปแล้วอยู่แล้ว
     # ไม่เสียอะไรเพิ่ม) เผื่อ user อยากแก้ทีหลังในแชทเดียวกันโดยไม่ต้องแนบไฟล์ซ้ำ (ผ่าน /ask branch เดิม)
