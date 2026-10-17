@@ -20,3 +20,4 @@ xlrd
 boto3
 pycel
 python-docx
+python-crfsuite

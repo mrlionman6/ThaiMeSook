@@ -319,6 +319,118 @@ async function bulkImportChunks() {
     }
 }
 
+// ---------- นำเข้าเอกสารยาว (structure-aware chunking ผ่าน kb_chunker.py) ----------
+let kbChunkPreviewList = [];
+
+async function previewKbChunks() {
+    const fileInput = document.getElementById("kbChunkFileInput");
+    const titleInput = document.getElementById("kbChunkSourceTitle");
+    const statusEl = document.getElementById("kbChunkPreviewStatus");
+
+    if (!fileInput.files || fileInput.files.length === 0) {
+        statusEl.textContent = "เลือกไฟล์ก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+    if (!titleInput.value.trim()) {
+        statusEl.textContent = "กรอกชื่อเอกสารก่อน";
+        statusEl.style.color = "red";
+        return;
+    }
+
+    const formData = new FormData();
+    formData.append("file", fileInput.files[0]);
+    formData.append("source_title", titleInput.value.trim());
+
+    statusEl.textContent = "กำลังหั่น... (อาจใช้เวลาสักครู่ถ้าไฟล์ใหญ่)";
+    statusEl.style.color = "#666";
+
+    try {
+        const res = await fetch("/admin/api/kb/chunk-preview", { method: "POST", body: formData });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        kbChunkPreviewList = data.chunks;
+        statusEl.textContent = `✅ หั่นได้ ${data.chunks.length} chunk — ตรวจ/แก้ไขด้านล่างแล้วกดยืนยันบันทึก`;
+        statusEl.style.color = "green";
+        renderKbChunkPreview();
+    } catch (error) {
+        statusEl.textContent = "❌ หั่นไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
+    }
+}
+
+function renderKbChunkPreview() {
+    const section = document.getElementById("kbChunkPreviewSection");
+    const tbody = document.getElementById("kbChunkPreviewBody");
+
+    if (kbChunkPreviewList.length === 0) {
+        section.style.display = "none";
+        tbody.innerHTML = "";
+        return;
+    }
+
+    section.style.display = "";
+    tbody.innerHTML = kbChunkPreviewList.map((c, i) => `
+        <tr>
+            <td>${escapeHtml(c.header)}</td>
+            <td>${c.token_count}</td>
+            <td><textarea class="kb-textarea" style="min-height:60px;width:100%;" oninput="updateKbChunkPreviewContent(${i}, this.value)">${escapeHtml(c.content)}</textarea></td>
+            <td><button type="button" onclick="deleteKbChunkPreviewRow(${i})">🗑️ ลบ</button></td>
+        </tr>
+    `).join("");
+}
+
+function updateKbChunkPreviewContent(index, value) {
+    kbChunkPreviewList[index].content = value;
+}
+
+function deleteKbChunkPreviewRow(index) {
+    kbChunkPreviewList.splice(index, 1);
+    renderKbChunkPreview();
+}
+
+async function commitKbChunks() {
+    const statusEl = document.getElementById("kbChunkCommitStatus");
+    const tagsInput = document.getElementById("kbChunkCommitTags");
+
+    if (kbChunkPreviewList.length === 0) {
+        statusEl.textContent = "ไม่มี chunk ให้บันทึก";
+        statusEl.style.color = "red";
+        return;
+    }
+
+    const tags = tagsInput.value.split(",").map(t => t.trim()).filter(t => t);
+    statusEl.textContent = "กำลังบันทึก...";
+    statusEl.style.color = "#666";
+
+    try {
+        const res = await fetch("/admin/api/kb/chunk-commit", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                chunks: kbChunkPreviewList.map(c => ({ content: c.content })),
+                tags: tags
+            })
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        statusEl.textContent = `✅ บันทึกแล้ว ${data.count} chunk`;
+        statusEl.style.color = "green";
+        kbChunkPreviewList = [];
+        renderKbChunkPreview();
+        document.getElementById("kbChunkFileInput").value = "";
+        document.getElementById("kbChunkSourceTitle").value = "";
+        tagsInput.value = "";
+        loadKb(1);
+        loadKbTagFilterList();
+    } catch (error) {
+        statusEl.textContent = "❌ บันทึกไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
+    }
+}
+
 async function saveKb(id) {
     const textarea = document.getElementById("kb-textarea-" + id);
     const tagsInput = document.getElementById("kb-tags-" + id);
