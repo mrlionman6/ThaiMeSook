@@ -78,8 +78,31 @@
                         <span id="bulkImportStatus" class="kb-toolbar-status"></span>
                     </div>
                 </details>
+                <details class="kb-toolbar-section">
+                    <summary>📄 นำเข้าเอกสารยาว (หั่นอัตโนมัติตามโครงสร้างมาตรา)</summary>
+                    <div class="kb-toolbar-body">
+                        <p class="ts-note">รองรับ .txt/.docx — หั่นตาม "มาตรา N" อัตโนมัติพร้อมบริบทหมวด (ไม่มีมาตราเลยจะแยกตามย่อหน้าแทน) ตรวจ/แก้ไข/ลบ chunk ได้ก่อนบันทึกจริง</p>
+                        <input type="text" id="kbChunkSourceTitle" class="kb-tag-input" placeholder="ชื่อเอกสาร/กฎหมาย (ใช้ขึ้นต้น header ทุก chunk)">
+                        <input type="file" id="kbChunkFileInput" accept=".txt,.docx">
+                        <button onclick="previewKbChunks()">ดูตัวอย่างการหั่น</button>
+                        <span id="kbChunkPreviewStatus" class="kb-toolbar-status"></span>
+                    </div>
+                </details>
             </div>
-    
+
+            <div id="kbChunkPreviewSection" style="display:none;">
+                <div class="kb-filter-bar">
+                    <label class="kb-filter-label">Tag สำหรับ chunk ชุดนี้ (ใช้ร่วมกันทุก chunk):</label>
+                    <input type="text" id="kbChunkCommitTags" class="kb-tag-input" placeholder="เช่น ภาษี, ที่ดิน">
+                    <button type="button" onclick="commitKbChunks()">✅ ยืนยันบันทึกทั้งหมด</button>
+                    <span id="kbChunkCommitStatus" class="kb-toolbar-status"></span>
+                </div>
+                <table class="legal-eval-table" id="kbChunkPreviewTable">
+                    <thead><tr><th>Header</th><th>Token</th><th>ข้อความ</th><th></th></tr></thead>
+                    <tbody id="kbChunkPreviewBody"></tbody>
+                </table>
+            </div>
+
             <div class="kb-filter-bar">
                 <label class="kb-filter-label">กรองตาม tag:</label>
                 <div id="kbTagFilterList" class="kb-tag-filter-list">กำลังโหลด tag...</div>

@@ -141,6 +141,7 @@ import bcrypt
 import pandas as pd
 import openpyxl
 import xlrd
+from docx import Document as DocxDocument
 from openpyxl.styles.numbers import is_date_format
 from openpyxl.workbook.properties import CalcProperties
 from openpyxl.cell.cell import MergedCell
@@ -363,6 +364,8 @@ def rerank_with_scores(query, candidates, top_k=3):
 import legal_retrieval
 # deferred import (หลังนิยาม client/ROUTER_MODEL/ADVISOR_MODEL/save_legal_memo ที่ legal_docs.py ต้องใช้)
 import legal_docs
+# deferred import (หลังนิยาม embed_model ที่ kb_chunker.py ต้องใช้) — ดู docstring ของไฟล์นั้น
+import kb_chunker
 
 def rewrite_query_for_retrieval(query: str, history: list) -> str:
     """ใช้ Claude Haiku เขียนคำถามที่กำกวม/อ้างอิงบริบทก่อนหน้า (เช่น 'แล้วอันนี้ล่ะ')
@@ -5253,6 +5256,13 @@ class KBCreate(BaseModel):
     tags: Optional[list[str]] = None
     chunk_id: Optional[int] = None  # ถ้าระบุมา จะพยายามเพิ่มที่ id นี้ตรงๆ (เช่น เติมคืนตำแหน่งที่เคยลบไป) ไม่ระบุ = ต่อท้ายอัตโนมัติตามปกติ
 
+class KBChunkPreviewItem(BaseModel):
+    content: str
+
+class KBChunkCommit(BaseModel):
+    chunks: list[KBChunkPreviewItem]
+    tags: Optional[list[str]] = None  # ใช้ร่วมกันทุก chunk ที่บันทึกใน request นี้ (มาจากเอกสารเดียวกัน)
+
 class TagRename(BaseModel):
     name: str
 
@@ -6921,6 +6931,44 @@ async def bulk_create_kb(file: UploadFile = File(...), _: bool = Depends(require
         new_id = add_knowledge_chunk(item["content"], embedding=embedding.tolist())
         if item["tags"]:
             set_tags_for_chunk(new_id, item["tags"])
+        added_ids.append(new_id)
+
+    rebuild_index()
+    return {"status": "created", "count": len(added_ids), "ids": added_ids}
+
+@app.post("/admin/api/kb/chunk-preview")
+async def kb_chunk_preview(file: UploadFile = File(...), source_title: str = Form(...), _: bool = Depends(require_login)):
+    """หั่นเอกสารยาว (.txt/.docx) ด้วย kb_chunker.chunk_document ให้ดูผลก่อน ไม่บันทึกลง DB (ดู kb_chunker.py)"""
+    raw = await file.read()
+    filename = (file.filename or "").lower()
+    if filename.endswith(".docx"):
+        text = "\n".join(p.text for p in DocxDocument(io.BytesIO(raw)).paragraphs)
+    else:
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="อ่านไฟล์ไม่ได้ — ต้องเป็น UTF-8 text หรือ .docx เท่านั้น")
+
+    title = source_title.strip() or "เอกสาร"
+    chunks = kb_chunker.chunk_document(text, title)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="ไม่พบเนื้อหาที่หั่นได้ในไฟล์นี้")
+    return {"chunks": chunks}
+
+@app.post("/admin/api/kb/chunk-commit")
+def kb_chunk_commit(body: KBChunkCommit, _: bool = Depends(require_login)):
+    """บันทึก chunk ที่ผู้ใช้ตรวจ/แก้ไข/ลบจากหน้า preview แล้ว ผ่าน add_knowledge_chunk ปกติ ติด tags เดียวกันทุก
+    chunk (มาจากเอกสารเดียวกัน) แล้ว rebuild_index ครั้งเดียวตอนจบ"""
+    contents = [c.content.strip() for c in body.chunks if c.content.strip()]
+    if not contents:
+        raise HTTPException(status_code=400, detail="ไม่มี chunk ให้บันทึก")
+
+    embeddings = embed_model.encode(contents)
+    added_ids = []
+    for content, embedding in zip(contents, embeddings):
+        new_id = add_knowledge_chunk(content, embedding=embedding.tolist())
+        if body.tags:
+            set_tags_for_chunk(new_id, body.tags)
         added_ids.append(new_id)
 
     rebuild_index()
