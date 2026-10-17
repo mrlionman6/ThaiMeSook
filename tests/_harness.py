@@ -76,7 +76,7 @@ WANTED_MAIN_FUNCS = {
     "_label_position", "_find_label_by_position", "_current_label_display_name",
     "_get_active_chat_document", "execute_open_library_file", "_normalize_filename_for_matching",
     "_match_and_apply_excel_edit", "_parse_json_response",
-    "rag_answer", "contains_unexpected_script", "_normalize_polite_particles", "_build_legal_mode_label",
+    "rag_answer", "contains_unexpected_script", "_normalize_polite_particles",
     "advisor_answer", "_advisor_system_prompt", "_advisor_offer_line",
     "_advisor_target_doc", "_advisor_document_context",
     "run_agentic_tool_loop", "_build_final_answer_with_citations", "_safe_execute_tool", "_build_action_receipt",

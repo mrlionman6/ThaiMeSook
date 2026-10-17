@@ -4,6 +4,7 @@ from main import (
     apply_change_rate, _resolve_direct_structural_dispatch, _match_and_apply_excel_edit, rag_answer,
     get_chat_messages, _document_totals_lines, _UNDO_HINT_LINE, get_latest_document_version,
     update_document_version_change_summary, _STRUCTURAL_CLAUSE_SPLIT_RE, _STRUCTURAL_DIRECT_RATE_RE,
+    _render_receipt_markers,
 )
 from document_fields import apply_field_edits
 
@@ -36,7 +37,7 @@ def _version_no(document_id: int) -> int:
 
 def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int, chat_id: int) -> dict:
     """apply field_edits -> rate_changes -> table edit_instruction ตามลำดับ รวมใบยืนยันเป็นข้อความเดียว sub_
-    commands ที่ไม่มีอะไรทำ -> "✗ ยังไม่ได้ทำ" สร้าง >1 เวอร์ชัน -> ฝัง marker ให้ undo ย้อนทีเดียวทั้งกลุ่ม"""
+    commands ที่ไม่มีอะไรทำ -> "ยังไม่ได้ทำ: ..." สร้าง >1 เวอร์ชัน -> ฝัง marker ให้ undo ย้อนทีเดียวทั้งกลุ่ม"""
     document_id = target_doc["id"]
     version_before = _version_no(document_id)
     receipt_sections: list[str] = []
@@ -59,8 +60,8 @@ def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int,
                 continue
             result = apply_change_rate(document_id, user_id, label, new_percent)
             message = result["message"]
-            if not message.startswith(("✓", "✗")):
-                message = ("✓ " if result.get("matched") else "✗ ") + message
+            if not message.startswith(("[[OK]]", "[[FAIL]]")):
+                message = ("[[OK]] " if result.get("matched") else "[[FAIL]] ") + message
             receipt_sections.append(_strip_totals_and_undo_tail(message))
         accounted += len(rate_changes)
 
@@ -99,11 +100,12 @@ def apply_compound_edit(route: dict, target_doc: dict, query: str, user_id: int,
     if isinstance(sub_commands, list):
         for sub_command in sub_commands[accounted:]:
             if isinstance(sub_command, str) and sub_command.strip():
-                receipt_sections.append(f"✗ ยังไม่ได้ทำ: {sub_command.strip()}")
+                receipt_sections.append(f"[[FAIL]] ยังไม่ได้ทำ: {sub_command.strip()}")
 
     _mark_compound_group(document_id, version_before)
     message_lines = ["\n\n".join(receipt_sections)] + _document_totals_lines(document_id) + ["", _UNDO_HINT_LINE]
-    return {"document_id": document_id, "answer": "\n".join(message_lines)}
+    # แปลง marker เป็นข้อความธรรมดาก่อนคืนผู้ใช้ — จุดเดียวสุดท้ายของเส้นทาง compound edit นี้
+    return {"document_id": document_id, "answer": _render_receipt_markers("\n".join(message_lines))}
 
 
 def _mark_compound_group(document_id: int, version_before: int) -> None:

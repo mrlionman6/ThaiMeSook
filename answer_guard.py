@@ -68,7 +68,7 @@ def truth_guard(
     raw_answer: str, *, query: str, active_docs: list, version_before: dict, edit_intent: bool, chat_id=None,
     strip_money_lines: bool = True,
 ) -> str:
-    """version เปลี่ยนจริง -> เชื่อ raw_answer เต็มที่ ไม่เปลี่ยนเลย -> "✓"/"✗" ใดๆ ต้องปลอม: edit_intent หรือเจอ
+    """version เปลี่ยนจริง -> เชื่อ raw_answer เต็มที่ ไม่เปลี่ยนเลย -> "[[OK]]"/"[[FAIL]]" ใดๆ ต้องปลอม: edit_intent หรือเจอ
     บรรทัดปลอม -> แทนทั้งก้อนด้วยข้อความจากโค้ด ไม่งั้นแค่ตัดยอดเงินที่ไม่ตรงค่าจริง (strip_money_lines คุมได้)"""
     if not active_docs:
         stripped = _strip_fabricated_receipt_lines(raw_answer)
