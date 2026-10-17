@@ -1,0 +1,270 @@
+{
+ "version": 1,
+ "note": "expected = ข้อความสั้นที่มีอยู่ใน chunk เป้าหมาย (เทียบแบบ substring กับ content) เพราะไฟล์ export ไม่มี id; expected ว่าง = คำถามนอกฐานความรู้ ระบบควรตอบว่าไม่พบ",
+ "chunk_keys": {
+  "C01": "ตามมาตรา 4 คำว่า",
+  "C02": "ห้ามคนต่างด้าวประกอบธุรกิจโดยเด็ดขาด",
+  "C03": "บัญชีสองท้ายพระราชบัญญัติ",
+  "C04": "บัญชีสามท้ายพระราชบัญญัติ",
+  "C05": "มาตรา 14 แห่งพระราชบัญญัติ",
+  "C06": "แบบฟอร์ม ต.2",
+  "C07": "(Nominee)",
+  "C08": "สนธิสัญญาไมตรีไทย-สหรัฐฯ",
+  "C09": "เป็นหน่วยงานราชการภายใต้สำนักนายกรัฐมนตรี",
+  "C10": "ตามมาตรา 31 แห่งพระราชบัญญัติส่งเสริมการลงทุน",
+  "C11": "มาตรา 28 และ 29",
+  "C12": "ถือหุ้นได้สูงสุด 100% ในธุรกิจส่วนใหญ่ ยกเว้น",
+  "C13": "One Stop Service Center",
+  "C14": "8 หมวดหลัก",
+  "C15": "แผนธุรกิจ (Business Plan)",
+  "C16": "เป็นกฎหมายคนละฉบับที่ทำงานร่วมกัน"
+ },
+ "questions": [
+  {
+   "id": "Q01",
+   "type": "keyword",
+   "question": "คนต่างด้าวตาม FBA หมายถึงใครบ้าง",
+   "expected": [
+    "C01"
+   ]
+  },
+  {
+   "id": "Q02",
+   "type": "keyword",
+   "question": "ธุรกิจในบัญชีหนึ่งท้าย พ.ร.บ.ธุรกิจคนต่างด้าว มีอะไรบ้าง",
+   "expected": [
+    "C02"
+   ]
+  },
+  {
+   "id": "Q03",
+   "type": "keyword",
+   "question": "ธุรกิจบัญชีสองต้องได้รับอนุญาตจากใคร",
+   "expected": [
+    "C03"
+   ]
+  },
+  {
+   "id": "Q04",
+   "type": "keyword",
+   "question": "FBL คืออะไร ต้องขอกับหน่วยงานไหน",
+   "expected": [
+    "C04",
+    "C06"
+   ]
+  },
+  {
+   "id": "Q05",
+   "type": "keyword",
+   "question": "ทุนขั้นต่ำของคนต่างด้าวตามมาตรา 14 เท่าไร",
+   "expected": [
+    "C05"
+   ]
+  },
+  {
+   "id": "Q06",
+   "type": "keyword",
+   "question": "ค่าธรรมเนียมยื่นคำขอ FBL เท่าไร",
+   "expected": [
+    "C06"
+   ]
+  },
+  {
+   "id": "Q07",
+   "type": "keyword",
+   "question": "Nominee ผิดกฎหมายไหม มีบทลงโทษอย่างไร",
+   "expected": [
+    "C07"
+   ]
+  },
+  {
+   "id": "Q08",
+   "type": "keyword",
+   "question": "BOI ยกเว้นภาษีเงินได้นิติบุคคลได้สูงสุดกี่ปี",
+   "expected": [
+    "C10"
+   ]
+  },
+  {
+   "id": "Q09",
+   "type": "keyword",
+   "question": "BOI ช่วยเรื่องวีซ่าและ work permit อย่างไร",
+   "expected": [
+    "C13"
+   ]
+  },
+  {
+   "id": "Q10",
+   "type": "keyword",
+   "question": "BOI แบ่งประเภทกิจการที่ส่งเสริมเป็นกี่หมวด",
+   "expected": [
+    "C14"
+   ]
+  },
+  {
+   "id": "Q11",
+   "type": "paraphrase",
+   "question": "บริษัทจดทะเบียนในไทยแต่ฝรั่งถือหุ้น 60% ถือว่าเป็นบริษัทต่างชาติไหม",
+   "expected": [
+    "C01"
+   ]
+  },
+  {
+   "id": "Q12",
+   "type": "paraphrase",
+   "question": "ชาวต่างชาติอยากเปิดสถานีวิทยุในไทย ทำได้หรือเปล่า",
+   "expected": [
+    "C02"
+   ]
+  },
+  {
+   "id": "Q13",
+   "type": "paraphrase",
+   "question": "ต่างชาติถือหุ้นใหญ่ อยากเปิดสำนักงานรับทำบัญชี ต้องทำอะไรก่อน",
+   "expected": [
+    "C04"
+   ]
+  },
+  {
+   "id": "Q14",
+   "type": "paraphrase",
+   "question": "ถ้าจ้างคนไทยมาถือหุ้นแทนเรา จะเกิดอะไรขึ้น",
+   "expected": [
+    "C07"
+   ]
+  },
+  {
+   "id": "Q15",
+   "type": "paraphrase",
+   "question": "ยื่นเรื่องขอใบอนุญาตไปแล้วต้องรอผลนานแค่ไหน ถ้าไม่ผ่านทำอะไรต่อได้",
+   "expected": [
+    "C06"
+   ]
+  },
+  {
+   "id": "Q16",
+   "type": "paraphrase",
+   "question": "นำเครื่องจักรจากต่างประเทศเข้ามาใช้ในโรงงาน ลดภาษีนำเข้าได้ไหม",
+   "expected": [
+    "C11"
+   ]
+  },
+  {
+   "id": "Q17",
+   "type": "paraphrase",
+   "question": "บริษัทต่างชาติซื้อที่ดินเพื่อสร้างโรงงานได้ไหม",
+   "expected": [
+    "C12"
+   ]
+  },
+  {
+   "id": "Q18",
+   "type": "paraphrase",
+   "question": "บริษัทจากอเมริกามีสิทธิพิเศษในการลงทุนในไทยไหม",
+   "expected": [
+    "C08"
+   ]
+  },
+  {
+   "id": "Q19",
+   "type": "paraphrase",
+   "question": "ได้รับอนุมัติส่งเสริมแล้วต้องทำอะไรต่อ ถ้าไม่ทำตามเงื่อนไขจะเป็นอย่างไร",
+   "expected": [
+    "C15"
+   ]
+  },
+  {
+   "id": "Q20",
+   "type": "paraphrase",
+   "question": "ร้านค้าปลีกของต่างชาติต้องมีทุนเท่าไรถึงไม่ต้องขอใบอนุญาต",
+   "expected": [
+    "C05"
+   ]
+  },
+  {
+   "id": "Q21",
+   "type": "english",
+   "question": "What is the minimum capital for a foreign company in Thailand?",
+   "expected": [
+    "C05"
+   ]
+  },
+  {
+   "id": "Q22",
+   "type": "english",
+   "question": "Can a BOI-promoted company be 100% foreign-owned?",
+   "expected": [
+    "C12",
+    "C08",
+    "C16"
+   ]
+  },
+  {
+   "id": "Q23",
+   "type": "english",
+   "question": "How long does it take to get a Foreign Business License approved?",
+   "expected": [
+    "C06"
+   ]
+  },
+  {
+   "id": "Q24",
+   "type": "english",
+   "question": "What tax incentives does the BOI offer?",
+   "expected": [
+    "C10",
+    "C09",
+    "C11"
+   ]
+  },
+  {
+   "id": "Q25",
+   "type": "multi",
+   "question": "ถ้าได้ BOI แล้ว ยังต้องขอ FBL อีกไหม",
+   "expected": [
+    "C16",
+    "C08"
+   ]
+  },
+  {
+   "id": "Q26",
+   "type": "multi",
+   "question": "BOI ช่วยให้ต่างชาติทำธุรกิจในบัญชีหนึ่งได้ไหม",
+   "expected": [
+    "C16",
+    "C02",
+    "C12"
+   ]
+  },
+  {
+   "id": "Q27",
+   "type": "multi",
+   "question": "บัญชีสองกับบัญชีสามต่างกันอย่างไร",
+   "expected": [
+    "C03",
+    "C04"
+   ]
+  },
+  {
+   "id": "Q28",
+   "type": "multi",
+   "question": "มีทางไหนบ้างที่ต่างชาติถือหุ้น 100% ได้โดยไม่ต้องขอ FBL",
+   "expected": [
+    "C08",
+    "C16"
+   ]
+  },
+  {
+   "id": "Q29",
+   "type": "out_of_kb",
+   "question": "ภาษีมูลค่าเพิ่มในไทยตอนนี้กี่เปอร์เซ็นต์",
+   "expected": []
+  },
+  {
+   "id": "Q30",
+   "type": "out_of_kb",
+   "question": "ชาวต่างชาติขอถิ่นที่อยู่ถาวร (PR) ในไทยต้องทำอย่างไร",
+   "expected": []
+  }
+ ]
+}

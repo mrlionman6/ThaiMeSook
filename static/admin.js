@@ -30,6 +30,7 @@ function switchTab(tab) {
     document.getElementById("tabDealScreening").style.display = tab === "dealScreening" ? "block" : "none";
     document.getElementById("tabFeasibility").style.display = tab === "feasibility" ? "block" : "none";
     document.getElementById("tabFileLibrary").style.display = tab === "fileLibrary" ? "block" : "none";
+    document.getElementById("tabLegalEval").style.display = tab === "legalEval" ? "block" : "none";
 
     document.getElementById("tabBtnPending").classList.toggle("tab-btn-active", tab === "pending");
     document.getElementById("tabBtnKb").classList.toggle("tab-btn-active", tab === "kb");
@@ -40,6 +41,7 @@ function switchTab(tab) {
     document.getElementById("tabBtnDealScreening").classList.toggle("tab-btn-active", tab === "dealScreening");
     document.getElementById("tabBtnFeasibility").classList.toggle("tab-btn-active", tab === "feasibility");
     document.getElementById("tabBtnFileLibrary").classList.toggle("tab-btn-active", tab === "fileLibrary");
+    document.getElementById("tabBtnLegalEval").classList.toggle("tab-btn-active", tab === "legalEval");
 
     if (tab === "pending") {
         loadLogs(pendingPage);
@@ -1782,6 +1784,122 @@ async function importLibraryFiles() {
         statusEl.textContent = "❌ นำเข้าไม่สำเร็จ: " + error;
         statusEl.style.color = "red";
     }
+}
+
+// ---------- แท็บ: วัดผลระบบค้นกฎหมาย ----------
+function _legalEvalPct(x) {
+    return (x * 100).toFixed(0) + "%";
+}
+
+let legalEvalLastCases = []; // เก็บผลล่าสุดไว้ ให้ปรับ threshold ชั่วคราวแล้ว render ใหม่ได้โดยไม่ fetch ซ้ำ
+
+async function runLegalEval() {
+    const statusEl = document.getElementById("legalEvalStatus");
+    const summaryEl = document.getElementById("legalEvalSummary");
+    const casesEl = document.getElementById("legalEvalCasesContainer");
+    statusEl.textContent = "กำลังรัน...";
+    statusEl.style.color = "#666";
+    summaryEl.innerHTML = "";
+    casesEl.innerHTML = "";
+
+    try {
+        const res = await fetch("/admin/api/legal-eval/run", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+
+        statusEl.textContent = "";
+        document.getElementById("legalEvalThresholdInput").value = data.threshold;
+        legalEvalLastCases = data.cases;
+        renderLegalEvalSummary(data.baseline, data.tag_vector);
+        renderLegalEvalCases(legalEvalLastCases);
+    } catch (error) {
+        statusEl.textContent = "รันไม่สำเร็จ: " + error;
+        statusEl.style.color = "red";
+    }
+}
+
+function onLegalEvalThresholdChange() {
+    if (legalEvalLastCases.length > 0) renderLegalEvalCases(legalEvalLastCases);
+}
+
+function renderLegalEvalSummary(baseline, tagVector) {
+    const emptyStat = { n: 0, hit_at_1: 0, hit_at_3: 0, mrr: 0 };
+    const types = Array.from(new Set([...Object.keys(baseline.by_type), ...Object.keys(tagVector.by_type)])).sort();
+
+    let rows = "";
+    for (const t of types) {
+        const b = baseline.by_type[t] || emptyStat;
+        const tv = tagVector.by_type[t] || emptyStat;
+        rows += `<tr>
+            <td>${escapeHtml(t)} (n=${b.n})</td>
+            <td>${_legalEvalPct(b.hit_at_1)}</td><td>${_legalEvalPct(b.hit_at_3)}</td><td>${b.mrr.toFixed(2)}</td>
+            <td>${_legalEvalPct(tv.hit_at_1)}</td><td>${_legalEvalPct(tv.hit_at_3)}</td><td>${tv.mrr.toFixed(2)}</td>
+        </tr>`;
+    }
+    rows += `<tr>
+        <td><strong>รวม (n=${baseline.overall.n})</strong></td>
+        <td><strong>${_legalEvalPct(baseline.overall.hit_at_1)}</strong></td>
+        <td><strong>${_legalEvalPct(baseline.overall.hit_at_3)}</strong></td>
+        <td><strong>${baseline.overall.mrr.toFixed(2)}</strong></td>
+        <td><strong>${_legalEvalPct(tagVector.overall.hit_at_1)}</strong></td>
+        <td><strong>${_legalEvalPct(tagVector.overall.hit_at_3)}</strong></td>
+        <td><strong>${tagVector.overall.mrr.toFixed(2)}</strong></td>
+    </tr>`;
+
+    const outOfKbNote = baseline.out_of_kb.n > 0
+        ? `<p>out_of_kb (n=${baseline.out_of_kb.n}): baseline ผ่าน ${_legalEvalPct(baseline.out_of_kb.pass_rate)} — ` +
+          `tag+vector ผ่าน ${_legalEvalPct(tagVector.out_of_kb.pass_rate)}</p>`
+        : "";
+
+    document.getElementById("legalEvalSummary").innerHTML = `
+        <table class="legal-eval-table">
+            <thead>
+                <tr><th rowspan="2">Type</th><th colspan="3">Baseline (beta=0)</th><th colspan="3">Tag+Vector</th></tr>
+                <tr><th>Hit@1</th><th>Hit@3</th><th>MRR</th><th>Hit@1</th><th>Hit@3</th><th>MRR</th></tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+        ${outOfKbNote}
+    `;
+}
+
+function renderLegalEvalCases(cases) {
+    const threshold = parseFloat(document.getElementById("legalEvalThresholdInput").value);
+    const modeLabel = (topScore) => (topScore >= threshold ? "📚" : "💡");
+
+    let rows = "";
+    for (const c of cases) {
+        const passLabel = (score) => {
+            const pass = c.type === "out_of_kb" ? score.out_of_kb_pass : score.hit_at_3;
+            return pass ? "✅ ผ่าน" : "❌ ไม่ผ่าน";
+        };
+        const expected = c.chunk_keys.length > 0 ? c.chunk_keys.map(escapeHtml).join(", ") : "(out_of_kb)";
+        rows += `<tr>
+            <td>${escapeHtml(c.id)}<br>(${escapeHtml(c.type || "")})</td>
+            <td>${escapeHtml(c.query)}</td>
+            <td>${expected}</td>
+            <td>${c.baseline.found_ids.map(id => "#" + id).join(", ")}</td>
+            <td>${c.baseline.top_score.toFixed(3)}</td>
+            <td>${modeLabel(c.baseline.top_score)}</td>
+            <td>${passLabel(c.baseline)}</td>
+            <td>${c.tag_vector.found_ids.map(id => "#" + id).join(", ")}</td>
+            <td>${c.tag_vector.top_score.toFixed(3)}</td>
+            <td>${modeLabel(c.tag_vector.top_score)}</td>
+            <td>${passLabel(c.tag_vector)}</td>
+        </tr>`;
+    }
+    document.getElementById("legalEvalCasesContainer").innerHTML = `
+        <table class="legal-eval-table">
+            <thead>
+                <tr>
+                    <th>ID</th><th>คำถาม</th><th>ที่ควรเจอ</th>
+                    <th>Baseline top3</th><th>Baseline score</th><th>ป้าย</th><th>Baseline</th>
+                    <th>Tag+Vector top3</th><th>Tag+Vector score</th><th>ป้าย</th><th>Tag+Vector</th>
+                </tr>
+            </thead>
+            <tbody>${rows}</tbody>
+        </table>
+    `;
 }
 
 // ---------- Init ----------

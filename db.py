@@ -12,7 +12,7 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
         init_db, get_all_knowledge_base_with_ids, get_all_knowledge_base_full,
         get_all_knowledge_base_for_export,
         add_knowledge_chunk, update_knowledge_chunk, delete_knowledge_chunk,
-        get_or_create_tag, set_tags_for_chunk, get_tags_for_chunk, get_all_tags,
+        get_or_create_tag, set_tags_for_chunk, get_tags_for_chunk, get_all_tags, get_all_chunk_tags_map,
         create_kb_snapshot, get_kb_snapshots, rollback_to_snapshot,
         get_embeddings_for_chunks, create_agent_job, finish_agent_job, get_agent_jobs,
         create_agent_proposal, get_agent_proposals, get_proposal_by_id, update_proposal_status,
@@ -632,6 +632,21 @@ def get_tags_for_chunk(chunk_id: int) -> list[str]:
             .all()
         )
         return [r[0] for r in rows]
+
+
+def get_all_chunk_tags_map() -> dict[int, list[str]]:
+    """คืน {chunk_id: [tag_name, ...]} ของทุก chunk ที่มี tag อย่างน้อย 1 อัน (query เดียว ไม่ loop เรียก
+    get_tags_for_chunk ทีละ chunk) — ใช้โดย legal_retrieval.legal_search ตอนให้คะแนน tag ทั้งคลัง"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(KnowledgeBaseTag.chunk_id, Tag.name)
+            .join(Tag, Tag.id == KnowledgeBaseTag.tag_id)
+            .all()
+        )
+    result: dict[int, list[str]] = {}
+    for chunk_id, name in rows:
+        result.setdefault(chunk_id, []).append(name)
+    return result
 
 
 def get_all_tags() -> list[dict]:

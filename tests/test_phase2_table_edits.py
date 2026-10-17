@@ -2715,11 +2715,13 @@ def test_router_dispatch_general_question_calls_advisor(ns):
 
 
 def test_router_dispatch_legal_question_calls_rag_answer(ns):
+    """rag_answer เติมป้าย "💡 ความรู้ทั่วไป" นำหน้าคำตอบเสมอตอนไม่มี chunk ผ่านเกณฑ์ (fake context เริ่มต้นว่างเปล่า
+    — ดู _build_legal_mode_label/kb_grounded)"""
     ns["_fake_client"].response_queue = [_route_intent_response(intent="legal_question")]
     ns["_fake_agentic_loop"].set_response("ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ", [], False)
     result = ns["_resolve_llm_router_dispatch"]("ธุรกิจบัญชีสามมีอะไรบ้าง", 1, 1, [])
     assert result is not None
-    assert result["answer"] == "ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ"
+    assert result["answer"] == "💡 ความรู้ทั่วไป\n\nธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ"
 
 
 def test_router_dispatch_library_search_lists_matching_documents(ns, library_fixture):
