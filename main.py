@@ -3974,7 +3974,7 @@ def run_agentic_tool_loop(
                 nudge_appended = True
             if verified_source_urls:
                 try:
-                    forced_response = call_with_required_tool(
+                    forced_response, _reason, _diag = call_with_required_tool(
                         client, model or "claude-haiku-4-5-20251001", effective_max_tokens, system_prompt,
                         messages, tools_for_this_call, "present_recommendations",
                     )
@@ -9905,7 +9905,7 @@ def _resolve_recommendation_intent_with_llm(
     )
 
     try:
-        response = call_with_required_tool(
+        response, _reason, _diag = call_with_required_tool(
             client, ADVISOR_MODEL, 1000, _RECOMMENDATION_INTENT_SYSTEM_PROMPT,
             [{"role": "user", "content": prompt}], [RESOLVE_RECOMMENDATION_ACTION_TOOL],
             "resolve_recommendation_action",
@@ -10427,7 +10427,7 @@ def route_intent_with_llm(
     )
 
     try:
-        response = call_with_required_tool(
+        response, _reason, _diag = call_with_required_tool(
             client, ROUTER_MODEL, 800, ROUTER_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
             [ROUTE_INTENT_TOOL], "route_intent",
         )
