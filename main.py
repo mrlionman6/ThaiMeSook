@@ -4707,7 +4707,8 @@ def rag_answer(
 
     # ห้าม Claude "แต่ง" ผลการแก้ไฟล์เอง — structural_route ไม่มี tool ถูกเรียกเลย ใช้ข้อความคงที่ ไม่งั้นเทียบ
     # version จริงของเอกสารก่อน/หลังเทิร์นแทนการเดาจากคำพูด (ดู answer_guard.truth_guard)
-    if structural_route and not structural_tool_called:
+    # ต้องเช็ค action_receipts ด้วยเสมอ — edit_chat_document เรียกสำเร็จได้โดยไม่ตั้ง structural_tool_called (ตั้งเฉพาะ 4 tool ตาราง)
+    if structural_route and not structural_tool_called and not action_receipts:
         print(f"[Route] chat={chat_id} branch=structural_no_tool")
         raw_answer = _STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE
     elif not action_receipts:
