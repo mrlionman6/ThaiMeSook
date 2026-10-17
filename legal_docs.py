@@ -3,27 +3,14 @@
 
 ขั้นตอน: (1) Claude ดึง slots จากข้อความ+ประวัติ ไม่เดาข้อเท็จจริงที่ไม่ได้พูดถึง (2) ค้น legal_retrieval.legal_search
 หา chunk ที่เกี่ยวข้อง (3) Claude เรียบเรียงเนื้อหาบันทึกเป็น JSON มีโครงสร้าง อ้าง chunk_ids ได้ (4) โค้ดตรวจ
-chunk_ids ให้อยู่ในชุดที่ค้นเจอจริงเท่านั้น ใส่ป้าย 📚/💡 เอง แล้วสร้างไฟล์ .docx ด้วย python-docx ล้วนๆ
+chunk_ids ให้อยู่ในชุดที่ค้นเจอจริงเท่านั้น แล้วส่งให้ legal_memo_format.build_memo_docx() สร้างไฟล์ .docx ทางการ
 
 import จาก main.py แบบ deferred (หลังนิยาม client/ROUTER_MODEL/ADVISOR_MODEL/save_legal_memo) เหมือน
 legal_retrieval.py — ดู main.py บรรทัดที่ import โมดูลนี้"""
-import io
-import datetime
-
-from docx import Document
-from docx.shared import Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-
 import legal_retrieval
+from legal_memo_format import build_memo_docx
 from llm_tools import call_with_required_tool
 from main import client, get_chat_messages, save_legal_memo, ROUTER_MODEL, ADVISOR_MODEL
-
-MEMO_FONT_NAME = "TH Sarabun New"
-MEMO_BODY_SIZE_PT = 16
-MEMO_HEADING_SIZE_PT = 20
-_MISSING_PLACEHOLDER = "............"
 
 MEMO_SLOTS_TOOL = {
     "name": "extract_memo_slots",
@@ -37,7 +24,11 @@ MEMO_SLOTS_TOOL = {
             "client_name": {"type": ["string", "null"], "description": "ชื่อลูกค้า/ผู้ขอคำปรึกษา ไม่ได้บอกใส่ null"},
             "legal_area": {
                 "type": ["string", "null"],
-                "description": "หมวดกฎหมายที่เกี่ยวข้อง เช่น ธุรกิจต่างด้าว/ภาษี/ที่ดิน/แรงงาน/สัญญา/ครอบครัว ฯลฯ ไม่ชัดเจนใส่ null",
+                "description": (
+                    "หมวดกฎหมายที่เกี่ยวข้อง รองรับกฎหมายไทยทุกหมวด เช่น อาญา, จราจร (เมาแล้วขับ), ทรัพย์สิน (บุกรุก), "
+                    "หลักทรัพย์ (ปั่นหุ้น/ฉ้อโกง), แพ่ง, ครอบครัว, แรงงาน, ภาษี, ธุรกิจ/ธุรกิจต่างด้าว, ที่ดิน, สัญญา ฯลฯ "
+                    "ไม่จำกัดเฉพาะหมวดใดหมวดหนึ่ง ไม่ชัดเจนใส่ null"
+                ),
             },
             "facts_summary": {
                 "type": ["string", "null"],
@@ -81,25 +72,39 @@ MEMO_CONTENT_TOOL = {
         "properties": {
             "issues": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
             "analysis": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
+            "arguments": {
+                "type": "object",
+                "description": "แนวทางข้อต่อสู้ — คิดเชิงกลยุทธ์ ไม่ใช่แค่สรุปตัวบทซ้ำ",
+                "properties": {
+                    "our_side": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
+                    "other_side": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
+                },
+                "required": ["our_side", "other_side"],
+            },
             "conclusion": _MEMO_PARAGRAPH_ITEM_SCHEMA,
             "next_steps": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["issues", "analysis", "conclusion", "next_steps"],
+        "required": ["issues", "analysis", "arguments", "conclusion", "next_steps"],
     },
 }
 
 MEMO_CONTENT_SYSTEM_PROMPT = (
     "คุณกำลังเรียบเรียงบันทึกความเห็นทางกฎหมายเบื้องต้นให้ทนายความใช้ประกอบการให้คำปรึกษา รองรับกฎหมายไทยทุกหมวด "
-    "(ธุรกิจต่างด้าว/ภาษี/ที่ดิน/แรงงาน/สัญญา/ครอบครัว ฯลฯ) ไม่จำกัดเฉพาะหมวดใดหมวดหนึ่ง ห้ามเขียนว่าเรื่องนี้ "
-    "\"นอกเหนือความเชี่ยวชาญ\" เด็ดขาด ไม่ว่าจะเป็นกฎหมายหมวดใด\n"
+    "เช่น อาญา, จราจร (เมาแล้วขับ), ทรัพย์สิน (บุกรุก), หลักทรัพย์ (ปั่นหุ้น/ฉ้อโกง), แพ่ง, ครอบครัว, แรงงาน, ภาษี, "
+    "ธุรกิจ/ธุรกิจต่างด้าว ฯลฯ ไม่จำกัดเฉพาะหมวดใดหมวดหนึ่ง ห้ามเขียนว่าเรื่องนี้ \"นอกเหนือความเชี่ยวชาญ\" เด็ดขาด "
+    "ไม่ว่าจะเป็นกฎหมายหมวดใด\n"
     "- ได้รับ chunk จากฐานความรู้มาพร้อม id — ถ้า chunk ตรงประเด็น ให้ใช้เป็นหลักและใส่ id นั้นใน chunk_ids ของ"
     "ย่อหน้าที่ใช้ข้อมูลนั้นจริง\n"
     "- chunk ที่ให้มาไม่ครอบคลุมบางประเด็น ใช้ความรู้ทั่วไปของคุณเขียนเสริมได้ (ใส่ chunk_ids เป็น [] สำหรับย่อหน้า"
     "นั้น) ระบุชื่อกฎหมาย/หน่วยงานให้ถูกต้องเท่าที่มั่นใจ\n"
     "- ไม่แน่ใจตัวเลข/อัตรา/มาตราที่แน่นอน ให้เขียนเป็นภาพรวมแทนการระบุตัวเลขที่ไม่แน่ใจ ห้ามแต่งตัวเลข/มาตราขึ้นมา\n"
     "- ห้ามเดา/แต่งข้อเท็จจริงของผู้ใช้ที่ไม่ได้อยู่ในสถานการณ์ที่ให้มาเด็ดขาด\n"
-    "- issues: ประเด็นที่ต้องพิจารณาแต่ละข้อ, analysis: การวิเคราะห์ทางกฎหมายแต่ละประเด็น, conclusion: ความเห็น"
-    "เบื้องต้นสรุปรวม 1 รายการ, next_steps: ขั้นตอนที่แนะนำให้ทำต่อ (ข้อความล้วน ไม่ต้องมี chunk_ids)"
+    "- issues: ประเด็นที่ต้องพิจารณาแต่ละข้อ, analysis: การวิเคราะห์ทางกฎหมายแต่ละประเด็น\n"
+    "- arguments.our_side: ข้อต่อสู้ ช่องทาง และการตีความที่เป็นประโยชน์ต่อฝ่ายผู้ขอความเห็นให้มากที่สุดเท่าที่กฎหมาย"
+    "เปิดช่อง รวมถึงทางเลือกทางกฎหมายที่คนทั่วไปมักไม่รู้\n"
+    "- arguments.other_side: ข้อโต้แย้งที่คู่กรณีหรือเจ้าหน้าที่น่าจะยกขึ้น และจุดอ่อนของฝ่ายเรา — ให้คิดเชิงกลยุทธ์ "
+    "ไม่ใช่แค่สรุปตัวบทซ้ำ\n"
+    "- conclusion: ความเห็นเบื้องต้นสรุปรวม 1 รายการ, next_steps: ขั้นตอนที่แนะนำให้ทำต่อ (ข้อความล้วน ไม่ต้องมี chunk_ids)"
 )
 
 
@@ -152,18 +157,11 @@ def _draft_memo_content(slots: dict, grounded_chunks: list[dict]):
     return tool_use_block.input
 
 
-def _label_for_chunk_ids(chunk_ids: list[int]) -> str:
-    """ป้ายที่โค้ดใส่เอง (ไม่ใช่ LLM เขียน) — มี chunk_ids (ตรวจผ่านว่าอยู่ในชุด grounded จริงแล้ว) -> อ้างอิงฐาน
-    ความรู้ ไม่มี -> ความรู้ทั่วไป"""
-    if chunk_ids:
-        return "📚 ฐานความรู้ " + " ".join(f"#{cid}" for cid in chunk_ids)
-    return "💡 ความรู้ทั่วไป"
-
-
 def _render_paragraph(item: dict, grounded_ids: set[int]) -> dict:
-    """กรอง chunk_ids ให้เหลือเฉพาะที่อยู่ในชุด grounded จริง (ตัดที่ LLM อ้างมั่วทิ้ง) แล้วคำนวณป้ายจากโค้ด"""
+    """กรอง chunk_ids ให้เหลือเฉพาะที่อยู่ในชุด grounded จริง (ตัดที่ LLM อ้างมั่วทิ้ง) — ไม่มี label/อีโมจิ
+    (legal_memo_format.build_memo_docx ใส่เลขอ้างอิง [n] เองจาก chunk_ids)"""
     valid_ids = [cid for cid in (item.get("chunk_ids") or []) if cid in grounded_ids]
-    return {"text": item.get("text") or "", "chunk_ids": valid_ids, "label": _label_for_chunk_ids(valid_ids)}
+    return {"text": item.get("text") or "", "chunk_ids": valid_ids}
 
 
 def _missing_slot_labels(slots: dict) -> list[str]:
@@ -177,93 +175,6 @@ def _missing_slot_labels(slots: dict) -> list[str]:
     if not slots.get("user_questions"):
         labels.append("คำถามเฉพาะเจาะจงของผู้ใช้")
     return labels
-
-
-def _thai_date_today() -> str:
-    thai_months = (
-        "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
-        "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
-    )
-    today = datetime.date.today()
-    return f"{today.day} {thai_months[today.month - 1]} {today.year + 543}"
-
-
-def _set_thai_run_font(run, size_pt: int = MEMO_BODY_SIZE_PT, bold: bool = False) -> None:
-    """ตั้งฟอนต์ไทยให้ run ครบทั้ง 4 ตำแหน่ง (ascii/hAnsi/eastAsia/cs) — python-docx เดียวไม่พอกับฟอนต์ไทย ต้องลง
-    XML (w:rFonts) ตรงๆ ไม่งั้น Word เลือกฟอนต์อื่นแทนที่ eastAsia/cs เงียบๆ"""
-    run.font.name = MEMO_FONT_NAME
-    run.font.size = Pt(size_pt)
-    run.font.bold = bold
-    rpr = run._element.get_or_add_rPr()
-    rfonts = rpr.find(qn("w:rFonts"))
-    if rfonts is None:
-        rfonts = OxmlElement("w:rFonts")
-        rpr.append(rfonts)
-    for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
-        rfonts.set(qn(attr), MEMO_FONT_NAME)
-
-
-def build_memo_docx(slots: dict, rendered: dict, used_chunks: list[dict]) -> bytes:
-    """สร้างไฟล์ .docx ด้วย python-docx ล้วนๆ จาก slots (ข้อเท็จจริง) + rendered (ย่อหน้าที่กรอง/ใส่ป้ายแล้ว) +
-    used_chunks (chunk ที่ถูกอ้างถึงจริงอย่างน้อย 1 ย่อหน้า สำหรับส่วนแหล่งอ้างอิง)"""
-    doc = Document()
-    normal_font = doc.styles["Normal"].font
-    normal_font.name = MEMO_FONT_NAME
-    normal_font.size = Pt(MEMO_BODY_SIZE_PT)
-
-    def add_heading(text: str):
-        p = doc.add_paragraph()
-        _set_thai_run_font(p.add_run(text), bold=True)
-        return p
-
-    def add_body(text: str):
-        p = doc.add_paragraph()
-        _set_thai_run_font(p.add_run(text))
-        return p
-
-    title_p = doc.add_paragraph()
-    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _set_thai_run_font(title_p.add_run("บันทึกความเห็นทางกฎหมายเบื้องต้น (ฉบับร่าง)"), size_pt=MEMO_HEADING_SIZE_PT, bold=True)
-
-    add_body(f"วันที่: {_thai_date_today()}")
-    add_body(f"เรียน: {slots.get('client_name') or _MISSING_PLACEHOLDER}")
-
-    add_heading("1. ข้อเท็จจริง")
-    add_body(slots.get("facts_summary") or _MISSING_PLACEHOLDER)
-    for fact in (slots.get("key_facts") or []):
-        add_body(f"• {fact}")
-
-    add_heading("2. ประเด็นที่ต้องพิจารณา")
-    for item in rendered["issues"] or [{"text": _MISSING_PLACEHOLDER, "label": ""}]:
-        add_body(f"{item['label']} {item['text']}".strip())
-
-    add_heading("3. ข้อกฎหมายและการวิเคราะห์")
-    for item in rendered["analysis"] or [{"text": _MISSING_PLACEHOLDER, "label": ""}]:
-        add_body(f"{item['label']} {item['text']}".strip())
-
-    add_heading("4. ความเห็นเบื้องต้น")
-    conclusion = rendered["conclusion"]
-    add_body(f"{conclusion['label']} {conclusion['text'] or _MISSING_PLACEHOLDER}".strip())
-
-    add_heading("5. ขั้นตอนที่แนะนำ")
-    for step in (rendered["next_steps"] or [_MISSING_PLACEHOLDER]):
-        add_body(f"• {step}")
-
-    add_heading("6. แหล่งอ้างอิง")
-    if used_chunks:
-        for chunk in used_chunks:
-            tags_text = "/".join(chunk.get("tags") or []) or "-"
-            first_line = (chunk["content"].splitlines() or [""])[0][:150]
-            add_body(f"#{chunk['id']} ({tags_text}) — {first_line}")
-    else:
-        add_body("ไม่มีข้อมูลจากฐานความรู้ที่ใช้โดยตรง (ใช้ความรู้ทั่วไปทั้งหมด)")
-
-    footer_p = doc.add_paragraph()
-    _set_thai_run_font(footer_p.add_run("ร่างโดย ThaiMeSook เพื่อใช้ประกอบการปรึกษาทนายความ"), size_pt=10)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
 
 
 def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dict:
@@ -288,9 +199,14 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
         print("[LegalMemo] draft_failed reason=llm_call_failed")
         return {"document_id": None, "answer": "ร่างบันทึกไม่สำเร็จ ลองพิมพ์ขอใหม่อีกครั้งครับ"}
 
+    arguments = memo_content.get("arguments") or {}
     rendered = {
         "issues": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("issues") or [])],
         "analysis": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("analysis") or [])],
+        "arguments": {
+            "our_side": [_render_paragraph(item, grounded_ids) for item in (arguments.get("our_side") or [])],
+            "other_side": [_render_paragraph(item, grounded_ids) for item in (arguments.get("other_side") or [])],
+        },
         "conclusion": _render_paragraph(memo_content.get("conclusion") or {}, grounded_ids),
         "next_steps": [s for s in (memo_content.get("next_steps") or []) if s],
     }
@@ -298,17 +214,22 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
         print("[LegalMemo] draft_failed reason=empty_content")
         return {"document_id": None, "answer": "ร่างบันทึกไม่สำเร็จ ลองพิมพ์ขอใหม่อีกครั้งครับ"}
 
-    used_ids = set()
-    for item in rendered["issues"] + rendered["analysis"] + [rendered["conclusion"]]:
-        used_ids.update(item["chunk_ids"])
-    used_chunks = [grounded_by_id[cid] for cid in sorted(used_ids) if cid in grounded_by_id]
+    # ลำดับการอ้างต้องตรงกับลำดับที่ build_memo_docx แสดงผล (issues -> analysis -> arguments -> conclusion)
+    # เพราะเลข [n] ในเอกสารนับตามลำดับที่เจอครั้งแรกใน used_chunks ไม่ใช่ sorted id
+    all_items = (
+        rendered["issues"] + rendered["analysis"]
+        + rendered["arguments"]["our_side"] + rendered["arguments"]["other_side"]
+        + [rendered["conclusion"]]
+    )
+    used_ids = list(dict.fromkeys(cid for item in all_items for cid in item["chunk_ids"]))
+    used_chunks = [grounded_by_id[cid] for cid in used_ids if cid in grounded_by_id]
 
     docx_bytes = build_memo_docx(slots, rendered, used_chunks)
     title = f"บันทึกความเห็นทางกฎหมายเบื้องต้น - {slots.get('client_name') or 'ไม่ระบุชื่อลูกค้า'}"
     memo_id = save_legal_memo(user_id, chat_id, title, slots, docx_bytes)
 
-    grounded_count = sum(1 for item in rendered["issues"] + rendered["analysis"] + [rendered["conclusion"]] if item["chunk_ids"])
-    general_count = len(rendered["issues"]) + len(rendered["analysis"]) + 1 - grounded_count
+    grounded_count = sum(1 for item in all_items if item["chunk_ids"])
+    general_count = len(all_items) - grounded_count
     missing = _missing_slot_labels(slots)
 
     download_url = f"/api/legal-memo/{memo_id}/download"
