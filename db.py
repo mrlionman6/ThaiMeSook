@@ -26,6 +26,7 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
         add_chat_message, get_chat_messages, delete_chat_session,
         upsert_library_search_card, get_all_library_search_cards,
         get_library_file_ids_without_search_card, get_library_search_vector_scores_for_all,
+        save_legal_memo, get_legal_memo,
     )
 """
 
@@ -182,6 +183,20 @@ class UserDocument(Base):
     raw_text = Column(Text, nullable=False)
     summary_text = Column(Text, nullable=False)
     structured_fields = Column(JSON, nullable=True)
+
+
+class LegalMemo(Base):
+    """บันทึกความเห็นทางกฎหมายเบื้องต้น (.docx) ที่ร่างจากสถานการณ์ในแชท — เก็บทั้งไฟล์ (bytes) และ slots ที่ใช้
+    ร่าง (slots_json) ไว้ด้วยกัน แยกจากระบบ EditableDocument/Excel ทั้งหมด (ดู legal_docs.py)"""
+    __tablename__ = "legal_memos"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    chat_id = Column(Integer, ForeignKey("chat_sessions.id", ondelete="CASCADE"), nullable=True, index=True)
+    title = Column(String, nullable=False)
+    slots_json = Column(JSON, nullable=False)
+    docx = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
 class EditableDocument(Base):
@@ -1306,6 +1321,28 @@ def create_user_document(
 
 # ---------- Excel Editor (แนบไฟล์ excel มาแก้ผ่านการคุย แล้วดาวน์โหลดกลับ) ----------
 EDITABLE_DOCUMENT_EXPIRY_DAYS = 5  # เขียนเป็นค่า expires_at ตอน insert เลย (ต่างจาก Deal Screening ที่คำนวณตอน query)
+
+
+def save_legal_memo(user_id: int, chat_id: Optional[int], title: str, slots_json: dict, docx_bytes: bytes) -> int:
+    """บันทึกบันทึกความเห็นทางกฎหมายที่ร่างเสร็จแล้ว (.docx) คืน id ใหม่"""
+    with SessionLocal() as session:
+        row = LegalMemo(user_id=user_id, chat_id=chat_id, title=title, slots_json=slots_json, docx=docx_bytes)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return row.id
+
+
+def get_legal_memo(memo_id: int, user_id: int) -> Optional[dict]:
+    """คืน None ถ้าไม่พบ id หรือไม่ใช่เจ้าของ (เหมือน get_editable_document ด้านล่าง)"""
+    with SessionLocal() as session:
+        row = session.get(LegalMemo, memo_id)
+        if row is None or row.user_id != user_id:
+            return None
+        return {
+            "id": row.id, "user_id": row.user_id, "chat_id": row.chat_id, "title": row.title,
+            "slots_json": row.slots_json, "docx": row.docx, "created_at": row.created_at,
+        }
 
 
 def create_editable_document(
