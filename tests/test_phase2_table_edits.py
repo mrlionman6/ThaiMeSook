@@ -150,7 +150,7 @@ def _current(ns, document_id=1):
 def test_apply_change_rate_to_10_percent(ns, doc1):
     result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 10)
     assert result["matched"] is True
-    assert "✓ เปลี่ยน 'ภาษีมูลค่าเพิ่ม'" in result["message"]
+    assert "[[OK]] เปลี่ยน 'ภาษีมูลค่าเพิ่ม'" in result["message"]
     assert "จาก 7% เป็น 10%" in result["message"]
     assert "พิมพ์ 'ย้อนการแก้'" in result["message"]
 
@@ -179,7 +179,7 @@ def test_apply_change_rate_message_and_values_show_current_label_not_stale_name(
     exclude_labels) ยังโชว์ "ภาษีมูลค่าเพิ่ม 25%" (ชื่อปัจจุบันจริง) ตามปกติ"""
     result = ns["apply_change_rate"](1, 1, "ภาษีมูลค่าเพิ่ม 7%", 25)
     assert result["matched"] is True
-    assert "✓ เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%" in result["message"]
+    assert "[[OK]] เปลี่ยน 'ภาษีมูลค่าเพิ่ม' จาก 7% เป็น 25%" in result["message"]
     assert "ภาษีมูลค่าเพิ่ม 7%" not in result["message"]
     assert "ยอดล่าสุด" in result["message"]
     # VAT เองไม่ซ้ำใต้ "ยอดล่าสุด:" อีก (ถูกกันด้วย exclude_labels เพราะมีบรรทัดหลักของมันเองอยู่แล้ว)
@@ -641,7 +641,7 @@ def test_full_scenario_field_updates_apply_immediately_with_correct_totals(ns, b
 def test_full_scenario_multi_command_single_message_creates_two_versions(ns, doc1):
     answer = _apply_query(ns, 1, "เปลี่ยน VAT เป็น 10% และลบรายการที่ 3")
     assert len(ns["_fake_db"].versions[1]) == 2
-    assert answer.count("✓") == 2
+    assert answer.count("เรียบร้อย:") == 2
 
     data = _current(ns)
     filled = data["tables"][0]["rows"]
@@ -659,8 +659,8 @@ def test_apply_structural_commands_reports_failure_without_stopping_remaining_co
         {"type": "delete_table_item", "item_no": 3},
     ]
     answer = ns["_apply_structural_commands"](1, 1, commands)
-    assert "✗" in answer
-    assert "✓" in answer
+    assert "ไม่สำเร็จ:" in answer
+    assert "เรียบร้อย:" in answer
     assert len(ns["_fake_db"].versions.get(1, [])) == 1  # เฉพาะคำสั่งที่สำเร็จเท่านั้นที่สร้างเวอร์ชัน
 
 
@@ -678,7 +678,7 @@ def test_resolve_direct_structural_dispatch_for_description_change_bypasses_is_s
     result = ns["_resolve_direct_structural_dispatch"](query, [box_doc], 1, 1)
     assert result is not None
     assert result["document_id"] == 1
-    assert "✓" in result["answer"]
+    assert "เรียบร้อย:" in result["answer"]
 
     filled = _current(ns)["tables"][0]["rows"]
     assert filled[0]["values"]["description"] == "Box 7x7"
@@ -852,15 +852,16 @@ def test_rag_answer_does_not_override_default_max_tokens(ns):
 
 
 def test_rag_answer_blocks_fabricated_edit_claim_without_receipts(ns, doc1):
-    """LLM ตอบ "✓ แก้แล้ว" โดยไม่มี receipt จาก tool เลย (และมีเอกสารเปิดอยู่ในแชทจริง) -> ต้องถูก block"""
-    ns["_fake_agentic_loop"].set_response("✓ แก้รายการเรียบร้อยแล้วครับ", [], False)
+    """LLM ตอบ "เรียบร้อย: แก้แล้ว" (เลียนแบบ marker ที่แปลงแล้วซึ่งอาจติดอยู่ในแชทเก่า) โดยไม่มี receipt จาก tool
+    เลย (และมีเอกสารเปิดอยู่ในแชทจริง) -> ต้องถูก block"""
+    ns["_fake_agentic_loop"].set_response("เรียบร้อย: แก้รายการเรียบร้อยแล้วครับ", [], False)
     answer, sources = ns["rag_answer"]("เปลี่ยน Box 4x4 เป็น 7x7", user_id=1, chat_id=1, structural_route=False)
     assert answer == ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
 
 
 def test_rag_answer_blocks_claim_with_filler_words_between_verb_and_done(ns, doc1):
     """"ลบรายการที่ 3 แล้วครับ" (มีข้อความคั่นกลางระหว่าง "ลบ" กับ "แล้ว" ไม่ใช่ "ลบแล้ว" ติดกันเป๊ะ) ต้องยังถูก
-    จับได้เหมือนเดิม แม้ structural_route=False — ไม่ได้พึ่งคำว่า "ยืนยัน"/"preview"/"✓" เลย — นี่คือเหตุการณ์จริง
+    จับได้เหมือนเดิม แม้ structural_route=False — ไม่ได้พึ่งคำว่า "ยืนยัน"/"preview"/"[[OK]]" เลย — นี่คือเหตุการณ์จริง
     ที่โจทย์ขอให้ยืนยันซ้ำ: agent (mock) อ้างว่าแก้แล้วโดยไม่มี receipt ต้องถูกบล็อก"""
     ns["_fake_agentic_loop"].set_response("ลบรายการที่ 3 แล้วครับ", [], False)
     answer, sources = ns["rag_answer"]("ลบรายการที่ 3", user_id=1, chat_id=1, structural_route=False)
@@ -869,7 +870,7 @@ def test_rag_answer_blocks_claim_with_filler_words_between_verb_and_done(ns, doc
 
 def test_rag_answer_does_not_block_legal_confirm_word_even_with_active_docs(ns, doc1):
     """คำตอบกฎหมายปกติที่มีคำว่า "ยืนยัน" ปนอยู่ (เช่น "ต้องยืนยันตัวตนก่อนยื่นภาษี") ต้องไม่ถูก block แม้มีเอกสาร
-    เปิดอยู่ในแชทจริงก็ตาม — "ยืนยัน"/"preview"/"✓" เช็คเฉพาะตอน structural_route=True เท่านั้น"""
+    เปิดอยู่ในแชทจริงก็ตาม — "ยืนยัน"/"preview"/"[[OK]]" เช็คเฉพาะตอน structural_route=True เท่านั้น"""
     ns["_fake_agentic_loop"].set_response("ต้องยืนยันตัวตนก่อนยื่นภาษีครับ", [], False)
     answer, sources = ns["rag_answer"]("ต้องทำอะไรก่อนยื่นภาษี", user_id=1, chat_id=1, structural_route=False)
     assert answer != ns["_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE"]
@@ -1611,7 +1612,7 @@ def test_recommendation_replace_command_changes_description_and_price_keeps_qty(
     result = ns["_resolve_recommendation_command_dispatch"]("แทนรายการที่ 5 ด้วยรุ่นที่ 1", [box_doc], 1, 1)
     assert result is not None
     answer = result["answer"]
-    assert "✓ แทนรายการที่ 5 (Item E) ด้วย Rack case 9U รุ่นประหยัด" in answer
+    assert "เรียบร้อย: แทนรายการที่ 5 (Item E) ด้วย Rack case 9U รุ่นประหยัด" in answer
     assert "ราคา/หน่วย 5,000 → 4,405" in answer
     assert "(ราคาอ้างอิงจาก shop-a.com)" in answer
     assert "พิมพ์ 'ย้อนการแก้'" in answer
@@ -1754,7 +1755,7 @@ def test_recommendation_intent_llm_resolves_replace_with_quantity_from_chat_hist
     result = ns["_resolve_recommendation_command_dispatch"]("เเทน ลงในรายการเลย", [box_doc], 1, 1)
     assert result is not None
     answer = result["answer"]
-    assert "✓ แทนรายการที่ 6 (Item F) ด้วย Seagate SkyHawk AI 16TB" in answer
+    assert "เรียบร้อย: แทนรายการที่ 6 (Item F) ด้วย Seagate SkyHawk AI 16TB" in answer
     assert "ราคา/หน่วย 25 → 19,500 (ราคาอ้างอิงจาก shop.example)" in answer
     assert "จำนวน 4 → 2" in answer
 
@@ -2591,7 +2592,7 @@ def test_resolve_llm_router_dispatch_replaces_item_with_recommendation_from_chat
     result = ns["_resolve_llm_router_dispatch"]("เอา Seagate SkyHawk เเทน HDD เก่าเลย", 1, 1, [router_hdd_doc])
     assert result is not None
     answer = result["answer"]
-    assert "✓ แทนรายการที่ 6 (HDD เก่า 4TB) ด้วย Seagate SkyHawk AI 16TB" in answer
+    assert "เรียบร้อย: แทนรายการที่ 6 (HDD เก่า 4TB) ด้วย Seagate SkyHawk AI 16TB" in answer
     assert "ราคา/หน่วย 2,800 → 19,500" in answer
 
     totals_by_label = {l["label"]: l["value"] for l in _current(ns)["labels"]}
@@ -2682,7 +2683,7 @@ def test_router_dispatch_add_recommendation_appends_new_row(ns, doc1):
     )]
     result = ns["_resolve_llm_router_dispatch"]("เพิ่มรุ่นนี้อีก 3 ตู้", 1, 1, [doc1])
     assert result is not None
-    assert "✓" in result["answer"]
+    assert "เรียบร้อย:" in result["answer"]
     rows = _current(ns)["tables"][0]["rows"]
     assert rows[-1]["values"]["description"] == "Rack case 9U รุ่นประหยัด"
     assert rows[-1]["values"]["qty"] == 3
@@ -2715,13 +2716,12 @@ def test_router_dispatch_general_question_calls_advisor(ns):
 
 
 def test_router_dispatch_legal_question_calls_rag_answer(ns):
-    """rag_answer เติมป้าย "💡 ความรู้ทั่วไป" นำหน้าคำตอบเสมอตอนไม่มี chunk ผ่านเกณฑ์ (fake context เริ่มต้นว่างเปล่า
-    — ดู _build_legal_mode_label/kb_grounded)"""
+    """rag_answer ไม่เติมป้ายโหมดค้นใดๆ นำหน้าคำตอบอีกต่อไป (ลบ _build_legal_mode_label ทิ้งแล้ว — ดู kb_grounded)"""
     ns["_fake_client"].response_queue = [_route_intent_response(intent="legal_question")]
     ns["_fake_agentic_loop"].set_response("ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ", [], False)
     result = ns["_resolve_llm_router_dispatch"]("ธุรกิจบัญชีสามมีอะไรบ้าง", 1, 1, [])
     assert result is not None
-    assert result["answer"] == "💡 ความรู้ทั่วไป\n\nธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ"
+    assert result["answer"] == "ธุรกิจบัญชีสามอยู่ในบัญชีสามท้ายพ.ร.บ.ครับ"
 
 
 def test_router_dispatch_library_search_lists_matching_documents(ns, library_fixture):
@@ -2930,7 +2930,7 @@ def test_router_mode_llm_calls_llm_once_for_natural_language_recommendation_repl
     result = ns["_resolve_llm_router_dispatch"](query, 1, 1, [router_hdd_doc])
     assert result is not None
     assert ns["_fake_client"].call_count == 1
-    assert "✓ แทนรายการที่ 6" in result["answer"]
+    assert "เรียบร้อย: แทนรายการที่ 6" in result["answer"]
 
 
 def test_router_mode_llm_falls_back_to_document_reading_when_router_fails(ns, box_doc):

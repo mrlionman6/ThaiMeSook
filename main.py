@@ -2963,14 +2963,17 @@ def _looks_like_fabricated_edit_claim(raw_answer: str, structural_route: bool = 
     return False
 
 
-_RECEIPT_LINE_RE = re.compile(r"(?m)^(?:\[\[OK\]\]|\[\[FAIL\]\]|แก้แล้ว:|ยังไม่ได้แก้:)[^\n]*\n?")
+_RECEIPT_LINE_RE = re.compile(
+    r"(?m)^(?:\[\[OK\]\]|\[\[FAIL\]\]|เรียบร้อย:|ไม่สำเร็จ:|แก้แล้ว:|ยังไม่ได้แก้:)[^\n]*\n?"
+)
 
 
 def _strip_fabricated_receipt_lines(text: str) -> str:
-    """ตัดบรรทัดที่ขึ้นต้นด้วย marker ภายใน ([[OK]]/[[FAIL]]) หรือข้อความแปลงแล้ว (แก้แล้ว:/ยังไม่ได้แก้:) ออกจาก
-    text — ใบยืนยันจริงของระบบนี้มาจากโค้ดเสมอ ต่อท้ายแยกต่างหากหลัง Claude ตอบจบแล้ว ไม่เคยปนอยู่ในข้อความที่
-    Claude เขียนเอง (ดู run_agentic_tool_loop/_dispatch_router_clarification/_answer_document_reading_question)
-    เจอแปลว่า Claude เลียนแบบ/แต่งใบยืนยันขึ้นเอง (รวมถึงเลียนแบบข้อความแปลงแล้วที่ติดอยู่ในประวัติแชทเก่า)"""
+    """ตัดบรรทัดที่ขึ้นต้นด้วย marker ภายใน ([[OK]]/[[FAIL]]) หรือข้อความแปลงแล้ว (เรียบร้อย:/ไม่สำเร็จ: ปัจจุบัน
+    หรือ แก้แล้ว:/ยังไม่ได้แก้: ของเดิมที่อาจยังค้างอยู่ในแชทเก่า) ออกจาก text — ใบยืนยันจริงของระบบนี้มาจากโค้ด
+    เสมอ ต่อท้ายแยกต่างหากหลัง Claude ตอบจบแล้ว ไม่เคยปนอยู่ในข้อความที่ Claude เขียนเอง (ดู
+    run_agentic_tool_loop/_dispatch_router_clarification/_answer_document_reading_question) เจอแปลว่า Claude
+    เลียนแบบ/แต่งใบยืนยันขึ้นเอง"""
     return _RECEIPT_LINE_RE.sub("", text).strip()
 
 
@@ -4659,7 +4662,7 @@ def _strip_legacy_mode_labels(text: str) -> str:
     return _LEGACY_MODE_LABEL_RE.sub("", text or "")
 
 
-_RECEIPT_MARKER_TO_PLAIN = (("[[OK]] ", "แก้แล้ว: "), ("[[FAIL]] ", "ยังไม่ได้แก้: "))
+_RECEIPT_MARKER_TO_PLAIN = (("[[OK]] ", "เรียบร้อย: "), ("[[FAIL]] ", "ไม่สำเร็จ: "))
 
 
 def _render_receipt_markers(text: str) -> str:
