@@ -72,19 +72,18 @@ MEMO_CONTENT_TOOL = {
         "properties": {
             "issues": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
             "analysis": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
-            "arguments": {
-                "type": "object",
-                "description": "แนวทางข้อต่อสู้ — คิดเชิงกลยุทธ์ ไม่ใช่แค่สรุปตัวบทซ้ำ",
-                "properties": {
-                    "our_side": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
-                    "other_side": {"type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA},
-                },
-                "required": ["our_side", "other_side"],
+            "our_side_arguments": {
+                "type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA,
+                "description": "แนวทางข้อต่อสู้ฝ่ายผู้ขอความเห็น — คิดเชิงกลยุทธ์ ไม่ใช่แค่สรุปตัวบทซ้ำ",
+            },
+            "other_side_arguments": {
+                "type": "array", "items": _MEMO_PARAGRAPH_ITEM_SCHEMA,
+                "description": "ข้อโต้แย้งที่คู่กรณี/เจ้าหน้าที่น่าจะยกขึ้น และจุดอ่อนของฝ่ายเรา",
             },
             "conclusion": _MEMO_PARAGRAPH_ITEM_SCHEMA,
             "next_steps": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["issues", "analysis", "arguments", "conclusion", "next_steps"],
+        "required": ["issues", "analysis", "our_side_arguments", "other_side_arguments", "conclusion", "next_steps"],
     },
 }
 
@@ -100,9 +99,9 @@ MEMO_CONTENT_SYSTEM_PROMPT = (
     "- ไม่แน่ใจตัวเลข/อัตรา/มาตราที่แน่นอน ให้เขียนเป็นภาพรวมแทนการระบุตัวเลขที่ไม่แน่ใจ ห้ามแต่งตัวเลข/มาตราขึ้นมา\n"
     "- ห้ามเดา/แต่งข้อเท็จจริงของผู้ใช้ที่ไม่ได้อยู่ในสถานการณ์ที่ให้มาเด็ดขาด\n"
     "- issues: ประเด็นที่ต้องพิจารณาแต่ละข้อ, analysis: การวิเคราะห์ทางกฎหมายแต่ละประเด็น\n"
-    "- arguments.our_side: ข้อต่อสู้ ช่องทาง และการตีความที่เป็นประโยชน์ต่อฝ่ายผู้ขอความเห็นให้มากที่สุดเท่าที่กฎหมาย"
+    "- our_side_arguments: ข้อต่อสู้ ช่องทาง และการตีความที่เป็นประโยชน์ต่อฝ่ายผู้ขอความเห็นให้มากที่สุดเท่าที่กฎหมาย"
     "เปิดช่อง รวมถึงทางเลือกทางกฎหมายที่คนทั่วไปมักไม่รู้\n"
-    "- arguments.other_side: ข้อโต้แย้งที่คู่กรณีหรือเจ้าหน้าที่น่าจะยกขึ้น และจุดอ่อนของฝ่ายเรา — ให้คิดเชิงกลยุทธ์ "
+    "- other_side_arguments: ข้อโต้แย้งที่คู่กรณีหรือเจ้าหน้าที่น่าจะยกขึ้น และจุดอ่อนของฝ่ายเรา — ให้คิดเชิงกลยุทธ์ "
     "ไม่ใช่แค่สรุปตัวบทซ้ำ\n"
     "- conclusion: ความเห็นเบื้องต้นสรุปรวม 1 รายการ, next_steps: ขั้นตอนที่แนะนำให้ทำต่อ (ข้อความล้วน ไม่ต้องมี chunk_ids)"
 )
@@ -115,7 +114,7 @@ def _extract_memo_slots(query: str, history: list) -> dict:
     history_text = ("ประวัติสนทนาล่าสุด:\n" + "\n".join(history_lines) + "\n\n") if history_lines else ""
     prompt = f"{history_text}ข้อความล่าสุดของผู้ใช้: {query}"
 
-    response = call_with_required_tool(
+    response, _reason, _diag = call_with_required_tool(
         client, ROUTER_MODEL, 800, "", [{"role": "user", "content": prompt}],
         [MEMO_SLOTS_TOOL], "extract_memo_slots",
     )
@@ -135,9 +134,19 @@ def _format_chunks_for_prompt(chunks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
+_EMPTY_DIAG = {"stop_reason": None, "blocks": "-", "out_tokens": None}
+
+
+def _log_memo_draft_failed(reason: str, diag: dict) -> None:
+    print(
+        f"[LegalMemo] draft_failed reason={reason} stop_reason={diag.get('stop_reason')} "
+        f"blocks={diag.get('blocks')} out_tokens={diag.get('out_tokens')}"
+    )
+
+
 def _draft_memo_content(slots: dict, grounded_chunks: list[dict]):
     """เรียก Claude (ADVISOR_MODEL — ต้องการภาษาไทยที่แม่นยำในคำตอบยาว เหมือน advisor_answer) เรียบเรียงเนื้อหา
-    บันทึก คืน None ถ้าเรียกไม่สำเร็จหรือโดนตัดเพราะ token ไม่พอ (stop_reason == "max_tokens") ให้ caller ตัดสินใจเอง"""
+    บันทึก คืน None ถ้าเรียกไม่สำเร็จ (log [LegalMemo] draft_failed รายละเอียดเสมอ ไม่ปล่อย exception หลุดเป็น 500)"""
     facts_lines = "\n".join(f"- {f}" for f in (slots.get("key_facts") or []))
     questions_lines = "\n".join(f"- {q}" for q in (slots.get("user_questions") or []))
     prompt = (
@@ -147,11 +156,16 @@ def _draft_memo_content(slots: dict, grounded_chunks: list[dict]):
         f"คำถามของผู้ใช้:\n{questions_lines or '(ไม่มี)'}\n\n"
         f"chunk จากฐานความรู้:\n{_format_chunks_for_prompt(grounded_chunks)}"
     )
-    response = call_with_required_tool(
-        client, ADVISOR_MODEL, 6000, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
-        [MEMO_CONTENT_TOOL], "draft_memo_content",
-    )
-    if response is None or response.stop_reason == "max_tokens":
+    try:
+        response, reason, diag = call_with_required_tool(
+            client, ADVISOR_MODEL, 6000, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
+            [MEMO_CONTENT_TOOL], "draft_memo_content",
+        )
+    except Exception as e:
+        _log_memo_draft_failed("api_error", {**_EMPTY_DIAG, "stop_reason": type(e).__name__})
+        return None
+    if response is None:
+        _log_memo_draft_failed(reason or "no_tool_use", diag or _EMPTY_DIAG)
         return None
     tool_use_block = next(b for b in response.content if b.type == "tool_use" and b.name == "draft_memo_content")
     return tool_use_block.input
@@ -196,16 +210,14 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
 
     memo_content = _draft_memo_content(slots, grounded_chunks)
     if memo_content is None:
-        print("[LegalMemo] draft_failed reason=llm_call_failed")
         return {"document_id": None, "answer": "ร่างบันทึกไม่สำเร็จ ลองพิมพ์ขอใหม่อีกครั้งครับ"}
 
-    arguments = memo_content.get("arguments") or {}
     rendered = {
         "issues": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("issues") or [])],
         "analysis": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("analysis") or [])],
         "arguments": {
-            "our_side": [_render_paragraph(item, grounded_ids) for item in (arguments.get("our_side") or [])],
-            "other_side": [_render_paragraph(item, grounded_ids) for item in (arguments.get("other_side") or [])],
+            "our_side": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("our_side_arguments") or [])],
+            "other_side": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("other_side_arguments") or [])],
         },
         "conclusion": _render_paragraph(memo_content.get("conclusion") or {}, grounded_ids),
         "next_steps": [s for s in (memo_content.get("next_steps") or []) if s],
@@ -228,15 +240,10 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
     title = f"บันทึกความเห็นทางกฎหมายเบื้องต้น - {slots.get('client_name') or 'ไม่ระบุชื่อลูกค้า'}"
     memo_id = save_legal_memo(user_id, chat_id, title, slots, docx_bytes)
 
-    grounded_count = sum(1 for item in all_items if item["chunk_ids"])
-    general_count = len(all_items) - grounded_count
     missing = _missing_slot_labels(slots)
 
     download_url = f"/api/legal-memo/{memo_id}/download"
-    answer_lines = [
-        f"ร่างบันทึกความเห็นทางกฎหมายเรียบร้อยครับ ดาวน์โหลด: [ลิงก์]({download_url})",
-        f"อ้างอิงฐานความรู้ {grounded_count} ย่อหน้า · ความรู้ทั่วไป {general_count} ย่อหน้า",
-    ]
+    answer_lines = [f"ร่างบันทึกความเห็นทางกฎหมายเรียบร้อยครับ ดาวน์โหลด: [ลิงก์]({download_url})"]
     if missing:
         answer_lines.append("ยังไม่ได้ระบุ: " + ", ".join(missing))
 
