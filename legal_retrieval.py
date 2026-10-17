@@ -23,19 +23,22 @@ DEFAULT_BETA = 0.15
 OUT_OF_KB_SCORE_THRESHOLD = -3.0
 
 _tag_embeddings: dict[str, np.ndarray] = {}  # {tag_name: embedding} — รีเฟรชทุกครั้งที่ main.rebuild_index() ทำงาน
+_chunk_tags_cache: dict[int, list[str]] = {}  # {chunk_id: [tag_name,...]} — รีเฟรชพร้อมกับ _tag_embeddings (เดิม
+# legal_search query DB ใหม่ทุกครั้ง ทั้งที่ค่านี้เปลี่ยนเฉพาะตอนแก้ tag ผ่าน admin ไม่ใช่ทุก query)
 
 
 def refresh_tag_embeddings() -> None:
-    """embed ชื่อ tag ทุกตัวในระบบใหม่ทั้งหมด ด้วย e5 instruction prefix "passage: " (ชื่อ tag ถือเป็น "เอกสาร"
-    ที่จะถูกค้นหาด้วย query) เรียกจาก main.rebuild_index() ทุกครั้ง (ดู docstring ของไฟล์นี้)"""
-    global _tag_embeddings
+    """embed ชื่อ tag ทุกตัวในระบบใหม่ทั้งหมด ด้วย e5 instruction prefix "passage: " + รีเฟรช _chunk_tags_cache คู่กัน
+    เรียกจาก main.rebuild_index() ทุกครั้ง (ดู docstring ของไฟล์นี้)"""
+    global _tag_embeddings, _chunk_tags_cache
     tags = get_all_tags()
     if not tags:
         _tag_embeddings = {}
-        return
-    names = [t["name"] for t in tags]
-    vectors = main.embed_model.encode([f"passage: {name}" for name in names])
-    _tag_embeddings = {name: np.array(vec) for name, vec in zip(names, vectors)}
+    else:
+        names = [t["name"] for t in tags]
+        vectors = main.embed_model.encode([f"passage: {name}" for name in names])
+        _tag_embeddings = {name: np.array(vec) for name, vec in zip(names, vectors)}
+    _chunk_tags_cache = get_all_chunk_tags_map()
 
 
 def _cosine(a: np.ndarray, b: np.ndarray) -> float:
@@ -43,18 +46,22 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / denom) if denom else 0.0
 
 
-def tag_scores(query: str) -> dict[str, float]:
+def tag_scores(query: str, query_vec: Optional[np.ndarray] = None) -> dict[str, float]:
     """cosine(query, tag) ของทุก tag ที่มีอยู่ตอนนี้ คืน {tag_name: cosine} ดิบทั้งหมด (ยังไม่กรอง threshold) —
-    query ใส่ e5 instruction prefix "query: " ให้ถูกคู่กับ "passage: " ที่ใช้ตอน embed ชื่อ tag"""
+    query ใส่ e5 instruction prefix "query: " ให้ถูกคู่กับ "passage: " ที่ใช้ตอน embed ชื่อ tag
+    query_vec: ถ้ามี (เช่น legal_search encode คู่กับ query หลักเป็น batch เดียวไปแล้ว) ใช้ตัวนี้แทนการ encode ซ้ำ"""
     if not _tag_embeddings:
         return {}
-    query_vec = np.array(main.embed_model.encode(f"query: {query}"))
+    if query_vec is None:
+        query_vec = np.array(main.embed_model.encode(f"query: {query}"))
     return {name: _cosine(query_vec, vec) for name, vec in _tag_embeddings.items()}
 
 
-def relevant_tag_scores(query: str, threshold: float = DEFAULT_TAG_RELEVANCE_THRESHOLD) -> dict[str, float]:
+def relevant_tag_scores(
+    query: str, threshold: float = DEFAULT_TAG_RELEVANCE_THRESHOLD, query_vec: Optional[np.ndarray] = None
+) -> dict[str, float]:
     """เหมือน tag_scores แต่กรองเหลือเฉพาะ tag ที่คะแนนเกิน threshold (tag ที่ "เกี่ยวข้องจริง" กับคำถามนี้)"""
-    return {name: score for name, score in tag_scores(query).items() if score >= threshold}
+    return {name: score for name, score in tag_scores(query, query_vec=query_vec).items() if score >= threshold}
 
 
 def _normalize(scores: np.ndarray) -> np.ndarray:
@@ -76,23 +83,40 @@ def legal_search(
         print("[LegalRetrieval] top_ids=[] tag_hits=[] latency_ms=0")
         return []
 
+    t0 = time.monotonic()
     tokenized_query = word_tokenize(query, engine="newmm")
     bm25_scores = np.array(main.bm25.get_scores(tokenized_query))
+    bm25_ms = int((time.monotonic() - t0) * 1000)
 
-    query_embedding = main.embed_model.encode(query).tolist()
+    # encode query เปล่า + query มี "query: " prefix (tag) เป็น batch เดียวเมื่อ beta>0 — ผลเหมือนเดิมทุกประการ
+    # แค่ลดเรียกโมเดล embedding (ตัวใหญ่) ซ้ำสองรอบต่อคำถาม beta=0 (baseline เทียบในหน้า eval) ไม่ encode ตัว tag เลย
+    t0 = time.monotonic()
+    if beta:
+        batch_vecs = main.embed_model.encode([query, f"query: {query}"])
+        query_embedding = batch_vecs[0].tolist()
+        tag_query_vec = np.array(batch_vecs[1])
+    else:
+        query_embedding = main.embed_model.encode(query).tolist()
+        tag_query_vec = None
+    encode_ms = int((time.monotonic() - t0) * 1000)
+
+    t0 = time.monotonic()
     vector_scores_map = get_vector_scores_for_all(query_embedding)
     vector_scores = np.array([vector_scores_map.get(cid, 0.0) for cid in ids])
+    vector_ms = int((time.monotonic() - t0) * 1000)
 
     base_scores = alpha * _normalize(vector_scores) + (1 - alpha) * _normalize(bm25_scores)
 
-    chunk_tags_map = get_all_chunk_tags_map()
-    tag_hits = relevant_tag_scores(query, threshold=tag_threshold) if beta else {}
+    t0 = time.monotonic()
+    chunk_tags_map = _chunk_tags_cache  # cache รีเฟรชพร้อม _tag_embeddings ตอน rebuild_index() ไม่ query DB ซ้ำทุก query
+    tag_hits = relevant_tag_scores(query, threshold=tag_threshold, query_vec=tag_query_vec) if beta else {}
     tag_boost = np.zeros(len(ids))
     if beta and tag_hits:
         for i, cid in enumerate(ids):
             relevant = [tag_hits[name] for name in chunk_tags_map.get(cid, []) if name in tag_hits]
             if relevant:
                 tag_boost[i] = max(relevant)
+    tag_ms = int((time.monotonic() - t0) * 1000)
 
     final_scores = base_scores + beta * tag_boost
     top_idx = final_scores.argsort()[::-1][:k]
@@ -102,7 +126,9 @@ def legal_search(
         for i in top_idx
     ]
 
+    t0 = time.monotonic()
     reranked_texts, rerank_scores = rerank_with_scores(query, [c["content"] for c in candidates], top_k=rerank_top_k)
+    rerank_ms = int((time.monotonic() - t0) * 1000)
 
     # rerank_with_scores คืนแค่ (content, score) เรียงใหม่ — จับคู่กลับเข้า dict เดิมด้วย content (pop ตัวแรกที่ยัง
     # ไม่ถูกใช้ กันจับคู่ผิดซ้ำถ้า 2 chunk มีเนื้อหาเดียวกันเป๊ะ)
@@ -116,6 +142,10 @@ def legal_search(
 
     latency_ms = int((time.monotonic() - start) * 1000)
     print(f"[LegalRetrieval] top_ids={[r['id'] for r in results]} tag_hits={list(tag_hits.keys())} latency_ms={latency_ms}")
+    print(
+        f"[LegalRetrieval] timing bm25_ms={bm25_ms} encode_ms={encode_ms} vector_ms={vector_ms} "
+        f"tag_ms={tag_ms} rerank_ms={rerank_ms} total_ms={latency_ms}"
+    )
     return results
 
 
