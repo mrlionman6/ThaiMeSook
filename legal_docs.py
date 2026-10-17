@@ -130,9 +130,9 @@ def _format_chunks_for_prompt(chunks: list[dict]) -> str:
     return "\n\n".join(lines)
 
 
-def _draft_memo_content(slots: dict, grounded_chunks: list[dict]) -> dict:
+def _draft_memo_content(slots: dict, grounded_chunks: list[dict]):
     """เรียก Claude (ADVISOR_MODEL — ต้องการภาษาไทยที่แม่นยำในคำตอบยาว เหมือน advisor_answer) เรียบเรียงเนื้อหา
-    บันทึก คืน dict ตาม MEMO_CONTENT_TOOL เสมอ (list ว่างถ้า parse/เรียกไม่สำเร็จ)"""
+    บันทึก คืน None ถ้าเรียกไม่สำเร็จหรือโดนตัดเพราะ token ไม่พอ (stop_reason == "max_tokens") ให้ caller ตัดสินใจเอง"""
     facts_lines = "\n".join(f"- {f}" for f in (slots.get("key_facts") or []))
     questions_lines = "\n".join(f"- {q}" for q in (slots.get("user_questions") or []))
     prompt = (
@@ -143,11 +143,11 @@ def _draft_memo_content(slots: dict, grounded_chunks: list[dict]) -> dict:
         f"chunk จากฐานความรู้:\n{_format_chunks_for_prompt(grounded_chunks)}"
     )
     response = call_with_required_tool(
-        client, ADVISOR_MODEL, 2500, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
+        client, ADVISOR_MODEL, 6000, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
         [MEMO_CONTENT_TOOL], "draft_memo_content",
     )
-    if response is None:
-        return {"issues": [], "analysis": [], "conclusion": {"text": "", "chunk_ids": []}, "next_steps": []}
+    if response is None or response.stop_reason == "max_tokens":
+        return None
     tool_use_block = next(b for b in response.content if b.type == "tool_use" and b.name == "draft_memo_content")
     return tool_use_block.input
 
@@ -284,12 +284,19 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
     grounded_by_id = {c["id"]: c for c in grounded_chunks}
 
     memo_content = _draft_memo_content(slots, grounded_chunks)
+    if memo_content is None:
+        print("[LegalMemo] draft_failed reason=llm_call_failed")
+        return {"document_id": None, "answer": "ร่างบันทึกไม่สำเร็จ ลองพิมพ์ขอใหม่อีกครั้งครับ"}
+
     rendered = {
         "issues": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("issues") or [])],
         "analysis": [_render_paragraph(item, grounded_ids) for item in (memo_content.get("analysis") or [])],
         "conclusion": _render_paragraph(memo_content.get("conclusion") or {}, grounded_ids),
         "next_steps": [s for s in (memo_content.get("next_steps") or []) if s],
     }
+    if not rendered["issues"] and not rendered["analysis"] and not rendered["conclusion"]["text"]:
+        print("[LegalMemo] draft_failed reason=empty_content")
+        return {"document_id": None, "answer": "ร่างบันทึกไม่สำเร็จ ลองพิมพ์ขอใหม่อีกครั้งครับ"}
 
     used_ids = set()
     for item in rendered["issues"] + rendered["analysis"] + [rendered["conclusion"]]:
@@ -306,7 +313,7 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
 
     download_url = f"/api/legal-memo/{memo_id}/download"
     answer_lines = [
-        f"ร่างบันทึกความเห็นทางกฎหมายเรียบร้อยครับ [📥 ดาวน์โหลด]({download_url})",
+        f"ร่างบันทึกความเห็นทางกฎหมายเรียบร้อยครับ ดาวน์โหลด: [ลิงก์]({download_url})",
         f"อ้างอิงฐานความรู้ {grounded_count} ย่อหน้า · ความรู้ทั่วไป {general_count} ย่อหน้า",
     ]
     if missing:
