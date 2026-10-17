@@ -64,6 +64,8 @@ from db import (
     get_deal_screening_batch,
     get_deal_screening_history,
     create_user_document,
+    save_legal_memo,
+    get_legal_memo,
     create_editable_document,
     get_editable_document,
     get_editable_document_raw,
@@ -359,6 +361,8 @@ def rerank_with_scores(query, candidates, top_k=3):
 
 # deferred import (หลังนิยาม rerank_with_scores ที่ legal_retrieval.py ต้องใช้) — ดู docstring ของไฟล์นั้น
 import legal_retrieval
+# deferred import (หลังนิยาม client/ROUTER_MODEL/ADVISOR_MODEL/save_legal_memo ที่ legal_docs.py ต้องใช้)
+import legal_docs
 
 def rewrite_query_for_retrieval(query: str, history: list) -> str:
     """ใช้ Claude Haiku เขียนคำถามที่กำกวม/อ้างอิงบริบทก่อนหน้า (เช่น 'แล้วอันนี้ล่ะ')
@@ -10056,7 +10060,7 @@ ROUTE_INTENT_TOOL = {
                 "enum": [
                     "edit_document", "replace_with_recommendation", "add_recommendation", "read_document",
                     "recommend_products", "library_search", "legal_question", "general_question",
-                    "ask_clarification", "undo", "compare_documents",
+                    "ask_clarification", "undo", "compare_documents", "draft_legal_document",
                 ],
             },
             "target_item_index": {
@@ -10234,6 +10238,9 @@ ROUTER_SYSTEM_PROMPT = (
     "สั่งให้ \"เปิด\" ไฟล์นั้นตรงๆ (เช่น \"เปิด X ด้วย\") ไม่ใช่แค่ถามหา/ค้นหาเฉยๆ\n"
     "- legal_question: คำถามความรู้ด้านกฎหมาย/ภาษี/การลงทุนทั่วไป ไม่เกี่ยวกับไฟล์ที่เปิดอยู่หรือคลังเอกสารเลย "
     "เช่น \"ธุรกิจบัญชีสามมีอะไรบ้าง\", \"พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวคืออะไร\"\n"
+    "- draft_legal_document: ผู้ใช้ขอให้ร่างความเห็น/บันทึก/เอกสารทางกฎหมายจากสถานการณ์ของตนเอง (ไม่ใช่แค่ถามความรู้"
+    "ทั่วไปเฉยๆ) เช่น \"ช่วยร่างบันทึกความเห็นให้หน่อย\", \"ขอความเห็นทางกฎหมายเป็นเอกสารได้ไหม\" รองรับกฎหมายไทยทุก"
+    "หมวด ไม่จำกัดแค่ธุรกิจต่างด้าว/ภาษี\n"
     "- general_question: การสนทนาทั่วไป/ทักทาย/คำถามอื่นที่ไม่เข้าพวกไหนข้างต้นเลย\n"
     "- undo: ขอยกเลิก/ย้อนการแก้ \"ไฟล์ที่เปิดอยู่ในแชทนี้\" เท่านั้น เช่น \"ย้อนกลับ\", \"เอาคืนให้หน่อย\" (คำสั้นๆ"
     "แบบนี้ปกติถูกจับด้วยโค้ดก่อนถึงตานี้อยู่แล้ว — ใช้ intent นี้เป็นทางสำรองสำหรับคำพูดแบบอื่นที่สื่อความหมาย"
@@ -10400,7 +10407,7 @@ _ROUTER_FILE_INTENTS = {
 }
 _ROUTER_VALID_INTENTS = _ROUTER_FILE_INTENTS | {
     "recommend_products", "library_search", "legal_question", "general_question", "ask_clarification",
-    "compare_documents",
+    "compare_documents", "draft_legal_document",
 }
 _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE = "ต้องเข้าสู่ระบบและเปิดไฟล์ในคลังเอกสารก่อนถึงจะแก้ไข/อ่านค่าในเอกสารได้ครับ"
 
@@ -10667,6 +10674,8 @@ def _resolve_llm_router_dispatch(
         return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
     if intent == "compare_documents" and not (user_id and chat_id):
         return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
+    if intent == "draft_legal_document" and not (user_id and chat_id):
+        return {"document_id": None, "answer": _ROUTER_FILE_LOGIN_REQUIRED_MESSAGE}
     if intent == "library_search" and not user_id:
         return {"document_id": None, "answer": _LIBRARY_LOGIN_REQUIRED_MESSAGE}
 
@@ -10694,6 +10703,8 @@ def _resolve_llm_router_dispatch(
         return {"document_id": target_doc["id"], "answer": result["message"]}
     if intent == "compare_documents":
         return multi_docs.dispatch_compare_documents(route, active_docs, chat_id, user_id)
+    if intent == "draft_legal_document":
+        return legal_docs.dispatch_draft_legal_document(query, user_id, chat_id)
     if intent in ("recommend_products", "general_question"):
         return _dispatch_router_advisor(query, user_id, chat_id, active_docs)
     if intent == "library_search":
@@ -10972,6 +10983,21 @@ def download_excel_editor_document(document_id: int, user_id: int = Depends(requ
         buf,
         media_type=media_type,
         headers={"Content-Disposition": _content_disposition_attachment(download_filename)},
+    )
+
+
+@app.get("/api/legal-memo/{memo_id}/download")
+def download_legal_memo(memo_id: int, user_id: int = Depends(require_user)):
+    """ดาวน์โหลดบันทึกความเห็นทางกฎหมาย (.docx) ที่ร่างไว้แล้ว — แยกจากระบบ EditableDocument ทั้งหมด (ดู
+    legal_docs.py) ตรวจเจ้าของผ่าน get_legal_memo เหมือน get_editable_document"""
+    memo = get_legal_memo(memo_id, user_id)
+    if memo is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+    buf = io.BytesIO(memo["docx"])
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": _content_disposition_attachment(f"legal-memo-{memo_id}.docx")},
     )
 
 

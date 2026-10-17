@@ -19,3 +19,4 @@ openpyxl
 xlrd
 boto3
 pycel
+python-docx
