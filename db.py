@@ -26,7 +26,7 @@ db.py — เลเยอร์เชื่อมต่อ PostgreSQL สำห�
         add_chat_message, get_chat_messages, delete_chat_session,
         upsert_library_search_card, get_all_library_search_cards,
         get_library_file_ids_without_search_card, get_library_search_vector_scores_for_all,
-        save_legal_memo, get_legal_memo,
+        save_legal_memo, get_legal_memo, list_legal_memos_by_chat, close_legal_memo,
     )
 """
 
@@ -197,6 +197,15 @@ class LegalMemo(Base):
     slots_json = Column(JSON, nullable=False)
     docx = Column(LargeBinary, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
+
+
+class ClosedChatLegalMemo(Base):
+    """LegalMemo ที่ถูก "ปิด" ไม่ให้แสดงในแผงไฟล์ของแชทอีก — รูปแบบเดียวกับ ClosedChatDocument เป๊ะ (ไม่ลบไฟล์
+    จริง ลิงก์ดาวน์โหลดเดิมยังใช้ได้ปกติ เพราะ get_legal_memo()/download_legal_memo() ไม่เช็คตารางนี้เลย)"""
+    __tablename__ = "closed_chat_legal_memos"
+
+    memo_id = Column(Integer, ForeignKey("legal_memos.id", ondelete="CASCADE"), primary_key=True)
+    closed_at = Column(DateTime(timezone=True), default=datetime.datetime.utcnow)
 
 
 class EditableDocument(Base):
@@ -1343,6 +1352,44 @@ def get_legal_memo(memo_id: int, user_id: int) -> Optional[dict]:
             "id": row.id, "user_id": row.user_id, "chat_id": row.chat_id, "title": row.title,
             "slots_json": row.slots_json, "docx": row.docx, "created_at": row.created_at,
         }
+
+
+def list_legal_memos_by_chat(chat_id: int, user_id: int) -> list[dict]:
+    """คืนทุก LegalMemo ที่ยังไม่ถูกปิด (ดู ClosedChatLegalMemo) ผูกกับแชทนี้ เรียงใหม่สุดก่อน — รูปแบบเดียวกับ
+    list_active_editable_documents_by_chat เป๊ะ ใช้โดยแผงไฟล์ฝั่งหน้าเว็บ (แท็บ Word)"""
+    with SessionLocal() as session:
+        rows = (
+            session.query(LegalMemo)
+            .filter(LegalMemo.chat_id == chat_id, LegalMemo.user_id == user_id)
+            .order_by(LegalMemo.created_at.desc())
+            .all()
+        )
+        if not rows:
+            return []
+        closed_ids = {
+            r.memo_id
+            for r in session.query(ClosedChatLegalMemo.memo_id)
+            .filter(ClosedChatLegalMemo.memo_id.in_([row.id for row in rows]))
+            .all()
+        }
+        return [
+            {"id": row.id, "title": row.title, "created_at": row.created_at}
+            for row in rows
+            if row.id not in closed_ids
+        ]
+
+
+def close_legal_memo(memo_id: int, user_id: int) -> bool:
+    """ปิด memo นี้ไม่ให้แสดงในแผงไฟล์อีก (ไม่ลบไฟล์จริง) — รูปแบบเดียวกับ close_editable_document เป๊ะ
+    คืน False ถ้าไม่พบหรือไม่ใช่เจ้าของ เรียกซ้ำกับ memo ที่ปิดไปแล้วได้ปลอดภัย (idempotent)"""
+    with SessionLocal() as session:
+        row = session.get(LegalMemo, memo_id)
+        if row is None or row.user_id != user_id:
+            return False
+        if session.get(ClosedChatLegalMemo, memo_id) is None:
+            session.add(ClosedChatLegalMemo(memo_id=memo_id, closed_at=datetime.datetime.utcnow()))
+            session.commit()
+        return True
 
 
 def create_editable_document(
