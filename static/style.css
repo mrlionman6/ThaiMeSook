@@ -1882,6 +1882,34 @@ button {
     font-size: 13px;
 }
 
+/* แท็บ Excel/Word เหนือแผงไฟล์ — สไตล์เดียวกับ .doc-preview-sheet-tab */
+.files-panel-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 12px 16px 0;
+    flex-shrink: 0;
+    border-bottom: 1px solid #eee;
+}
+
+.files-panel-tab {
+    font-size: 13px;
+    padding: 6px 12px;
+    border: 1px solid #ddd;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    background: #fafafa;
+    color: #555;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.files-panel-tab.active {
+    background: white;
+    color: var(--color-primary);
+    font-weight: bold;
+    border-color: var(--color-sky);
+}
+
 .files-panel-body {
     flex: 1;
     overflow-y: auto;
@@ -2112,6 +2140,15 @@ button {
     overflow: auto;
     box-sizing: border-box;
     padding: 0;
+}
+
+/* ย่อหน้าเนื้อหาบันทึกความเห็นทางกฎหมาย (ดู openMemoPreview) — ใช้ drawer เดียวกับ preview Excel */
+.doc-preview-memo-paragraph {
+    margin: 0 0 12px;
+    padding: 0 16px;
+    font-size: 14px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
 }
 
 .doc-preview-footer {

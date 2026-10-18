@@ -33,6 +33,11 @@
             <h3>ไฟล์ในแชทนี้</h3>
             <button id="filesPanelCloseBtn" aria-label="ปิดแผง">✕</button>
         </div>
+        <!-- แท็บสลับชนิดไฟล์ (ดู switchFilesPanelTab ใน script.js) -->
+        <div class="files-panel-tabs" id="filesPanelTabs">
+            <button type="button" class="files-panel-tab active" id="filesPanelTabExcel">Excel</button>
+            <button type="button" class="files-panel-tab" id="filesPanelTabWord">Word</button>
+        </div>
         <div id="filesPanelMessage" class="files-panel-message" hidden></div>
         <div class="files-panel-body" id="filesPanelBody"></div>
         <div class="files-panel-footer">

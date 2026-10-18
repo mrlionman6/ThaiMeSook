@@ -608,19 +608,24 @@ async function loadChatFilesPanel(preserveMessage = false) {
 
     // แชทใหม่ที่ยังไม่มี chat_id จริง (ยังไม่เคยถามอะไรเลย) -> ไม่มีอะไรให้โหลด แสดงสถานะว่างตรงๆ
     if (!requestChatId) {
-        renderFilesPanel({ documents: [] });
+        renderFilesPanel({ documents: [], memos: [] });
         return;
     }
 
     try {
-        const res = await fetch(`/api/chats/${requestChatId}/state`);
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const data = await res.json();
+        // โหลดไฟล์ Excel (เดิม) และบันทึกความเห็นทางกฎหมาย (แท็บ Word) พร้อมกัน — memo ล้มไม่ทำให้ Excel ล้มไปด้วย
+        const [stateRes, memosRes] = await Promise.all([
+            fetch(`/api/chats/${requestChatId}/state`),
+            fetch(`/api/chat/${requestChatId}/legal-memos`),
+        ]);
+        if (!stateRes.ok) throw new Error("HTTP " + stateRes.status);
+        const data = await stateRes.json();
+        const memosData = memosRes.ok ? await memosRes.json() : { memos: [] };
         if (currentChatId !== requestChatId) return; // สลับแชทไปแล้วระหว่างรอผล ทิ้งผลนี้ทิ้งไป
-        renderFilesPanel(data);
+        renderFilesPanel({ documents: data.documents || [], memos: memosData.memos || [] });
     } catch (error) {
         if (currentChatId !== requestChatId) return;
-        renderFilesPanel({ documents: [], loadError: true });
+        renderFilesPanel({ documents: [], memos: [], loadError: true });
     }
 }
 
@@ -657,11 +662,39 @@ function updateFilesPanelBadge(count) {
     }
 }
 
+// แท็บที่เลือกอยู่ของแผงไฟล์ ("excel"/"word") + ข้อมูลล่าสุดของทั้งสองแท็บ (เก็บไว้สลับแท็บได้ทันทีไม่ต้อง fetch
+// ซ้ำ — ดู switchFilesPanelTab) รีเฟรชทุกครั้งที่ loadChatFilesPanel ทำงาน (รวมถึงตอนร่าง memo ใหม่เสร็จในแชท
+// เพราะ loadChatFilesPanel ถูกเรียกหลังได้คำตอบทุกครั้งอยู่แล้ว)
+let filesPanelActiveTab = "excel";
+let filesPanelDocumentsCache = [];
+let filesPanelMemosCache = [];
+
+function renderFilesPanelTabs() {
+    const excelTab = document.getElementById("filesPanelTabExcel");
+    const wordTab = document.getElementById("filesPanelTabWord");
+    excelTab.textContent = `Excel (${filesPanelDocumentsCache.length})`;
+    wordTab.textContent = `Word (${filesPanelMemosCache.length})`;
+    excelTab.classList.toggle("active", filesPanelActiveTab === "excel");
+    wordTab.classList.toggle("active", filesPanelActiveTab === "word");
+}
+
+function switchFilesPanelTab(tab) {
+    if (filesPanelActiveTab === tab) return;
+    filesPanelActiveTab = tab;
+    renderFilesPanel({ documents: filesPanelDocumentsCache, memos: filesPanelMemosCache });
+}
+
+document.getElementById("filesPanelTabExcel").addEventListener("click", () => switchFilesPanelTab("excel"));
+document.getElementById("filesPanelTabWord").addEventListener("click", () => switchFilesPanelTab("word"));
+
 function renderFilesPanel(state) {
+    filesPanelDocumentsCache = state.documents || [];
+    filesPanelMemosCache = state.memos || [];
+    renderFilesPanelTabs();
+
     const body = document.getElementById("filesPanelBody");
     body.innerHTML = ""; // เคลียร์การ์ดเก่าทิ้ง (ไม่ใช่การประกอบ HTML จากข้อมูลดิบ — แค่ล้างก่อนสร้างใหม่)
-    const documents = state.documents || [];
-    updateFilesPanelBadge(documents.length);
+    updateFilesPanelBadge(filesPanelDocumentsCache.length); // ยอดบนปุ่มลอย — นับไฟล์ Excel เหมือนเดิมทุกประการ
 
     if (state.loadError) {
         const p = document.createElement("p");
@@ -671,15 +704,25 @@ function renderFilesPanel(state) {
         return;
     }
 
-    if (documents.length === 0) {
-        const p = document.createElement("p");
-        p.className = "files-panel-empty";
-        p.textContent = "ยังไม่มีไฟล์เปิดในแชทนี้";
-        body.appendChild(p);
-        return;
+    if (filesPanelActiveTab === "word") {
+        if (filesPanelMemosCache.length === 0) {
+            const p = document.createElement("p");
+            p.className = "files-panel-empty";
+            p.textContent = "ยังไม่มีไฟล์ Word ในแชทนี้";
+            body.appendChild(p);
+            return;
+        }
+        filesPanelMemosCache.forEach(memo => body.appendChild(buildMemoCard(memo)));
+    } else {
+        if (filesPanelDocumentsCache.length === 0) {
+            const p = document.createElement("p");
+            p.className = "files-panel-empty";
+            p.textContent = "ยังไม่มีไฟล์เปิดในแชทนี้";
+            body.appendChild(p);
+            return;
+        }
+        filesPanelDocumentsCache.forEach(doc => body.appendChild(buildFileCard(doc)));
     }
-
-    documents.forEach(doc => body.appendChild(buildFileCard(doc)));
 
     // แผงไฟล์รีเฟรชทุกครั้งที่มีคำตอบใหม่/แก้ไฟล์/คิวเปลี่ยน (ดูจุดเรียก loadChatFilesPanel ทั้งหมด) — ใช้จุด
     // เดียวกันนี้รีเฟรช preview ที่เปิดค้างอยู่ด้วยเลย (ถ้ามี) กันข้อมูลเก่าค้างจอหลังแก้ไฟล์ที่กำลังดูอยู่
@@ -817,6 +860,71 @@ function handleCloseFromPanel(documentId, filename) {
     );
 }
 
+// สร้างการ์ดไฟล์ Word (บันทึกความเห็นทางกฎหมาย) 1 ใบ — รูปแบบเดียวกับ buildFileCard แต่ไม่มีปุ่มย้อนการแก้
+// (ร่างใหม่ทุกครั้ง ไม่มีขั้นแก้ไขทีละจุดแบบ Excel)
+function buildMemoCard(memo) {
+    const card = document.createElement("div");
+    card.className = "file-card";
+
+    const nameRow = document.createElement("div");
+    nameRow.className = "file-card-name file-card-name-clickable";
+    nameRow.textContent = memo.title;
+    nameRow.title = "คลิกเพื่อดูไฟล์";
+    nameRow.onclick = () => openMemoPreview(memo.memo_id, memo.title);
+    card.appendChild(nameRow);
+
+    if (memo.created_at) {
+        const metaRow = document.createElement("div");
+        metaRow.className = "file-card-meta";
+        metaRow.textContent = new Date(memo.created_at).toLocaleDateString("th-TH");
+        card.appendChild(metaRow);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "file-card-actions";
+
+    const previewBtn = document.createElement("button");
+    previewBtn.type = "button";
+    previewBtn.className = "file-card-btn";
+    previewBtn.textContent = "ดูไฟล์";
+    previewBtn.onclick = () => openMemoPreview(memo.memo_id, memo.title);
+    actions.appendChild(previewBtn);
+
+    const downloadBtn = document.createElement("a");
+    downloadBtn.className = "file-card-btn";
+    downloadBtn.textContent = "ดาวน์โหลด";
+    downloadBtn.href = memo.download_url;
+    actions.appendChild(downloadBtn);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "file-card-btn file-card-btn-danger";
+    closeBtn.textContent = "ปิดไฟล์";
+    closeBtn.onclick = () => handleCloseMemoFromPanel(memo.memo_id, memo.title);
+    actions.appendChild(closeBtn);
+
+    card.appendChild(actions);
+    return card;
+}
+
+function handleCloseMemoFromPanel(memoId, title) {
+    showConfirmDialog(
+        `ปิดไฟล์ "${title}" ในแชทนี้?`,
+        async () => {
+            try {
+                const res = await fetch(`/api/chat/${currentChatId}/legal-memos/${memoId}/close`, { method: "POST" });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+                showFilesPanelMessage(data.message || data.error || "ดำเนินการแล้ว");
+            } catch (error) {
+                showFilesPanelMessage(String(error));
+            }
+            loadChatFilesPanel(true); // preserveMessage — เพิ่งเซ็ตข้อความผลลัพธ์ไว้เองด้านบน
+        },
+        { confirmText: "ปิดไฟล์" }
+    );
+}
+
 // =====================================================================
 // Preview เอกสาร Excel ในแท็บด้านขวา (read-only — ดู GET /api/excel-editor/{id}/preview ฝั่ง backend)
 // เปิดจากการคลิกไฟล์ในแผงไฟล์ (ชื่อไฟล์ หรือปุ่ม "ดูไฟล์" — ดู buildFileCard ด้านบน)
@@ -829,7 +937,13 @@ const DOC_PREVIEW_PAGE_SIZE = 100;
 // แค่ frontend ไม่เรียกใช้)
 let docPreviewState = null;
 
+// null เมื่อไม่ได้เปิด preview บันทึกความเห็นทางกฎหมาย (Word) อยู่ — คู่กับ docPreviewState แต่ใช้ drawer เดียวกัน
+// (docPreviewDrawer) เพราะเนื้อหาเป็นย่อหน้าข้อความล้วน ไม่มีชีต/ตาราง ไม่ต้องมี pagination เหมือน Excel — เปิดได้
+// ทีละอันเท่านั้น (ดู openDocPreview/openMemoPreview ล้างอีกฝั่งทิ้งก่อนเริ่มเสมอ)
+let memoPreviewState = null;
+
 function openDocPreview(documentId, filename) {
+    memoPreviewState = null;
     docPreviewState = {
         documentId, filename, sheet: null,
         rows: [], columnWidths: [], merges: [], usedCols: 0, hasMore: false, nextStartRow: 1,
@@ -842,11 +956,46 @@ function openDocPreview(documentId, filename) {
     fetchDocPreviewPage(true);
 }
 
+async function openMemoPreview(memoId, title) {
+    docPreviewState = null;
+    memoPreviewState = { memoId };
+    document.getElementById("docPreviewTitle").textContent = title;
+    document.getElementById("docPreviewSheetTabs").hidden = true; // ไม่มีชีตให้สลับ (ต่างจาก Excel)
+    document.getElementById("docPreviewLoadMoreBtn").hidden = true; // โหลดย่อหน้าทั้งหมดในครั้งเดียว ไม่แบ่งหน้า
+    document.getElementById("docPreviewDrawer").classList.add("open");
+    document.getElementById("docPreviewDrawer").setAttribute("aria-hidden", "false");
+    document.getElementById("docPreviewBackdrop").hidden = false;
+    await fetchMemoPreview();
+}
+
+async function fetchMemoPreview() {
+    if (!memoPreviewState) return;
+    const state = memoPreviewState;
+    const body = document.getElementById("docPreviewBody");
+    try {
+        const res = await fetch(`/api/legal-memo/${state.memoId}/content`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+        if (memoPreviewState !== state) return; // ปิด/สลับไปดูไฟล์อื่นแล้วระหว่างรอผล ทิ้งผลนี้ไป
+        body.innerHTML = "";
+        (data.paragraphs || []).forEach(text => {
+            const p = document.createElement("p");
+            p.className = "doc-preview-memo-paragraph";
+            p.textContent = text;
+            body.appendChild(p);
+        });
+    } catch (error) {
+        if (memoPreviewState !== state) return;
+        body.textContent = "โหลด preview ไม่สำเร็จ: " + error;
+    }
+}
+
 function closeDocPreview() {
     document.getElementById("docPreviewDrawer").classList.remove("open");
     document.getElementById("docPreviewDrawer").setAttribute("aria-hidden", "true");
     document.getElementById("docPreviewBackdrop").hidden = true;
     docPreviewState = null;
+    memoPreviewState = null;
 }
 
 // reset=true: ล้างแถวที่สะสมไว้ทิ้งแล้วเริ่มใหม่จากแถว 1 (สลับชีต หรือรีเฟรชเพราะไฟล์อาจเปลี่ยนไปแล้ว — ดู
@@ -903,8 +1052,8 @@ function switchDocPreviewSheet(sheetName) {
 // กลับมาที่แท็บนี้ (ดู visibilitychange ด้านล่าง) รีเซ็ตกลับไปแถว 1 เสมอ (ไม่ใช่แค่ต่อท้าย) เพราะการแก้โครงสร้าง
 // (เช่นลบ/เพิ่มรายการ) อาจทำให้แถวที่เคยโหลดไว้ก่อนหน้าไม่ตรงกับของจริงอีกต่อไป
 function refreshDocPreviewIfOpen() {
-    if (!docPreviewState) return;
-    fetchDocPreviewPage(true);
+    if (docPreviewState) fetchDocPreviewPage(true);
+    else if (memoPreviewState) fetchMemoPreview();
 }
 
 document.addEventListener("visibilitychange", () => {

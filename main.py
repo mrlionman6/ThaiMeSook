@@ -66,6 +66,8 @@ from db import (
     create_user_document,
     save_legal_memo,
     get_legal_memo,
+    list_legal_memos_by_chat,
+    close_legal_memo,
     create_editable_document,
     get_editable_document,
     get_editable_document_raw,
@@ -11071,6 +11073,33 @@ def download_legal_memo(memo_id: int, user_id: int = Depends(require_user)):
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": _content_disposition_attachment(f"legal-memo-{memo_id}.docx")},
     )
+
+
+@app.get("/api/chat/{chat_id}/legal-memos")
+def list_chat_legal_memos_endpoint(chat_id: int, user_id: int = Depends(require_user)):
+    """รายการบันทึกความเห็นทางกฎหมายในแชทนี้ — ใช้โดยแท็บ Word ของแผงไฟล์ (ดู legal_docs.list_chat_legal_memos)"""
+    chat = get_chat_session(chat_id, user_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
+    return {"memos": legal_docs.list_chat_legal_memos(chat_id, user_id)}
+
+
+@app.get("/api/legal-memo/{memo_id}/content")
+def read_legal_memo_content_endpoint(memo_id: int, user_id: int = Depends(require_user)):
+    """อ่านย่อหน้าของบันทึกที่ร่างไว้แล้วเป็นข้อความล้วน (ไม่ต้องดาวน์โหลด) — ดู legal_docs.read_legal_memo_paragraphs"""
+    result = legal_docs.read_legal_memo_paragraphs(memo_id, user_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="ไม่พบข้อมูล")
+    return result
+
+
+@app.post("/api/chat/{chat_id}/legal-memos/{memo_id}/close")
+def close_chat_legal_memo_endpoint(chat_id: int, memo_id: int, user_id: int = Depends(require_user)):
+    """ซ่อนบันทึกนี้จากแท็บ Word ของแชทนี้ — ไม่ลบไฟล์จริง (ดู legal_docs.close_chat_legal_memo)"""
+    chat = get_chat_session(chat_id, user_id)
+    if chat is None:
+        raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
+    return legal_docs.close_chat_legal_memo(chat_id, memo_id, user_id)
 
 
 # ---------- Document preview (ดูไฟล์ Excel ในแท็บด้านขวา — read-only ล้วน ไม่แก้ไฟล์ใดๆ เลยสักจุด) ----------

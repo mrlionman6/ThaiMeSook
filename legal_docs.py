@@ -7,9 +7,15 @@ chunk_ids ให้อยู่ในชุดที่ค้นเจอจร�
 
 import จาก main.py แบบ deferred (หลังนิยาม client/ROUTER_MODEL/ADVISOR_MODEL/save_legal_memo) เหมือน
 legal_retrieval.py — ดู main.py บรรทัดที่ import โมดูลนี้"""
+import io
+from typing import Optional
+
+from docx import Document
+
 import legal_retrieval
 from legal_memo_format import build_memo_docx
 from llm_tools import call_with_required_tool
+from db import get_legal_memo, list_legal_memos_by_chat, close_legal_memo
 from main import client, get_chat_messages, save_legal_memo, ROUTER_MODEL, ADVISOR_MODEL
 
 MEMO_SLOTS_TOOL = {
@@ -252,3 +258,39 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
         answer_lines.append("ยังไม่ได้ระบุ: " + ", ".join(missing))
 
     return {"document_id": None, "answer": "\n".join(answer_lines)}
+
+
+def list_chat_legal_memos(chat_id: int, user_id: int) -> list[dict]:
+    """รายการบันทึกความเห็นที่ร่างไว้ในแชทนี้ (ยังไม่ถูกปิด) ใช้โดยแผงไฟล์ฝั่งหน้าเว็บ (แท็บ Word)"""
+    rows = list_legal_memos_by_chat(chat_id, user_id)
+    return [
+        {
+            "memo_id": r["id"],
+            "title": r["title"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            "download_url": f"/api/legal-memo/{r['id']}/download",
+        }
+        for r in rows
+    ]
+
+
+def read_legal_memo_paragraphs(memo_id: int, user_id: int) -> Optional[dict]:
+    """แปลงไฟล์ .docx ที่เก็บไว้กลับเป็นย่อหน้าข้อความล้วนให้ดูในแชทได้โดยไม่ต้องดาวน์โหลด (เนื้อหาเต็มไม่ได้เก็บ
+    แยกไว้ต่างหาก มีแค่ใน .docx) ตรวจเจ้าของผ่าน get_legal_memo เหมือน download_legal_memo คืน None ถ้าไม่พบ/ไม่ใช่เจ้าของ"""
+    memo = get_legal_memo(memo_id, user_id)
+    if memo is None:
+        return None
+    document = Document(io.BytesIO(memo["docx"]))
+    paragraphs = [p.text for p in document.paragraphs if p.text.strip()]
+    return {"title": memo["title"], "paragraphs": paragraphs}
+
+
+def close_chat_legal_memo(chat_id: int, memo_id: int, user_id: int) -> dict:
+    """ซ่อนบันทึกนี้จากแผงไฟล์ของแชทนี้ ไม่ลบไฟล์จริง — ลิงก์ดาวน์โหลดเดิมยังใช้ได้ปกติ (ดู close_legal_memo)
+    ตรวจว่า memo นี้เป็นของแชทนี้จริงก่อนเสมอ (ไม่ใช่แค่ของ user นี้) เหมือน close_chat_document"""
+    memo = get_legal_memo(memo_id, user_id)
+    if memo is None or memo["chat_id"] != chat_id:
+        return {"error": "ไม่พบบันทึกนี้ในแชทนี้"}
+    if not close_legal_memo(memo_id, user_id):
+        return {"error": "ปิดไฟล์ไม่สำเร็จ ลองใหม่อีกครั้ง"}
+    return {"closed": True, "title": memo["title"], "message": f"ปิดไฟล์ '{memo['title']}' ในแชทนี้แล้วครับ"}
