@@ -342,8 +342,8 @@ async function submitAttachmentUpload(endpoint, file, instruction = null) {
     const requestChatId = currentChatId; // ยึด context แชทที่กำลังดูอยู่ตอนกดส่ง กันโชว์ผลผิดที่ถ้าสลับแชทระหว่างรอ
 
     const userMessage = instruction
-        ? `📎 [แนบเอกสาร] ${file.name} — ${instruction}`
-        : "📎 [แนบเอกสาร] " + file.name;
+        ? `[แนบเอกสาร] ${file.name} — ${instruction}`
+        : "[แนบเอกสาร] " + file.name;
     appendChatMessage("user", userMessage);
     document.getElementById("questionInput").value = "";
     clearImageAttachment();

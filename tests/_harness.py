@@ -149,7 +149,7 @@ WANTED_MAIN_CONSTS = {
     "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
     "_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS", "_RECEIPT_LINE_RE",
-    "_LEGACY_MODE_LABEL_RE", "_RECEIPT_MARKER_TO_PLAIN",
+    "_LEGACY_MODE_LABEL_RE", "_RECEIPT_MARKER_TO_PLAIN", "LEGAL_ANSWER_MODEL",
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES", "MAX_TOOL_ITERATIONS",
     "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
@@ -650,11 +650,13 @@ class _FakeAgenticLoop:
         self.response = (text, receipts, structural_tool_called)
 
     def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None,
-                 max_iterations=None, max_tokens=None):
+                 max_iterations=None, max_tokens=None, thinking=None, **kwargs):
+        # **kwargs กัน run_agentic_tool_loop จริงเพิ่ม keyword argument ใหม่ในอนาคตแล้วเทสต์ล้มทั้งชุดเงียบๆ
+        # (เพิ่งเจอจริงกับ thinking — ดู PR #60)
         self.last_call_args = {
             "system_prompt": system_prompt, "messages": initial_messages, "user_id": user_id, "chat_id": chat_id,
             "tools_override": tools_override, "model": model, "max_iterations": max_iterations,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens, "thinking": thinking, **kwargs,
         }
         return self.response
 
