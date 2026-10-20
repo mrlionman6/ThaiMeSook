@@ -155,13 +155,14 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 import anthropic
 from sentence_transformers import SentenceTransformer, CrossEncoder
+import torch
 from rank_bm25 import BM25Okapi
 from pythainlp.tokenize import word_tokenize
 import numpy as np
 from starlette.middleware.sessions import SessionMiddleware
 from PIL import Image, ImageDraw, ImageFont
 
-from llm_tools import call_with_required_tool
+from llm_tools import call_with_required_tool, create_with_optional_thinking, is_thinking_unsupported_error
 
 app = FastAPI()
 app.add_middleware(
@@ -202,6 +203,12 @@ IMAGE_ANSWER_DISCLAIMER = (
 )
 
 # ---------- โหลดโมเดล ----------
+# ตั้งจำนวน thread ของ torch "ก่อน" โหลดโมเดลเสมอ (เปลี่ยนทีหลังไม่มีผลกับ thread pool ที่สร้างไปแล้ว) ค่าเริ่มต้น
+# = จำนวน core ของเครื่อง (os.cpu_count()) ตั้งผ่าน env ได้เผื่อ container จำกัด core ไว้น้อยกว่าที่ torch เห็น
+TORCH_NUM_THREADS = int(os.environ.get("TORCH_NUM_THREADS", str(os.cpu_count() or 1)))
+torch.set_num_threads(TORCH_NUM_THREADS)
+print(f"[Torch] threads={TORCH_NUM_THREADS} cpu_count={os.cpu_count()}")
+
 print("กำลังโหลดโมเดล...")
 embed_model = SentenceTransformer('intfloat/multilingual-e5-large')
 reranker = CrossEncoder('cross-encoder/mmarco-mMiniLMv2-L12-H384-v1')
@@ -216,9 +223,13 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "1234")
 # แม่นยำกว่าในคำตอบยาวๆ ที่ผสมผลค้นเว็บหลายแหล่ง (เหตุการณ์จริงที่แก้: Haiku เขียนภาษาไทยเพี้ยนในคำตอบยาว เช่น
 # "ขออบรรจุรายการ"/"หนึ่งพัฒนาการคำเทคนิก") ตั้งค่าผ่าน env ได้ (ไม่ hardcode ตายตัว เผื่อ API key นี้ยังเข้าถึง
 # รุ่นนี้ไม่ได้ หรือ Anthropic ออกรุ่นใหม่กว่านี้ภายหลัง) ค่าเริ่มต้นเป็น Claude API ID ของ Sonnet รุ่นล่าสุด ณ
-# ตอนเขียน (claude-sonnet-5-5 — ดู platform.claude.com/docs/en/about-claude/models/all-models) เส้นทางอื่น
-# ทั้งหมด (legal RAG/classifier ต่างๆ) ยังใช้ Haiku เหมือนเดิมทุกจุด ไม่เปลี่ยน
+# ตอนเขียน (claude-sonnet-5-5 — ดู platform.claude.com/docs/en/about-claude/models/all-models)
 ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-5-5")
+
+# เส้นทางกฎหมาย (rag_answer/rag_answer_stream) เดิมไม่ส่ง model เข้า run_agentic_tool_loop เลย เลยได้ Haiku
+# เริ่มต้นเสมอ ทั้งที่อยากได้ความแม่นยำแบบเดียวกับ advisor — ค่าเริ่มต้นอิง ADVISOR_MODEL ที่ resolve แล้ว (ไม่ใช่
+# "claude-sonnet-5-5" ตรงๆ) เพื่อให้แก้ ADVISOR_MODEL ที่เดียวกระทบทั้งคู่ถ้าไม่ได้ตั้ง LEGAL_ANSWER_MODEL แยกไว้
+LEGAL_ANSWER_MODEL = os.environ.get("LEGAL_ANSWER_MODEL", ADVISOR_MODEL)
 
 # feat/llm-intent-router: "llm" (ค่าเริ่มต้น) = ask_question() เรียก route_intent_with_llm ตัวเดียวตัดสิน intent
 # ทั้งหมดแทนด่านคำสำคัญซ้อนกันหลายชั้นเดิม (_is_document_reading_question/_looks_like_library_query/
@@ -3587,11 +3598,14 @@ MAX_PAUSE_TURNS = 5  # จำนวนรอบ pause_turn ติดกันส
 def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
     tools_override: Optional[list] = None, model: Optional[str] = None, max_iterations: Optional[int] = None,
-    max_tokens: Optional[int] = None,
+    max_tokens: Optional[int] = None, thinking: Optional[dict] = None,
 ) -> tuple[str, list[str], bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
-    - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL — ต้องการเหตุผล/
-      ภาษาไทยที่แม่นยำกว่าในคำตอบยาวๆ ที่ผสมผลค้นเว็บหลายแหล่ง) เส้นทางอื่นทั้งหมดไม่ระบุมา ใช้ Haiku เหมือนเดิม
+    - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL, rag_answer — ดู
+      LEGAL_ANSWER_MODEL — ต้องการเหตุผล/ภาษาไทยที่แม่นยำกว่าในคำตอบยาวๆ) เส้นทางอื่นทั้งหมดไม่ระบุมา ใช้ Haiku เหมือนเดิม
+    - thinking: ถ้าระบุมา ส่งต่อให้ client.messages.create ของรอบหลักของ loop เท่านั้น (ดู
+      llm_tools.create_with_optional_thinking — โมเดลไม่รองรับรูปแบบนี้ก็ถอยให้เองอัตโนมัติ) ไม่ระบุมาไม่กระทบ
+      เส้นทางเดิมเลย (None เสมอสำหรับ caller ที่ไม่ได้แก้)
     - tools_override: ถ้าระบุมา ใช้ชุดนี้แทนการประกอบ AVAILABLE_TOOLS+LIBRARY_TOOLS+CHAT_DOCUMENT_TOOLS ตามปกติ
       ทั้งหมด (ใช้โดย advisor_answer — ดู ADVISOR_TOOLS — ให้เครื่องมือเฉพาะ web_search ทั่วไปเท่านั้น ไม่มี
       เครื่องมือแก้ไฟล์/คลังเอกสารเลยในเส้นทางนี้) dispatcher ของแต่ละ tool ด้านล่างยังคงเช็คชื่อ tool ตามปกติ
@@ -3699,7 +3713,8 @@ def run_agentic_tool_loop(
                 break
         continuing_pause = False
 
-        response = client.messages.create(
+        response = create_with_optional_thinking(
+            client, thinking,
             model=model or "claude-haiku-4-5-20251001",
             max_tokens=effective_max_tokens,  # เดิม 2500 คงที่ — advisor ส่ง ADVISOR_MAX_TOKENS=8000 แทน (ดู docstring)
             system=system_prompt,
@@ -4716,7 +4731,8 @@ def rag_answer(
     structural_tool_called = False
     for attempt in range(1, MAX_ANSWER_RETRIES + 2):  # ลองครั้งแรก + retry อีก MAX_ANSWER_RETRIES ครั้ง
         raw_answer, action_receipts, structural_tool_called = run_agentic_tool_loop(
-            ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id
+            ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id,
+            model=LEGAL_ANSWER_MODEL, thinking={"type": "between_tools"},
         )
 
         if not contains_unexpected_script(raw_answer):
@@ -5242,15 +5258,29 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
         return
 
     full_answer = ""
-    with client.messages.stream(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
-        system=ctx["system_prompt"],
-        messages=ctx["messages"],
-    ) as stream:
-        for text_chunk in stream.text_stream:
-            full_answer += text_chunk
-            yield {"type": "delta", "text": text_chunk}
+    try:
+        with client.messages.stream(
+            model=LEGAL_ANSWER_MODEL,
+            max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
+            system=ctx["system_prompt"],
+            messages=ctx["messages"],
+            thinking={"type": "between_tools"},  # ปิด thinking ชัดเจน — เหตุผลเดียวกับ legal_docs._MEMO_THINKING
+        ) as stream:
+            for text_chunk in stream.text_stream:
+                full_answer += text_chunk
+                yield {"type": "delta", "text": text_chunk}
+    except Exception as e:
+        if not is_thinking_unsupported_error(e):
+            raise
+        # โมเดลนี้ไม่รองรับรูปแบบ thinking นี้ (เช่น rollback ผ่าน env ไปโมเดลรุ่นเก่า) — เรียกซ้ำแบบไม่ส่ง thinking
+        print(f"[LLM] thinking_unsupported_fallback model={LEGAL_ANSWER_MODEL}")
+        full_answer = ""
+        with client.messages.stream(
+            model=LEGAL_ANSWER_MODEL, max_tokens=2500, system=ctx["system_prompt"], messages=ctx["messages"],
+        ) as stream:
+            for text_chunk in stream.text_stream:
+                full_answer += text_chunk
+                yield {"type": "delta", "text": text_chunk}
 
     full_answer = full_answer.strip()
     _log_if_low_confidence(query, full_answer, ctx["top_chunks"], ctx["scores"])
@@ -6582,10 +6612,26 @@ def close_chat_document_endpoint(chat_id: int, document_id: int, user_id: int = 
         raise HTTPException(status_code=404, detail="ไม่พบแชทนี้")
     return close_chat_document(document_id, user_id, chat_id)
 
+def _warmup_models() -> None:
+    """encode/predict 1 ครั้งก่อนรับ request จริง (คำขอค้น KB แรกสุดหลัง deploy ช้าผิดปกติเพราะ CPU ยังไม่ได้ warm
+    ขึ้น weight เข้า cache) ไม่ให้ error ตรงนี้ทำให้ startup ทั้งระบบล้ม"""
+    try:
+        t0 = time.monotonic()
+        embed_model.encode("warmup")
+        embed_ms = int((time.monotonic() - t0) * 1000)
+        t0 = time.monotonic()
+        reranker.predict([("warmup query", "warmup passage")])
+        rerank_ms = int((time.monotonic() - t0) * 1000)
+        print(f"[Warmup] embed_ms={embed_ms} rerank_ms={rerank_ms}")
+    except Exception as e:
+        print(f"[Warmup] failed exception_type={type(e).__name__}")
+
+
 # ---------- Startup Event ----------
 @app.on_event("startup")
 async def startup_event():
     init_db()       # สร้างตาราง knowledge_base และ logs ถ้ายังไม่มี (รวม library_search_index ด้วย)
+    _warmup_models()  # ก่อน rebuild_index() เสมอ — กันคำค้นจริงครั้งแรกสุดช้าผิดปกติจาก cold start ของ CPU
     rebuild_index()  # โหลด knowledge base จาก DB + build BM25/vector index
     # บัตรค้นหาคลังเอกสาร (ดู build_library_search_card/search_library) — รันใน background thread แยกต่างหาก
     # ไม่บล็อก startup เลย (ต่างจาก backfill_missing_embeddings ของ KB กฎหมายด้านบนที่บล็อก เพราะ KB ต้องพร้อม
