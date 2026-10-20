@@ -25,6 +25,18 @@ def thai_date(d: datetime.date | None = None) -> str:
     return f"{d.day} {_THAI_MONTHS[d.month - 1]} พ.ศ. {d.year + 543}"
 
 
+def _set_thai_lang(rpr) -> None:
+    """ตั้ง w:lang เป็น th-TH ทุกแกน (val/eastAsia/bidi) — Word ใช้ค่านี้ตัดสินกฎการตัดคำ/ขึ้นบรรทัดใหม่ของไทย
+    ค่า default ของ python-docx (en-US/ar-SA) ไม่รู้จักกฎนี้ ทำให้ตัดคำกลางคำได้ (เหตุการณ์จริงที่แก้)"""
+    old = rpr.find(qn("w:lang"))
+    if old is not None:
+        rpr.remove(old)
+    lang = OxmlElement("w:lang")
+    for attr in ("w:val", "w:eastAsia", "w:bidi"):
+        lang.set(qn(attr), "th-TH")
+    rpr.append(lang)
+
+
 def _font(run, size=BODY_PT, bold=False):
     run.font.name = FONT_NAME
     run.font.size = Pt(size)
@@ -45,9 +57,10 @@ def _font(run, size=BODY_PT, bold=False):
     rpr.append(szcs)
     if bold:
         rpr.append(OxmlElement("w:bCs"))
+    _set_thai_lang(rpr)
 
 
-def _para(doc, text="", *, size=BODY_PT, bold=False, align=WD_ALIGN_PARAGRAPH.THAI_JUSTIFY,
+def _para(doc, text="", *, size=BODY_PT, bold=False, align=WD_ALIGN_PARAGRAPH.LEFT,
           left_cm=0.0, first_cm=0.0, before=0, after=0):
     p = doc.add_paragraph()
     p.alignment = align
@@ -130,6 +143,7 @@ def build_memo_docx(slots: dict, rendered: dict, used_chunks: list[dict]) -> byt
     normal = doc.styles["Normal"]
     normal.font.name = FONT_NAME
     normal.font.size = Pt(BODY_PT)
+    _set_thai_lang(normal.element.get_or_add_rPr())
     _page_number_footer(sec)
 
     _para(doc, "บันทึกความเห็นทางกฎหมายเบื้องต้น", size=TITLE_PT, bold=True, align=WD_ALIGN_PARAGRAPH.CENTER)
@@ -179,9 +193,9 @@ def build_memo_docx(slots: dict, rendered: dict, used_chunks: list[dict]) -> byt
             tag_part = f" หมวด {tags}" if tags else ""
             p = _para(doc, left_cm=1.0, first_cm=-1.0, after=2)
             p.paragraph_format.tab_stops.add_tab_stop(Cm(1.0), WD_TAB_ALIGNMENT.LEFT)
-            _font(p.add_run(f"[{n}]\tฐานความรู้ ThaiMeSook รายการที่ {chunk['id']}{tag_part}: {first_line}"))
+            _font(p.add_run(f"[{n}]\tฐานข้อมูลกฎหมาย ThaiMeSook รายการที่ {chunk['id']}{tag_part}: {first_line}"))
     else:
-        _para(doc, "ไม่มีการอ้างอิงจากฐานความรู้ของระบบ", first_cm=1.25)
+        _para(doc, "ไม่มีการอ้างอิงจากฐานข้อมูลกฎหมายของระบบ", first_cm=1.25)
     _para(doc, "ข้อความที่ไม่มีเลขอ้างอิงกำกับ เรียบเรียงจากความรู้ทั่วไปทางกฎหมาย", size=14, first_cm=1.25, before=4)
 
     _para(doc, "ผู้จัดทำร่าง  ThaiMeSook", align=WD_ALIGN_PARAGRAPH.RIGHT, before=24)
