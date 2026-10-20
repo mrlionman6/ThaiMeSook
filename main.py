@@ -163,6 +163,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from PIL import Image, ImageDraw, ImageFont
 
 from llm_tools import call_with_required_tool, create_with_optional_thinking, is_thinking_unsupported_error
+from answer_truncate import truncate_to_last_complete_paragraph
 
 app = FastAPI()
 app.add_middleware(
@@ -230,6 +231,8 @@ ADVISOR_MODEL = os.environ.get("ADVISOR_MODEL", "claude-sonnet-5-5")
 # เริ่มต้นเสมอ ทั้งที่อยากได้ความแม่นยำแบบเดียวกับ advisor — ค่าเริ่มต้นอิง ADVISOR_MODEL ที่ resolve แล้ว (ไม่ใช่
 # "claude-sonnet-5-5" ตรงๆ) เพื่อให้แก้ ADVISOR_MODEL ที่เดียวกระทบทั้งคู่ถ้าไม่ได้ตั้ง LEGAL_ANSWER_MODEL แยกไว้
 LEGAL_ANSWER_MODEL = os.environ.get("LEGAL_ANSWER_MODEL", ADVISOR_MODEL)
+# เดิม 2500 คงที่ — คำถามกฎหมายยาว/วิเคราะห์หลายประเด็นชน max_tokens กลางคันจนคำตอบขาด (เหตุการณ์จริงที่แก้)
+LEGAL_ANSWER_MAX_TOKENS = int(os.environ.get("LEGAL_ANSWER_MAX_TOKENS", "6000"))
 
 # feat/llm-intent-router: "llm" (ค่าเริ่มต้น) = ask_question() เรียก route_intent_with_llm ตัวเดียวตัดสิน intent
 # ทั้งหมดแทนด่านคำสำคัญซ้อนกันหลายชั้นเดิม (_is_document_reading_question/_looks_like_library_query/
@@ -3588,7 +3591,7 @@ def _build_final_answer_with_citations(content_blocks: list) -> str:
     if not citations:
         return final_text
 
-    source_lines = [f"{i}. {title} — [ลิงก์]({url})" for i, (title, url) in enumerate(citations, start=1)]
+    source_lines = [f"{i}. {title}: [ลิงก์]({url})" for i, (title, url) in enumerate(citations, start=1)]
     return final_text + "\n\nแหล่งที่มา:\n" + "\n".join(source_lines)
 
 
@@ -3599,7 +3602,7 @@ def run_agentic_tool_loop(
     system_prompt: str, initial_messages: list, user_id: Optional[int] = None, chat_id: Optional[int] = None,
     tools_override: Optional[list] = None, model: Optional[str] = None, max_iterations: Optional[int] = None,
     max_tokens: Optional[int] = None, thinking: Optional[dict] = None,
-) -> tuple[str, list[str], bool]:
+) -> tuple[str, list[str], bool, bool]:
     """Agentic loop จริง — Claude ตัดสินใจเองว่าจะเรียก tool ไหน:
     - model: ถ้าระบุมา ใช้โมเดลนี้แทน Haiku เริ่มต้น (ใช้โดย advisor_answer — ดู ADVISOR_MODEL, rag_answer — ดู
       LEGAL_ANSWER_MODEL — ต้องการเหตุผล/ภาษาไทยที่แม่นยำกว่าในคำตอบยาวๆ) เส้นทางอื่นทั้งหมดไม่ระบุมา ใช้ Haiku เหมือนเดิม
@@ -3638,7 +3641,8 @@ def run_agentic_tool_loop(
     (ถ้ามี verified_source_urls อย่างน้อย 1 อัน) หรือสรุปเป็นข้อความธรรมดาแทน (ถ้าไม่มี url ที่ยืนยันได้เลย) ก่อนจะ
     ยอมใช้ข้อความ fallback "งานนี้มีหลายขั้นเกินไป" เป็นทางเลือกสุดท้ายจริงๆ
 
-    คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด, มี structural tool ถูกเรียกในเทิร์นนี้ไหม) เสมอ — รายการใบยืนยัน
+    คืน (ข้อความคำตอบ, รายการใบยืนยันจากโค้ด, มี structural tool ถูกเรียกในเทิร์นนี้ไหม, ชน stop_reason==
+    "max_tokens" ในรอบสุดท้ายไหม — ดู answer_truncate.truncate_to_last_complete_paragraph) เสมอ — รายการใบยืนยัน
     มาจาก _build_action_receipt() เฉพาะ tool ที่เปลี่ยนข้อมูลจริง (open_library_file, select_list_item ตอนเปิด
     ไฟล์, edit_chat_document, close_chat_document, undo_last_edit, change_rate/update_table_item/
     delete_table_item/add_table_item ตอนล้มเหลว — สำเร็จไม่ออกใบยืนยันแยก เพราะกลายเป็นคำตอบสุดท้ายเองอยู่แล้ว
@@ -3704,6 +3708,7 @@ def run_agentic_tool_loop(
     iteration = 0
     pause_count = 0
     hit_iteration_limit = False
+    hit_max_tokens = False
     continuing_pause = False
     while True:
         if not continuing_pause:
@@ -3780,6 +3785,7 @@ def run_agentic_tool_loop(
             hit_iteration_limit = True  # ไม่ใช่ iteration limit เป๊ะๆ แต่ทริกเกอร์ fallback เดียวกัน (บังคับเรียก
             # present_recommendations ด้านล่างแม้ final_text_so_far จะไม่ว่างเปล่าก็ตาม — ข้อความที่มีอยู่เป็นแค่
             # ส่วนเกณฑ์ก่อนหน้า tool_use ที่ถูกตัดทิ้ง ไม่ใช่คำตอบที่สมบูรณ์)
+            hit_max_tokens = True
             break
 
         if response.stop_reason != "tool_use":
@@ -4053,17 +4059,17 @@ def run_agentic_tool_loop(
     if applied_messages:
         # มี tool แก้โครงสร้างไฟล์สำเร็จในเทิร์นนี้ (หรือ present_recommendations ถูกบังคับเรียกสำเร็จ) — ใช้
         # ข้อความผลลัพธ์จากโค้ดตรงๆ เป็นคำตอบสุดท้ายเสมอ ไม่ให้ Claude เรียบเรียง/แต่งคำตอบของตัวเองทับเด็ดขาด
-        return "\n\n".join(applied_messages), action_receipts, structural_tool_called
+        return "\n\n".join(applied_messages), action_receipts, structural_tool_called, hit_max_tokens
 
     final_text = _build_final_answer_with_citations(paused_content_blocks + (response.content if response is not None else []))
     if not final_text:
         # เผื่อกรณีอื่นที่ข้อความว่างเปล่าโดยไม่คาดคิด (เช่น Claude ตอบจบแล้วจริงแต่ไม่มี text block เลย)
         # ไม่ปล่อยให้ข้อความว่างเปล่าไปโผล่ในแชทผู้ใช้เด็ดขาด
-        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called
+        return "งานนี้มีหลายขั้นเกินไป ลองแบ่งเป็นคำสั่งสั้นลงครับ", action_receipts, structural_tool_called, hit_max_tokens
 
     # final_text อาจมีบรรทัด "✓"/"✗" ที่ Claude เลียนแบบใบยืนยันของโค้ดแล้วแต่งขึ้นเอง — การตัดทิ้ง/ตัดสินใจย้ายไปที่
     # rag_answer/advisor_answer (answer_guard.truth_guard) ทั้งหมดแล้ว ส่ง final_text ดิบไปตรงๆ
-    return final_text, action_receipts, structural_tool_called
+    return final_text, action_receipts, structural_tool_called, hit_max_tokens
 
 
 # ---------- ระยะ 3: AI Agent สำหรับจัดการ KB (เสนอ tag / ยุบรวม chunk) ----------
@@ -4513,6 +4519,9 @@ def _prepare_rag_context(query, history, image_data, user_id=None, chat_id=None,
         "(เช่น สัญญาบริการ, ข้อเสนอราคา, เอกสารโครงการ)\n"
         + legal_prompt_block +
         "- ตอบด้วยโทนทางการ แม่นยำ เหมาะกับนักลงทุน/ผู้ประกอบการ ไม่ใช่โทนเป็นกันเองแบบพูดกับประชาชนทั่วไป\n"
+        "- ตอบเป็นย่อหน้าธรรมดา ใช้เลขข้อ (1. 2. 3.) สำหรับรายการ ตอบกระชับ ห้ามใช้หัวข้อ Markdown (#), ตาราง "
+        "(|...|), blockquote (>), หรือ em dash (—) เด็ดขาด (ยกเว้นตาราง markdown จากเครื่องมือ compare_chat_"
+        "documents ตามกติกาด้านล่างที่ยังต้องแสดงเป็นตารางเหมือนเดิม)\n"
         # เดิม: "ใช้คำลงท้ายประโยคว่า \"ครับ\" เท่านั้นเสมอ ห้ามใช้ \"ค่ะ\" หรือเขียน \"ครับ/ค่ะ\" คู่กันเด็ดขาด"
         # แก้เป็นข้อนี้แทน — เคยเจอ Claude ใส่ "ครับ" ท้ายทุกย่อหน้า/เป็นบรรทัดเดี่ยวทั้งที่ยังไม่จบคำตอบ
         "- ใช้คำลงท้าย \"ครับ\" แค่ท้ายคำตอบทั้งหมดครั้งเดียวเท่านั้น ห้ามใส่ \"ครับ\" ท้ายทุกย่อหน้าหรือเป็น "
@@ -4729,10 +4738,11 @@ def rag_answer(
     raw_answer = ""
     action_receipts: list[str] = []
     structural_tool_called = False
+    hit_max_tokens = False
     for attempt in range(1, MAX_ANSWER_RETRIES + 2):  # ลองครั้งแรก + retry อีก MAX_ANSWER_RETRIES ครั้ง
-        raw_answer, action_receipts, structural_tool_called = run_agentic_tool_loop(
+        raw_answer, action_receipts, structural_tool_called, hit_max_tokens = run_agentic_tool_loop(
             ctx["system_prompt"], ctx["messages"], user_id=user_id, chat_id=chat_id,
-            model=LEGAL_ANSWER_MODEL, thinking={"type": "between_tools"},
+            model=LEGAL_ANSWER_MODEL, thinking={"type": "between_tools"}, max_tokens=LEGAL_ANSWER_MAX_TOKENS,
         )
 
         if not contains_unexpected_script(raw_answer):
@@ -4740,6 +4750,9 @@ def rag_answer(
         print(f"[LanguageGuard] เจอภาษาแปลกปลอมในคำตอบ (ครั้งที่ {attempt}) — กำลังลองใหม่")
     else:
         print("[LanguageGuard] ลองใหม่ครบจำนวนแล้วแต่ยังเจอปัญหา — ส่งคำตอบล่าสุดกลับไปทั้งที่ยังมีปัญหา")
+
+    if hit_max_tokens:
+        raw_answer = truncate_to_last_complete_paragraph(raw_answer, source="rag_answer")
 
     # ห้าม Claude "แต่ง" ผลการแก้ไฟล์เอง — structural_route ไม่มี tool ถูกเรียกเลย ใช้ข้อความคงที่ ไม่งั้นเทียบ
     # version จริงของเอกสารก่อน/หลังเทิร์นแทนการเดาจากคำพูด (ดู answer_guard.truth_guard)
@@ -5216,7 +5229,7 @@ def advisor_answer(
     version_before = snapshot_document_versions(active_docs)
     if edit_intent is None:
         edit_intent = _resolve_fallback_edit_intent(query, active_docs, chat_id, user_id)
-    raw_answer, action_receipts, _structural = run_agentic_tool_loop(
+    raw_answer, action_receipts, _structural, _hit_max_tokens = run_agentic_tool_loop(
         _advisor_system_prompt(document_context), messages, user_id=user_id, chat_id=chat_id,
         tools_override=advisor_tools, model=ADVISOR_MODEL, max_iterations=ADVISOR_MAX_TOOL_ITERATIONS,
         max_tokens=ADVISOR_MAX_TOKENS,
@@ -5258,10 +5271,11 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
         return
 
     full_answer = ""
+    hit_max_tokens = False
     try:
         with client.messages.stream(
             model=LEGAL_ANSWER_MODEL,
-            max_tokens=2500,  # เดิม 1500 — เหตุผลเดียวกับ run_agentic_tool_loop
+            max_tokens=LEGAL_ANSWER_MAX_TOKENS,  # เดิม 2500 คงที่ — เหตุผลเดียวกับ run_agentic_tool_loop
             system=ctx["system_prompt"],
             messages=ctx["messages"],
             thinking={"type": "between_tools"},  # ปิด thinking ชัดเจน — เหตุผลเดียวกับ legal_docs._MEMO_THINKING
@@ -5269,6 +5283,7 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
             for text_chunk in stream.text_stream:
                 full_answer += text_chunk
                 yield {"type": "delta", "text": text_chunk}
+            hit_max_tokens = stream.get_final_message().stop_reason == "max_tokens"
     except Exception as e:
         if not is_thinking_unsupported_error(e):
             raise
@@ -5276,13 +5291,18 @@ def rag_answer_stream(query, history=None, image_data=None, user_id=None):
         print(f"[LLM] thinking_unsupported_fallback model={LEGAL_ANSWER_MODEL}")
         full_answer = ""
         with client.messages.stream(
-            model=LEGAL_ANSWER_MODEL, max_tokens=2500, system=ctx["system_prompt"], messages=ctx["messages"],
+            model=LEGAL_ANSWER_MODEL, max_tokens=LEGAL_ANSWER_MAX_TOKENS,
+            system=ctx["system_prompt"], messages=ctx["messages"],
         ) as stream:
             for text_chunk in stream.text_stream:
                 full_answer += text_chunk
                 yield {"type": "delta", "text": text_chunk}
+            hit_max_tokens = stream.get_final_message().stop_reason == "max_tokens"
 
     full_answer = full_answer.strip()
+    if hit_max_tokens:
+        # ย้อนแก้ delta ที่ yield ไปแล้วบนจอไม่ได้ (ดู docstring) แต่ full_answer ที่บันทึกลงประวัติแชทยังตัดได้
+        full_answer = truncate_to_last_complete_paragraph(full_answer, source="rag_answer_stream")
     _log_if_low_confidence(query, full_answer, ctx["top_chunks"], ctx["scores"])
     # ทำความสะอาดคำลงท้ายแบบเดียวกับ rag_answer() (ดู _normalize_polite_particles) — ใช้ได้แค่บางส่วนในเส้นทาง
     # นี้เท่านั้น: full_answer ที่คืนตรงนี้คือสิ่งที่ถูกบันทึกลงประวัติแชทจริง (ask_question_stream เรียก

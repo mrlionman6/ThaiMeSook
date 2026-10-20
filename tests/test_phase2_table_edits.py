@@ -843,12 +843,47 @@ def test_rag_answer_allows_structural_route_when_tool_called(ns):
     assert "ยืนยัน" in answer  # ข้อความจริงจาก tool (จำลองผ่าน fake loop) ไม่ถูก block
 
 
-def test_rag_answer_does_not_override_default_max_tokens(ns):
-    """เส้นทางอื่น (ไม่ใช่ advisor) ต้องไม่ส่ง max_tokens เข้า run_agentic_tool_loop เลย — ปล่อยให้ใช้ค่าเริ่มต้น
-    2500 เหมือนเดิม (ดู ADVISOR_MAX_TOKENS ที่เฉพาะ advisor_answer เท่านั้นที่ส่งมา)"""
+def test_rag_answer_sends_legal_answer_max_tokens(ns):
+    """rag_answer ต้องส่ง LEGAL_ANSWER_MAX_TOKENS เข้า run_agentic_tool_loop เสมอ (ไม่ใช่ปล่อย None ให้ใช้ 2500
+    คงที่เหมือนเดิม — เหตุการณ์จริงที่แก้: คำตอบกฎหมายยาวขาดกลางคัน ดู round2-p0 ข้อ 1)"""
     ns["_fake_agentic_loop"].set_response("คำตอบปกติ", [], False)
     ns["rag_answer"]("มาตรา 10 พ.ร.บ.การประกอบธุรกิจของคนต่างด้าวว่าอย่างไร", user_id=1, chat_id=1)
-    assert ns["_fake_agentic_loop"].last_call_args["max_tokens"] is None
+    assert ns["_fake_agentic_loop"].last_call_args["max_tokens"] == ns["LEGAL_ANSWER_MAX_TOKENS"]
+
+
+def test_rag_answer_truncates_answer_on_max_tokens(ns):
+    """hit_max_tokens=True จาก run_agentic_tool_loop -> rag_answer ต้องตัดย่อหน้าสุดท้ายที่ค้างกลางคันทิ้งก่อนตอบ
+    (เหตุการณ์จริงที่แก้: คำตอบกฎหมายยาวขาดกลางคัน — ดู round2-p0 ข้อ 1)"""
+    cut_off_answer = "มาตรา 10 กำหนดหลักเกณฑ์ไว้ชัดเจนครับ\n\nส่วนย่อหน้าต่อไปนี้เขียนไม่จบกลางคำ"
+    ns["_fake_agentic_loop"].set_response(cut_off_answer, [], False, hit_max_tokens=True)
+    answer, _sources = ns["rag_answer"]("คำถามยาว", user_id=1, chat_id=1)
+    assert "ย่อหน้าต่อไปนี้เขียนไม่จบกลางคำ" not in answer
+    assert "มาตรา 10 กำหนดหลักเกณฑ์ไว้ชัดเจนครับ" in answer
+
+
+def test_rag_answer_keeps_full_answer_when_max_tokens_not_hit(ns):
+    full_answer = "มาตรา 10 กำหนดหลักเกณฑ์ไว้ชัดเจนครับ\n\nส่วนย่อหน้าต่อไปนี้เขียนไม่จบกลางคำ"
+    ns["_fake_agentic_loop"].set_response(full_answer, [], False, hit_max_tokens=False)
+    answer, _sources = ns["rag_answer"]("คำถามยาว", user_id=1, chat_id=1)
+    assert "ย่อหน้าต่อไปนี้เขียนไม่จบกลางคำ" in answer
+
+
+def test_truncate_to_last_complete_paragraph_drops_incomplete_last_paragraph(ns):
+    truncate = ns["truncate_to_last_complete_paragraph"]
+    text = "ย่อหน้าแรกจบประโยคแล้ว.\n\nย่อหน้าที่สองเขียนไม่จบกลางคำ"
+    assert truncate(text) == "ย่อหน้าแรกจบประโยคแล้ว."
+
+
+def test_truncate_to_last_complete_paragraph_keeps_text_ending_politely(ns):
+    truncate = ns["truncate_to_last_complete_paragraph"]
+    text = "ย่อหน้าแรก\n\nย่อหน้าที่สองจบด้วยคำลงท้ายครับ"
+    assert truncate(text) == text
+
+
+def test_truncate_to_last_complete_paragraph_single_paragraph_returns_unchanged(ns):
+    truncate = ns["truncate_to_last_complete_paragraph"]
+    text = "ย่อหน้าเดียวไม่มีตัวแบ่ง ไม่จบประโยคชัดเจน"
+    assert truncate(text) == text
 
 
 def test_rag_answer_blocks_fabricated_edit_claim_without_receipts(ns, doc1):
@@ -1123,12 +1158,12 @@ def test_build_final_answer_with_citations_joins_text_blocks_without_breaking_se
     assert body == "กล้องรุ่น A ราคาประมาณ 1,500 บาท ตามที่ประกาศไว้ และยังมีอีกร้านที่เสนอราคา 1,450 บาท"
     assert "\n\n" not in body
 
-    # citation ตัดซ้ำตาม url (https://a.com เจอ 2 ครั้งแต่นับครั้งเดียว) ไม่เกิน 5 แหล่ง รูปแบบ "N. <title> —
-    # [ลิงก์](<url>)" (markdown link ไม่ใช่ URL ดิบ — ดู _build_final_answer_with_citations)
+    # citation ตัดซ้ำตาม url (https://a.com เจอ 2 ครั้งแต่นับครั้งเดียว) ไม่เกิน 5 แหล่ง รูปแบบ "N. <title>:
+    # [ลิงก์](<url>)" (markdown link ไม่ใช่ URL ดิบ ใช้ ":" ไม่ใช่ em dash — ดู _build_final_answer_with_citations)
     assert text.count("แหล่งที่มา:") == 1
-    assert "1. ร้าน A — [ลิงก์](https://a.com)" in text
-    assert "2. ร้าน B — [ลิงก์](https://b.com)" in text
-    assert text.count("ร้าน A —") == 1
+    assert "1. ร้าน A: [ลิงก์](https://a.com)" in text
+    assert "2. ร้าน B: [ลิงก์](https://b.com)" in text
+    assert text.count("ร้าน A:") == 1
 
 
 def test_build_final_answer_with_citations_caps_at_five_sources(ns):
@@ -1165,13 +1200,13 @@ def test_run_agentic_tool_loop_continues_after_pause_turn_then_ends_on_second_ca
             stop_reason="end_turn",
         ),
     ]
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำกล้องหน่อย"}],
         user_id=None, chat_id=None, tools_override=[],
     )
     assert answer.startswith("ส่วนแรก ส่วนหลัง")
-    assert "แหล่ง A — [ลิงก์](https://a.com)" in answer
-    assert "แหล่ง B — [ลิงก์](https://b.com)" in answer
+    assert "แหล่ง A: [ลิงก์](https://a.com)" in answer
+    assert "แหล่ง B: [ลิงก์](https://b.com)" in answer
     assert fake_client.call_count == 2
     assert receipts == []
     assert structural is False
@@ -1226,7 +1261,7 @@ def test_run_agentic_tool_loop_present_recommendations_filters_unverified_source
         _FakeAgenticResponse([_FakeAgenticTextBlock("จบ")], stop_reason="end_turn"),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำกล้องหน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1282,7 +1317,7 @@ def test_run_agentic_tool_loop_forces_present_recommendations_when_ends_empty_af
         ),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1326,7 +1361,7 @@ def test_run_agentic_tool_loop_forces_present_recommendations_when_hitting_max_i
         ),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"], max_iterations=2,
     )
@@ -1351,7 +1386,7 @@ def test_run_agentic_tool_loop_falls_back_to_plain_summary_when_no_verified_url(
         _FakeAgenticResponse([_FakeAgenticTextBlock("สรุปจากข้อมูลที่มีครับ ยังไม่มีราคาที่ยืนยันได้ชัดเจน")], stop_reason="end_turn"),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1377,7 +1412,7 @@ def test_run_agentic_tool_loop_forced_calls_survive_exception_and_fall_back_grac
     ]
     fake_client.raise_on_create = RuntimeError("simulated API failure")
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1412,7 +1447,7 @@ def test_run_agentic_tool_loop_forces_present_recommendations_when_hitting_max_t
         ),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1464,7 +1499,7 @@ def test_run_agentic_tool_loop_max_tokens_drops_whole_assistant_message_when_emp
         ),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=1, chat_id=1, tools_override=ns["ADVISOR_TOOLS"],
     )
@@ -1490,7 +1525,7 @@ def test_run_agentic_tool_loop_pause_turn_three_times_does_not_consume_iteration
         _FakeAgenticResponse([_FakeAgenticTextBlock("ส่วนสุดท้าย")], stop_reason="end_turn"),
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=None, chat_id=None, tools_override=[], max_iterations=1,
     )
@@ -1511,7 +1546,7 @@ def test_run_agentic_tool_loop_gives_up_after_too_many_pause_turns(ns):
         for i in range(max_pause + 1)
     ]
 
-    answer, receipts, structural = real_loop(
+    answer, receipts, structural, _hit_max_tokens = real_loop(
         "system prompt ทดสอบ", [{"role": "user", "content": "แนะนำ Rack case หน่อย"}],
         user_id=None, chat_id=None, tools_override=[],
     )

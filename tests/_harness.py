@@ -37,6 +37,7 @@ MAIN_PY = Path(__file__).parent.parent / "main.py"
 DB_PY = Path(__file__).parent.parent / "db.py"
 DOCUMENT_FIELDS_PY = Path(__file__).parent.parent / "document_fields.py"
 LLM_TOOLS_PY = Path(__file__).parent.parent / "llm_tools.py"
+ANSWER_TRUNCATE_PY = Path(__file__).parent.parent / "answer_truncate.py"
 ANSWER_GUARD_PY = Path(__file__).parent.parent / "answer_guard.py"
 COMPOUND_EDITS_PY = Path(__file__).parent.parent / "compound_edits.py"
 MULTI_DOCS_PY = Path(__file__).parent.parent / "multi_docs.py"
@@ -149,7 +150,7 @@ WANTED_MAIN_CONSTS = {
     "_STRUCTURAL_NO_TOOL_FALLBACK_MESSAGE",
     "_FABRICATED_EDIT_CLAIM_RE", "_FABRICATED_EDIT_CLAIM_STRUCTURAL_ONLY_PATTERNS",
     "_FABRICATED_EDIT_CLAIM_GENERAL_PATTERNS", "_RECEIPT_LINE_RE",
-    "_LEGACY_MODE_LABEL_RE", "_RECEIPT_MARKER_TO_PLAIN", "LEGAL_ANSWER_MODEL",
+    "_LEGACY_MODE_LABEL_RE", "_RECEIPT_MARKER_TO_PLAIN", "LEGAL_ANSWER_MODEL", "LEGAL_ANSWER_MAX_TOKENS",
     "UNEXPECTED_SCRIPT_PATTERN", "MAX_ANSWER_RETRIES", "MAX_HISTORY_MESSAGES", "MAX_TOOL_ITERATIONS",
     "_MAX_ANSWER_CITATIONS",
     "_ADVISOR_REPLACEMENT_OFFER_LINE", "ADVISOR_TOOLS", "GENERAL_WEB_SEARCH_TOOL",
@@ -643,11 +644,13 @@ class _FakeAgenticLoop:
     แบบแยกส่วน โดยไม่ต้องเรียก Claude จริงหรือประกอบ tools list เต็มๆ (หนักเกินไปสำหรับเทสต์นี้)"""
 
     def __init__(self):
-        self.response = ("คำตอบปกติ", [], False)
+        self.response = ("คำตอบปกติ", [], False, False)
         self.last_call_args = None
 
-    def set_response(self, text: str, receipts: list, structural_tool_called: bool) -> None:
-        self.response = (text, receipts, structural_tool_called)
+    def set_response(
+        self, text: str, receipts: list, structural_tool_called: bool, hit_max_tokens: bool = False,
+    ) -> None:
+        self.response = (text, receipts, structural_tool_called, hit_max_tokens)
 
     def __call__(self, system_prompt, initial_messages, user_id=None, chat_id=None, tools_override=None, model=None,
                  max_iterations=None, max_tokens=None, thinking=None, **kwargs):
@@ -790,15 +793,17 @@ def build_namespace() -> dict:
     db_tree = ast.parse(DB_PY.read_text(encoding="utf-8"))
     document_fields_tree = ast.parse(DOCUMENT_FIELDS_PY.read_text(encoding="utf-8"))
     llm_tools_tree = ast.parse(LLM_TOOLS_PY.read_text(encoding="utf-8"))
+    answer_truncate_tree = ast.parse(ANSWER_TRUNCATE_PY.read_text(encoding="utf-8"))
     answer_guard_tree = ast.parse(ANSWER_GUARD_PY.read_text(encoding="utf-8"))
     compound_edits_tree = ast.parse(COMPOUND_EDITS_PY.read_text(encoding="utf-8"))
     multi_docs_tree = ast.parse(MULTI_DOCS_PY.read_text(encoding="utf-8"))
     _extract(main_tree, WANTED_MAIN_FUNCS, WANTED_MAIN_CONSTS, ns, "main.py")
     _extract(db_tree, WANTED_DB_FUNCS, set(), ns, "db.py")
     _extract_all(document_fields_tree, ns, "document_fields.py")
-    # llm_tools.py/answer_guard.py/compound_edits.py/multi_docs.py เหมือน document_fields.py — ดึงทั้งไฟล์ด้วย
-    # _extract_all "หลัง" main.py เสมอ
+    # llm_tools.py/answer_truncate.py/answer_guard.py/compound_edits.py/multi_docs.py เหมือน document_fields.py —
+    # ดึงทั้งไฟล์ด้วย _extract_all "หลัง" main.py เสมอ
     _extract_all(llm_tools_tree, ns, "llm_tools.py")
+    _extract_all(answer_truncate_tree, ns, "answer_truncate.py")
     _extract_all(answer_guard_tree, ns, "answer_guard.py")
     _extract_all(compound_edits_tree, ns, "compound_edits.py")
     _extract_all(multi_docs_tree, ns, "multi_docs.py")

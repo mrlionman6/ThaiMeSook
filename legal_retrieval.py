@@ -18,7 +18,8 @@ from main import get_all_tags, get_all_chunk_tags_map, get_vector_scores_for_all
 # tag ที่ cosine(query, tag) >= ค่านี้ถือว่า "เกี่ยวข้อง" กับคำถาม — ปรับได้ (ดู relevant_tag_scores)
 DEFAULT_TAG_RELEVANCE_THRESHOLD = 0.80
 # น้ำหนักคะแนนเสริมจาก tag ในสูตรรวม (ดู legal_search) — beta=0 ปิดส่วนนี้ ใช้เป็น baseline เทียบในหน้า admin
-DEFAULT_BETA = 0.15
+# TAG_BOOST_BETA=0 ปิด tag boost ทั้งระบบได้ทันทีไม่ต้อง deploy ใหม่ (ค่าเริ่มต้นเหมือนเดิมถ้าไม่ตั้ง env นี้)
+DEFAULT_BETA = float(os.environ.get("TAG_BOOST_BETA", "0.15"))
 # คะแนน rerank (CrossEncoder, raw logit ไม่ใช่ 0-1) อันดับ 1 ต่ำกว่านี้ -> สลับ system prompt เป็นโหมดความรู้ทั่วไป
 # (ไม่ใช่ปฏิเสธ) เป็นจุดเริ่มต้นคร่าวๆ ปรับจริงด้วยหน้า admin "วัดผลระบบค้นกฎหมาย"
 OUT_OF_KB_SCORE_THRESHOLD = -3.0

@@ -24,6 +24,14 @@ from main import client, get_chat_messages, save_legal_memo, ROUTER_MODEL, ADVIS
 # ไม่รองรับก็ถอยให้เองอัตโนมัติ (ดู llm_tools.create_with_optional_thinking) กัน rollback ผ่าน env ไปโมเดลรุ่นเก่าพัง
 _MEMO_THINKING = {"type": "between_tools"}
 MEMO_MAX_TOKENS = int(os.environ.get("MEMO_MAX_TOKENS", "12000"))
+# เกณฑ์ขั้นต่ำกันขยะจริงๆ เท่านั้น (ไม่ใช่ OUT_OF_KB_SCORE_THRESHOLD ที่เข้มเกินไปสำหรับเส้นทางนี้ — เหตุการณ์จริง
+# ที่แก้: chunk ที่ legal_search คืนมาจริงถูกกรองทิ้งหมดจนบันทึกไม่มี [n] อ้างอิงเลย)
+MEMO_CHUNK_SCORE_FLOOR = float(os.environ.get("MEMO_CHUNK_SCORE_FLOOR", "-8.0"))
+
+
+def _filter_grounded_chunks(results: list[dict], floor: float = MEMO_CHUNK_SCORE_FLOOR) -> list[dict]:
+    """กรอง chunk ที่คะแนน rerank ต่ำกว่า floor ทิ้ง (เกณฑ์ขั้นต่ำเท่านั้น)"""
+    return [r for r in results if r["score"] >= floor]
 
 MEMO_SLOTS_TOOL = {
     "name": "extract_memo_slots",
@@ -211,7 +219,7 @@ def _missing_slot_labels(slots: dict) -> list[str]:
     if not slots.get("key_facts"):
         labels.append("ข้อเท็จจริงสำคัญแบบละเอียด")
     if not slots.get("user_questions"):
-        labels.append("คำถามเฉพาะเจาะจงของผู้ใช้")
+        labels.append("คำถามเฉพาะเจาะจงของผู้ขอความเห็น")
     return labels
 
 
@@ -228,7 +236,11 @@ def dispatch_draft_legal_document(query: str, user_id: int, chat_id: int) -> dic
         "\n" + "\n".join(slots.get("user_questions") or []) if slots.get("user_questions") else ""
     )
     results = legal_retrieval.legal_search(search_query, k=5, rerank_top_k=5)
-    grounded_chunks = [r for r in results if r["score"] >= legal_retrieval.OUT_OF_KB_SCORE_THRESHOLD]
+    grounded_chunks = _filter_grounded_chunks(results)
+    print(
+        f"[MemoRetrieval] ids={[r['id'] for r in results]} scores={[round(r['score'], 2) for r in results]} "
+        f"passed={len(grounded_chunks)}"
+    )
     grounded_ids = {c["id"] for c in grounded_chunks}
     grounded_by_id = {c["id"]: c for c in grounded_chunks}
 

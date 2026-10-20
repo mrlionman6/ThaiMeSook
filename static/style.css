@@ -319,6 +319,8 @@ button {
 #answerBox h1, #answerBox h2, #answerBox h3 {
     margin-top: 16px;
     margin-bottom: 6px;
+    font-size: 1em;
+    font-weight: 600;
 }
 
 #answerBox p {
