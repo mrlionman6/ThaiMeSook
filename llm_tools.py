@@ -10,7 +10,10 @@ call_with_required_tool คืน (response, reason, diag) เสมอ: reason=
 หรือ JSON ที่ parse ได้ครบ schema ห่อเป็น response ปลอมหน้าตาเหมือนเดิมทุกจุดที่ caller ใช้ — .content/
 .stop_reason/.usage, diag=None) ไม่สำเร็จ response เป็น None เสมอ, reason อธิบายสาเหตุ ("no_tool_use" /
 "max_tokens" / "json_invalid") และ diag เป็น {"stop_reason","blocks","out_tokens"} ให้ caller log ละเอียดได้
-error ที่ไม่เกี่ยวกับ tool_choice (เช่น rate limit) ยัง raise ขึ้นไปเหมือนเดิมทุกประการ ไม่ถูกแปลงเป็น reason"""
+error ที่ไม่เกี่ยวกับ tool_choice (เช่น rate limit) ยัง raise ขึ้นไปเหมือนเดิมทุกประการ ไม่ถูกแปลงเป็น reason
+
+thinking (optional): ส่งต่อให้ client.messages.create ทุกจุด (ดู create_with_optional_thinking) — โมเดลไม่รองรับ
+รูปแบบที่ส่งไปก็ถอยไปเรียกแบบไม่ส่ง thinking ให้เองอัตโนมัติ ไม่ raise"""
 import json
 import re
 import types
@@ -22,6 +25,30 @@ import anthropic
 _UNSUPPORTED_TOOL_CHOICE: set[tuple[str, str]] = set()
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def is_thinking_unsupported_error(exc: Exception) -> bool:
+    """True ถ้า 400 นี้มาจากพารามิเตอร์ thinking ที่โมเดลนี้ไม่รองรับรูปแบบที่ส่งไป (เช่น rollback ผ่าน env ไปเป็น
+    โมเดลรุ่นเก่าที่ไม่รู้จัก {"type":"between_tools"}) — ใช้กับ create_with_optional_thinking เท่านั้น"""
+    return (
+        isinstance(exc, anthropic.BadRequestError)
+        and getattr(exc, "status_code", None) == 400
+        and "thinking" in str(exc).lower()
+    )
+
+
+def create_with_optional_thinking(client, thinking: Optional[dict] = None, **kwargs):
+    """เรียก client.messages.create ปกติ — ถ้าส่ง thinking มาด้วยแล้วโมเดลนี้ตอบ 400 ว่าไม่รองรับรูปแบบนั้น
+    (ดู is_thinking_unsupported_error) เรียกซ้ำทันทีแบบไม่ส่ง thinking เลย (กัน rollback โมเดลด้วย env แล้วพัง)"""
+    if thinking is None:
+        return client.messages.create(**kwargs)
+    try:
+        return client.messages.create(thinking=thinking, **kwargs)
+    except Exception as e:
+        if not is_thinking_unsupported_error(e):
+            raise
+        print(f"[LLM] thinking_unsupported_fallback model={kwargs.get('model')}")
+        return client.messages.create(**kwargs)
 
 
 def _is_tool_choice_unsupported_error(exc: Exception) -> bool:
@@ -79,12 +106,12 @@ def _synthetic_tool_use_response(original_response, tool_name: str, parsed_input
     )
 
 
-def _call_auto_with_fallback(client, model, max_tokens, system, messages, tools, tool_name, required_keys):
+def _call_auto_with_fallback(client, model, max_tokens, system, messages, tools, tool_name, required_keys, thinking=None):
     auto_system = system + f"\n\nสำคัญ: ต้องเรียกใช้เครื่องมือ {tool_name} เสมอทุกครั้ง ห้ามตอบเป็นข้อความธรรมดาเด็ดขาด"
     text, response = "", None
     for attempt in range(2):  # ลองครั้งแรก + retry อีก 1 ครั้งพร้อมข้อความย้ำ
-        response = client.messages.create(
-            model=model, max_tokens=max_tokens, system=auto_system, tools=tools,
+        response = create_with_optional_thinking(
+            client, thinking, model=model, max_tokens=max_tokens, system=auto_system, tools=tools,
             tool_choice={"type": "auto"}, messages=messages,
         )
         if _find_tool_use(response, tool_name) is not None:
@@ -100,13 +127,18 @@ def _call_auto_with_fallback(client, model, max_tokens, system, messages, tools,
     return None, ("json_invalid" if text.strip() else "no_tool_use"), _response_diag(response)
 
 
-def call_with_required_tool(client, model: str, max_tokens: int, system: str, messages: list, tools: list, tool_name: str):
+def call_with_required_tool(
+    client, model: str, max_tokens: int, system: str, messages: list, tools: list, tool_name: str,
+    thinking: Optional[dict] = None,
+):
+    """thinking (ถ้าส่งมา): ส่งต่อให้ client.messages.create ทุกจุดในนี้ ผ่าน create_with_optional_thinking —
+    โมเดลไม่รองรับรูปแบบที่ส่งไปก็เรียกซ้ำแบบไม่ส่ง thinking ให้เองอัตโนมัติ"""
     for choice_type, choice_kwargs in (("tool", {"name": tool_name}), ("any", {})):
         if (model, choice_type) in _UNSUPPORTED_TOOL_CHOICE:
             continue
         try:
-            response = client.messages.create(
-                model=model, max_tokens=max_tokens, system=system, tools=tools,
+            response = create_with_optional_thinking(
+                client, thinking, model=model, max_tokens=max_tokens, system=system, tools=tools,
                 tool_choice={"type": choice_type, **choice_kwargs}, messages=messages,
             )
         except Exception as e:
@@ -121,4 +153,4 @@ def call_with_required_tool(client, model: str, max_tokens: int, system: str, me
             return None, "max_tokens", _response_diag(response)
 
     required_keys = _required_keys_for_tool(tools, tool_name)
-    return _call_auto_with_fallback(client, model, max_tokens, system, messages, tools, tool_name, required_keys)
+    return _call_auto_with_fallback(client, model, max_tokens, system, messages, tools, tool_name, required_keys, thinking)

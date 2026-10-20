@@ -5,6 +5,7 @@ import จาก main.py แบบ deferred (หลังนิยาม rerank_
 knowledge_base_texts/embed_model ถูก reassign ใหม่ทุกครั้งที่ rebuild_index() ทำงาน จึงอ้างผ่าน `main.<ชื่อ>` สดทุก
 ครั้งที่ใช้ แทนที่จะ `from main import` ตรงๆ"""
 import json
+import os
 import time
 from typing import Optional
 
@@ -21,6 +22,10 @@ DEFAULT_BETA = 0.15
 # คะแนน rerank (CrossEncoder, raw logit ไม่ใช่ 0-1) อันดับ 1 ต่ำกว่านี้ -> สลับ system prompt เป็นโหมดความรู้ทั่วไป
 # (ไม่ใช่ปฏิเสธ) เป็นจุดเริ่มต้นคร่าวๆ ปรับจริงด้วยหน้า admin "วัดผลระบบค้นกฎหมาย"
 OUT_OF_KB_SCORE_THRESHOLD = -3.0
+# จำนวน candidate สูงสุดที่ส่งให้ reranker จริง (ตัดจาก candidates ที่ได้จาก BM25+vector+tag ก่อน rerank) — ค่า
+# เริ่มต้น 5 ตรงกับ k ที่ caller จริงทุกจุดใช้กันอยู่แล้วตอนนี้ (main.py/legal_docs.py ส่ง k=5 ทั้งคู่) ไม่เปลี่ยน
+# พฤติกรรมเดิมเลยถ้าไม่ตั้ง env นี้ไว้ — ลดได้ถ้า rerank_ms ช้าเกินไปบน production (CrossEncoder คือคอขวดหลัก)
+RERANK_CANDIDATES = int(os.environ.get("RERANK_CANDIDATES", "5"))
 
 _tag_embeddings: dict[str, np.ndarray] = {}  # {tag_name: embedding} — รีเฟรชทุกครั้งที่ main.rebuild_index() ทำงาน
 _chunk_tags_cache: dict[int, list[str]] = {}  # {chunk_id: [tag_name,...]} — รีเฟรชพร้อมกับ _tag_embeddings (เดิม
@@ -126,14 +131,21 @@ def legal_search(
         for i in top_idx
     ]
 
+    # ตัดเหลือ RERANK_CANDIDATES ตัวก่อนส่งให้ reranker จริง (ค่าเริ่มต้น 5 = k ที่ caller ใช้กันอยู่แล้วทุกจุด ->
+    # ไม่ตัดอะไรทิ้งเพิ่มถ้าไม่ตั้ง env นี้) candidates เรียงคะแนนรวมมาจาก argsort ด้านบนแล้ว ตัดท้ายคือตัดตัวที่
+    # คะแนนรวมต่ำสุดออกก่อนเสมอ
+    rerank_candidates = candidates[:RERANK_CANDIDATES]
+
     t0 = time.monotonic()
-    reranked_texts, rerank_scores = rerank_with_scores(query, [c["content"] for c in candidates], top_k=rerank_top_k)
+    reranked_texts, rerank_scores = rerank_with_scores(
+        query, [c["content"] for c in rerank_candidates], top_k=rerank_top_k
+    )
     rerank_ms = int((time.monotonic() - t0) * 1000)
 
     # rerank_with_scores คืนแค่ (content, score) เรียงใหม่ — จับคู่กลับเข้า dict เดิมด้วย content (pop ตัวแรกที่ยัง
     # ไม่ถูกใช้ กันจับคู่ผิดซ้ำถ้า 2 chunk มีเนื้อหาเดียวกันเป๊ะ)
     by_content: dict[str, list[dict]] = {}
-    for c in candidates:
+    for c in rerank_candidates:
         by_content.setdefault(c["content"], []).append(c)
     results = []
     for text, score in zip(reranked_texts, rerank_scores):
@@ -144,7 +156,7 @@ def legal_search(
     print(f"[LegalRetrieval] top_ids={[r['id'] for r in results]} tag_hits={list(tag_hits.keys())} latency_ms={latency_ms}")
     print(
         f"[LegalRetrieval] timing bm25_ms={bm25_ms} encode_ms={encode_ms} vector_ms={vector_ms} "
-        f"tag_ms={tag_ms} rerank_ms={rerank_ms} total_ms={latency_ms}"
+        f"tag_ms={tag_ms} rerank_ms={rerank_ms} rerank_n={len(rerank_candidates)} total_ms={latency_ms}"
     )
     return results
 

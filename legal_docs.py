@@ -8,6 +8,7 @@ chunk_ids ให้อยู่ในชุดที่ค้นเจอจร�
 import จาก main.py แบบ deferred (หลังนิยาม client/ROUTER_MODEL/ADVISOR_MODEL/save_legal_memo) เหมือน
 legal_retrieval.py — ดู main.py บรรทัดที่ import โมดูลนี้"""
 import io
+import os
 from typing import Optional
 
 from docx import Document
@@ -17,6 +18,12 @@ from legal_memo_format import build_memo_docx
 from llm_tools import call_with_required_tool
 from db import get_legal_memo, list_legal_memos_by_chat, close_legal_memo
 from main import client, get_chat_messages, save_legal_memo, ROUTER_MODEL, ADVISOR_MODEL
+
+# ปิด extended thinking ชัดเจน — โมเดลตระกูล Sonnet 5.5 เปิด thinking อัตโนมัติ (adaptive) แม้ไม่ได้ขอ กินจน
+# max_tokens หมดได้ (เหตุการณ์จริงที่แก้: [LegalMemo] draft_failed reason=max_tokens blocks=thinking out_tokens=6000)
+# ไม่รองรับก็ถอยให้เองอัตโนมัติ (ดู llm_tools.create_with_optional_thinking) กัน rollback ผ่าน env ไปโมเดลรุ่นเก่าพัง
+_MEMO_THINKING = {"type": "between_tools"}
+MEMO_MAX_TOKENS = int(os.environ.get("MEMO_MAX_TOKENS", "12000"))
 
 MEMO_SLOTS_TOOL = {
     "name": "extract_memo_slots",
@@ -126,7 +133,7 @@ def _extract_memo_slots(query: str, history: list) -> dict:
 
     response, _reason, _diag = call_with_required_tool(
         client, ROUTER_MODEL, 800, "", [{"role": "user", "content": prompt}],
-        [MEMO_SLOTS_TOOL], "extract_memo_slots",
+        [MEMO_SLOTS_TOOL], "extract_memo_slots", thinking=_MEMO_THINKING,
     )
     if response is None:
         return {"client_name": None, "legal_area": None, "facts_summary": None, "key_facts": None, "user_questions": None}
@@ -168,9 +175,16 @@ def _draft_memo_content(slots: dict, grounded_chunks: list[dict]):
     )
     try:
         response, reason, diag = call_with_required_tool(
-            client, ADVISOR_MODEL, 6000, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
-            [MEMO_CONTENT_TOOL], "draft_memo_content",
+            client, ADVISOR_MODEL, MEMO_MAX_TOKENS, MEMO_CONTENT_SYSTEM_PROMPT, [{"role": "user", "content": prompt}],
+            [MEMO_CONTENT_TOOL], "draft_memo_content", thinking=_MEMO_THINKING,
         )
+        if response is None and reason == "max_tokens":
+            # ลองใหม่ 1 ครั้งด้วย max_tokens สูงขึ้นก่อนยอมแพ้ (เผื่อคำตอบยาวจริงๆ ไม่ใช่แค่ thinking กินที่)
+            response, reason, diag = call_with_required_tool(
+                client, ADVISOR_MODEL, MEMO_MAX_TOKENS * 2, MEMO_CONTENT_SYSTEM_PROMPT,
+                [{"role": "user", "content": prompt}], [MEMO_CONTENT_TOOL], "draft_memo_content",
+                thinking=_MEMO_THINKING,
+            )
     except Exception as e:
         _log_memo_draft_failed("api_error", {**_EMPTY_DIAG, "stop_reason": type(e).__name__})
         return None
